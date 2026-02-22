@@ -1984,18 +1984,24 @@ class RadiopaediaWeakEvidenceAligner:
 
 
 
+
 @dataclass(frozen=True)
 class RetrieverSupervisionRow:
     qa_row_id: int
+    subject_id: int
+    split: str                    # "train" / "valid" / "test"
     report_rel_path: str
     qa_type: str
     claim_text: str
     pos_chunk_ids_json: str
     pos_weights_json: str
 
+
 @dataclass(frozen=True)
 class VerifierSupervisionRow:
     qa_row_id: int
+    subject_id: int
+    split: str
     report_rel_path: str
     qa_type: str
     case_context: str
@@ -2004,28 +2010,17 @@ class VerifierSupervisionRow:
     claim_text: str
     evidence_chunk_ids_json: str
     evidence_weights_json: str
-    soft_support_score: float  # deterministic scalar derived from combined_scores
+    soft_support_score: float
+
 
 class RadiopaediaStep4CSupervisionBuilder:
     """
     Step 4C: Convert Step 3 + Step 4B outputs into final supervision artifacts
 
-    Inputs:
-      - qa_csv: mimic_qa_step3.csv  (Step 3)
-      - weak_alignment_parquet: weak_alignment_step4b.parquet (Step 4B)
+      - Create a fresh patient-wise split (train=75%, valid=10%, test=15%)
+      - Write subject_id + split into both output parquets
 
-    Outputs (in out_dir):
-      - retriever_supervision.parquet
-          query = claim_text
-          targets = top-k evidence chunk ids + soft weights
-      - verifier_supervision.parquet
-          input = case_context + question + answer_target + evidence ids + weights
-          target = soft_support_score (scalar)
-
-    Notes:
-      - Does NOT store evidence text (IDs only).
-      - Streams both QA CSV and alignment parquet in the same qa_row_id order.
-      - Assumes Step 4B wrote rows in strict qa_row_id increasing order.
+    Split is computed ONLY from subject_id (no leakage across patients) and is deterministic.
     """
 
     def __init__(
@@ -2034,6 +2029,7 @@ class RadiopaediaStep4CSupervisionBuilder:
         weak_alignment_parquet: str | Path,
         out_dir: str | Path,
         # columns in qa_csv
+        subject_id_col: str = "subject_id",          # NEW
         report_path_col: str = "report_rel_path",
         qa_type_col: str = "qa_type",
         claim_col: str = "claim_text",
@@ -2044,8 +2040,13 @@ class RadiopaediaStep4CSupervisionBuilder:
         qa_chunksize_rows: int = 50_000,
         parquet_batch_rows: int = 50_000,
         # supervision shaping
-        top_k: Optional[int] = None,  # if set, truncate to first k from 4B
-        min_weight: float = 0.0,      # drop items below this weight after truncation
+        top_k: Optional[int] = None,
+        min_weight: float = 0.0,
+        # split config (NEW)
+        split_seed: int = 13,
+        frac_train: float = 0.75,
+        frac_valid: float = 0.10,
+        frac_test: float = 0.15,
         # progress
         tqdm_desc: str = "Step 4C: building supervision",
         parquet_compression: str = "zstd",
@@ -2055,6 +2056,7 @@ class RadiopaediaStep4CSupervisionBuilder:
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
+        self.subject_id_col = str(subject_id_col)     # NEW
         self.report_path_col = str(report_path_col)
         self.qa_type_col = str(qa_type_col)
         self.claim_col = str(claim_col)
@@ -2068,16 +2070,25 @@ class RadiopaediaStep4CSupervisionBuilder:
         self.top_k = int(top_k) if top_k is not None else None
         self.min_weight = float(min_weight)
 
+        self.split_seed = int(split_seed)
+        self.frac_train = float(frac_train)
+        self.frac_valid = float(frac_valid)
+        self.frac_test = float(frac_test)
+        if not np.isclose(self.frac_train + self.frac_valid + self.frac_test, 1.0):
+            raise ValueError("Split fractions must sum to 1.0 (train+valid+test).")
+
         self.tqdm_desc = str(tqdm_desc)
         self.parquet_compression = str(parquet_compression)
 
         self.retriever_out = self.out_dir / "retriever_supervision.parquet"
         self.verifier_out = self.out_dir / "verifier_supervision.parquet"
         self.manifest_out = self.out_dir / "manifest_step4c.json"
+        self.split_map_out = self.out_dir / "patient_split_map.json"  # NEW
 
         self._retr_schema: Optional[pa.Schema] = None
         self._ver_schema: Optional[pa.Schema] = None
 
+        self._patient_split_map: Optional[Dict[int, str]] = None
 
     def _safe_str(self, x) -> str:
         if x is None:
@@ -2102,14 +2113,6 @@ class RadiopaediaStep4CSupervisionBuilder:
         return ids, w
 
     def _soft_support_from_combined(self, combined_scores: List[float]) -> float:
-        """
-        Deterministic scalar target for verifier.
-        We use max(combined_scores) because:
-          - stable
-          - monotone with best-evidence match
-          - does not depend on k length (beyond retrieval)
-        If list is empty -> 0.0
-        """
         if not combined_scores:
             return 0.0
         try:
@@ -2117,11 +2120,47 @@ class RadiopaediaStep4CSupervisionBuilder:
         except Exception:
             return 0.0
 
+    # patient-wise split map (deterministic)
+    def _build_patient_split_map(self) -> Dict[int, str]:
+        # Read only subject_id column (fast)
+        if not self.qa_csv.exists():
+            raise FileNotFoundError(f"QA CSV not found: {self.qa_csv}")
+
+        subj = pd.read_csv(self.qa_csv, usecols=[self.subject_id_col])
+        subj[self.subject_id_col] = pd.to_numeric(subj[self.subject_id_col], errors="coerce")
+        subj = subj[~subj[self.subject_id_col].isna()]
+        subject_ids = np.array(sorted(subj[self.subject_id_col].astype(int).unique().tolist()), dtype=np.int64)
+
+        rng = np.random.RandomState(self.split_seed)
+        perm = rng.permutation(subject_ids)
+
+        n = len(perm)
+        n_train = int(round(self.frac_train * n))
+        n_valid = int(round(self.frac_valid * n))
+        # ensure exact total
+        n_test = n - n_train - n_valid
+        if n_test < 0:
+            n_test = 0
+            n_valid = n - n_train
+
+        split_map: Dict[int, str] = {}
+        for sid in perm[:n_train]:
+            split_map[int(sid)] = "train"
+        for sid in perm[n_train : n_train + n_valid]:
+            split_map[int(sid)] = "valid"
+        for sid in perm[n_train + n_valid :]:
+            split_map[int(sid)] = "test"
+
+        # write map for reuse
+        self.split_map_out.write_text(json.dumps(split_map, indent=2), encoding="utf-8")
+        return split_map
 
     def _init_retriever_writer(self) -> pq.ParquetWriter:
         self._retr_schema = pa.schema(
             [
                 ("qa_row_id", pa.int64()),
+                ("subject_id", pa.int64()),     # NEW
+                ("split", pa.string()),         # NEW
                 ("report_rel_path", pa.string()),
                 ("qa_type", pa.string()),
                 ("claim_text", pa.string()),
@@ -2139,6 +2178,8 @@ class RadiopaediaStep4CSupervisionBuilder:
         self._ver_schema = pa.schema(
             [
                 ("qa_row_id", pa.int64()),
+                ("subject_id", pa.int64()),     # NEW
+                ("split", pa.string()),         # NEW
                 ("report_rel_path", pa.string()),
                 ("qa_type", pa.string()),
                 ("case_context", pa.string()),
@@ -2157,14 +2198,15 @@ class RadiopaediaStep4CSupervisionBuilder:
         )
 
     def _to_table(self, df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
-        # Force stable dtypes to avoid string/large_string drift
         for c in schema.names:
             if c not in df.columns:
                 df[c] = None
 
         df["qa_row_id"] = pd.to_numeric(df["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
+        df["subject_id"] = pd.to_numeric(df["subject_id"], errors="coerce").fillna(-1).astype(np.int64)
 
         for c in [
+            "split",
             "report_rel_path",
             "qa_type",
             "claim_text",
@@ -2186,12 +2228,13 @@ class RadiopaediaStep4CSupervisionBuilder:
 
         return pa.Table.from_pandas(df, schema=schema, preserve_index=False)
 
-
     def run(self) -> None:
         if not self.qa_csv.exists():
             raise FileNotFoundError(f"QA CSV not found: {self.qa_csv}")
         if not self.weak_alignment_parquet.exists():
             raise FileNotFoundError(f"Weak alignment parquet not found: {self.weak_alignment_parquet}")
+
+        self._patient_split_map = self._build_patient_split_map()
 
         total_rows = sum(1 for _ in open(self.qa_csv, "r", encoding="utf-8", errors="ignore")) - 1
         pbar = tqdm(total=max(total_rows, 0), desc=self.tqdm_desc, unit="rows", miniters=1)
@@ -2201,10 +2244,8 @@ class RadiopaediaStep4CSupervisionBuilder:
         assert self._retr_schema is not None
         assert self._ver_schema is not None
 
-        # Stream alignment parquet in row groups/batches
         pf = pq.ParquetFile(str(self.weak_alignment_parquet))
 
-        # Alignment columns we need
         align_cols = [
             "qa_row_id",
             "report_rel_path",
@@ -2215,8 +2256,8 @@ class RadiopaediaStep4CSupervisionBuilder:
             "combined_scores_json",
         ]
 
-        # QA columns we need
         needed_qa_cols = [
+            self.subject_id_col,
             self.report_path_col,
             self.qa_type_col,
             self.claim_col,
@@ -2227,23 +2268,23 @@ class RadiopaediaStep4CSupervisionBuilder:
 
         qa_reader = pd.read_csv(self.qa_csv, chunksize=self.qa_chunksize_rows)
 
-        # We join by order: qa_row_id increments with QA row order in Step 4B.
-        # That means: the N-th row in QA CSV corresponds to alignment qa_row_id=N.
         qa_row_id_expected = 0
         align_row_id_expected = 0
 
         try:
-            # iterate alignment parquet batches
             align_iter = pf.iter_batches(batch_size=self.parquet_batch_rows, columns=align_cols)
 
             for qa_chunk in qa_reader:
-                # Validate QA columns
                 for c in needed_qa_cols:
                     if c not in qa_chunk.columns:
                         raise ValueError(f"QA CSV missing required column: {c}")
 
-                # Make QA chunk deterministic and safe
                 qa_chunk = qa_chunk.copy()
+
+                qa_chunk[self.subject_id_col] = pd.to_numeric(qa_chunk[self.subject_id_col], errors="coerce")
+                qa_chunk = qa_chunk[~qa_chunk[self.subject_id_col].isna()]
+                qa_chunk[self.subject_id_col] = qa_chunk[self.subject_id_col].astype(np.int64)
+
                 qa_chunk[self.report_path_col] = qa_chunk[self.report_path_col].astype(str)
                 qa_chunk[self.qa_type_col] = qa_chunk[self.qa_type_col].astype(str)
                 qa_chunk[self.claim_col] = qa_chunk[self.claim_col].astype(str)
@@ -2252,63 +2293,57 @@ class RadiopaediaStep4CSupervisionBuilder:
                 qa_chunk[self.answer_col] = qa_chunk[self.answer_col].astype(str)
 
                 n = len(qa_chunk)
+                if n == 0:
+                    continue
 
-                # Pull exactly n alignment rows from parquet batches (may span multiple batches)
                 align_rows: List[pd.DataFrame] = []
                 need = n
                 while need > 0:
                     batch = next(align_iter, None)
                     if batch is None:
-                        raise RuntimeError(
-                            f"Alignment parquet ended early. Still needed {need} rows for current QA chunk."
-                        )
+                        raise RuntimeError(f"Alignment parquet ended early. Still needed {need} rows.")
                     bdf = batch.to_pandas()
                     align_rows.append(bdf)
                     need -= len(bdf)
 
                 align_df = pd.concat(align_rows, ignore_index=True)
                 if len(align_df) > n:
-                    # To keep code simple + deterministic, we disallow overread by requiring batch_size == qa_chunksize_rows.
                     align_df = align_df.iloc[:n].copy()
 
-                # Sanity check ordering
-                # qa_row_id is required to be contiguous and match expected counters.
                 if "qa_row_id" not in align_df.columns:
                     raise ValueError("Alignment parquet missing qa_row_id column.")
 
                 first_id = int(align_df.iloc[0]["qa_row_id"])
                 if first_id != align_row_id_expected:
                     raise RuntimeError(
-                        f"Alignment qa_row_id mismatch: expected {align_row_id_expected}, got {first_id}. "
-                        f"(This usually means alignment parquet is not in the same order as QA CSV.)"
+                        f"Alignment qa_row_id mismatch: expected {align_row_id_expected}, got {first_id}."
                     )
 
-                # Build supervision rows
                 retr_rows: List[Dict[str, object]] = []
                 ver_rows: List[Dict[str, object]] = []
 
+                assert self._patient_split_map is not None
+
                 for i in range(n):
-                    # expected ids
                     qa_row_id = qa_row_id_expected
                     al_row = align_df.iloc[i]
 
-                    # parse retrieved ids + weights
                     ids = self._loads_json_list(self._safe_str(al_row.get("retrieved_chunk_ids_json", "[]")))
                     w = self._loads_json_list(self._safe_str(al_row.get("support_weights_json", "[]")))
                     combined = self._loads_json_list(self._safe_str(al_row.get("combined_scores_json", "[]")))
 
-                    # coerce lists
                     ids = [int(x) for x in ids if str(x).strip() != ""]
                     w = [float(x) for x in w]
                     combined = [float(x) for x in combined]
 
                     ids, w = self._filter_and_truncate(ids, w)
-                    # keep list lengths consistent
                     if len(w) != len(ids):
                         m = min(len(w), len(ids))
                         ids, w = ids[:m], w[:m]
 
-                    # QA fields
+                    subject_id = int(qa_chunk.iloc[i][self.subject_id_col])
+                    split = self._patient_split_map.get(subject_id, "train")  # should always exist
+
                     report_rel_path = self._safe_str(qa_chunk.iloc[i][self.report_path_col])
                     qa_type = self._safe_str(qa_chunk.iloc[i][self.qa_type_col])
                     claim_text = self._safe_str(qa_chunk.iloc[i][self.claim_col])
@@ -2320,6 +2355,8 @@ class RadiopaediaStep4CSupervisionBuilder:
                         asdict(
                             RetrieverSupervisionRow(
                                 qa_row_id=qa_row_id,
+                                subject_id=subject_id,
+                                split=split,
                                 report_rel_path=report_rel_path,
                                 qa_type=qa_type,
                                 claim_text=claim_text,
@@ -2333,6 +2370,8 @@ class RadiopaediaStep4CSupervisionBuilder:
                         asdict(
                             VerifierSupervisionRow(
                                 qa_row_id=qa_row_id,
+                                subject_id=subject_id,
+                                split=split,
                                 report_rel_path=report_rel_path,
                                 qa_type=qa_type,
                                 case_context=case_context,
@@ -2349,7 +2388,6 @@ class RadiopaediaStep4CSupervisionBuilder:
                     qa_row_id_expected += 1
                     align_row_id_expected += 1
 
-                # Write batches
                 retr_df = pd.DataFrame(retr_rows)
                 ver_df = pd.DataFrame(ver_rows)
 
@@ -2372,6 +2410,13 @@ class RadiopaediaStep4CSupervisionBuilder:
             "outputs": {
                 "retriever_supervision": str(self.retriever_out),
                 "verifier_supervision": str(self.verifier_out),
+                "patient_split_map": str(self.split_map_out),
+            },
+            "split": {
+                "method": "patient-wise",
+                "seed": self.split_seed,
+                "fractions": {"train": self.frac_train, "valid": self.frac_valid, "test": self.frac_test},
+                "labels": ["train", "valid", "test"],
             },
             "params": {
                 "qa_chunksize_rows": self.qa_chunksize_rows,
@@ -2385,8 +2430,8 @@ class RadiopaediaStep4CSupervisionBuilder:
 
         print(f"Wrote: {self.retriever_out}")
         print(f"Wrote: {self.verifier_out}")
+        print(f"Wrote: {self.split_map_out}")
         print(f"Wrote: {self.manifest_out}")
-
 
 
 
@@ -2465,9 +2510,14 @@ if __name__ == "__main__":
     #     qa_csv="/PATH/MIMIC/mimic_qa_step3.csv",
     #     weak_alignment_parquet="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026/weak_alignment_step4b.parquet",
     #     out_dir="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026/step4c_supervision",
-    #     top_k=20,  # keep only first 20
-    #     min_weight=0.0,  # keep all weights
+    #     top_k=20,
+    #     min_weight=0.0,
     #     qa_chunksize_rows=50_000,
     #     parquet_batch_rows=50_000,
+    #     subject_id_col="subject_id",  # must exist in mimic_qa_step3.csv
+    #     split_seed=13,
+    #     frac_train=0.75,
+    #     frac_valid=0.10,
+    #     frac_test=0.15,
     # )
     # builder.run()
