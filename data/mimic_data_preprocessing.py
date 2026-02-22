@@ -8,13 +8,20 @@ https://github.com/tayebiarasteh/
 
 import pdb
 import re
+import json
 from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Set, Tuple
 import hashlib
-
+from transformers import AutoTokenizer, AutoModel
+from dataclasses import asdict, dataclass
+import faiss
+import pyarrow as pa
+import pyarrow.parquet as pq
+import torch
+import random
+import numpy as np
 
 
 import warnings
@@ -391,7 +398,6 @@ class QAItem:
     answer_target: str
     claim_text: str
     supporting_span: str
-
 
 class MimicQATableBuilder:
     """
@@ -1258,36 +1264,1210 @@ class MimicQATableBuilder:
 
 
 
+@dataclass(frozen=True)
+class EvidenceChunk:
+    chunk_id: int
+    article_id: str
+    article_title: str
+    section_title: Optional[str]
+    chunk_text: str
+    chunk_token_count: int
+    article_relpath: str
+    chunk_hash: str
+
+class RadiopaediaSnapshotBuilder:
+    """
+    Step 4A
+    Build a frozen, offline evidence snapshot from cleaned Radiopaedia .txt files.
+
+    Output (in out_dir):
+      - chunks.csv (always)
+      - chunks.parquet
+      - manifest.json
+    """
+
+    def __init__(
+        self,
+        in_dir: str | Path,
+        out_dir: str | Path,
+        snapshot_name: str = "RadiopaediaSnapshot_v1",
+        tokenizer_name: str = "sentence-transformers/all-mpnet-base-v2",
+        target_tokens: int = 200,
+        min_tokens: int = 50,
+        write_csv: bool = True,
+        write_parquet: bool = True,
+        tqdm_desc: str = "Building RadiopaediaSnapshot_v1 chunks",
+        encoding: str = "utf-8",
+    ) -> None:
+        self.in_dir = Path(in_dir)
+        self.out_dir = Path(out_dir)
+        self.snapshot_name = str(snapshot_name)
+
+        self.tokenizer_name = str(tokenizer_name)
+        self.target_tokens = int(target_tokens)
+        self.min_tokens = int(min_tokens)
+
+        self.write_csv = bool(write_csv)
+        self.write_parquet = bool(write_parquet)
+        self.tqdm_desc = str(tqdm_desc)
+        self.encoding = str(encoding)
+
+        self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, use_fast=True)
+
+        # We are NOT running the encoder model, only tokenizing.
+        # So set a huge max length to avoid noisy warnings.
+        try:
+            self._tokenizer.model_max_length = int(1e9)
+        except Exception:
+            pass
+
+        self._blankline_re = re.compile(r"\n{3,}")
+        self._ws_re = re.compile(r"[ \t]+")
+
+
+    def _list_txt_files(self) -> List[Path]:
+        files = sorted(self.in_dir.rglob("*.txt"))
+        if not files:
+            raise ValueError(f"No .txt files found under: {self.in_dir}")
+        return files
+
+    def _read_text(self, p: Path) -> str:
+        return p.read_text(encoding=self.encoding, errors="ignore")
+
+    def _first_nonempty_line(self, text: str) -> str:
+        for ln in text.splitlines():
+            s = ln.strip()
+            if s:
+                return s
+        return ""
+
+    def _normalize_whitespace(self, text: str) -> str:
+        if not text:
+            return ""
+        t = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not t:
+            return ""
+        lines = [ln.rstrip() for ln in t.split("\n")]
+        out_lines: List[str] = []
+        blank_run = 0
+        for ln in lines:
+            if ln.strip() == "":
+                blank_run += 1
+                if blank_run <= 1:
+                    out_lines.append("")
+                continue
+            blank_run = 0
+            out_lines.append(" ".join(ln.split()))
+        out = "\n".join(out_lines).strip()
+        out = self._blankline_re.sub("\n\n", out).strip()
+        return out
+
+    def _make_article_id(self, p: Path) -> str:
+        return p.stem
+
+    def _stable_hash(self, s: str) -> str:
+        return hashlib.md5(s.encode("utf-8", errors="ignore")).hexdigest()
+
+
+    def _tokenize(self, text: str) -> List[int]:
+        return self._tokenizer.encode(text, add_special_tokens=False)
+
+    def _decode(self, ids: List[int]) -> str:
+        return self._tokenizer.decode(ids, clean_up_tokenization_spaces=True).strip()
+
+    def _split_into_token_chunks(self, text: str) -> List[Tuple[str, int]]:
+        ids = self._tokenize(text)
+        if not ids:
+            return []
+
+        out: List[Tuple[str, int]] = []
+        for i in range(0, len(ids), self.target_tokens):
+            block = ids[i : i + self.target_tokens]
+            if len(block) < self.min_tokens:
+                continue
+            chunk_text = self._decode(block)
+            if chunk_text:
+                out.append((chunk_text, len(block)))
+        return out
+
+    # main build
+
+    def build_snapshot(self) -> pd.DataFrame:
+        files = self._list_txt_files()
+
+        rows: List[Dict[str, object]] = []
+        chunk_id = 0
+
+        for p in tqdm(files, desc=self.tqdm_desc, total=len(files)):
+            raw = self._read_text(p).strip()
+            if not raw:
+                continue
+
+            title = self._first_nonempty_line(raw)
+            body = self._normalize_whitespace(raw)
+            if not body:
+                continue
+
+            article_id = self._make_article_id(p)
+            relpath = str(p.relative_to(self.in_dir))
+
+            section_title = None  # keep None for now
+
+            chunks = self._split_into_token_chunks(body)
+            for ctext, ntoks in chunks:
+                chash = self._stable_hash(ctext)
+                rows.append(
+                    asdict(
+                        EvidenceChunk(
+                            chunk_id=chunk_id,
+                            article_id=article_id,
+                            article_title=title,
+                            section_title=section_title,
+                            chunk_text=ctext,
+                            chunk_token_count=int(ntoks),
+                            article_relpath=relpath,
+                            chunk_hash=chash,
+                        )
+                    )
+                )
+                chunk_id += 1
+
+        return pd.DataFrame(rows)
+
+    def _parquet_available(self) -> bool:
+        try:
+            import pyarrow  # noqa: F401
+            return True
+        except Exception:
+            pass
+        try:
+            import fastparquet  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    def write_outputs(self, df: pd.DataFrame) -> None:
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+        chunks_csv = self.out_dir / "chunks.csv"
+        if self.write_csv:
+            df.to_csv(chunks_csv, index=False)
+
+        chunks_parquet = self.out_dir / "chunks.parquet"
+        wrote_parquet = False
+        if self.write_parquet:
+            if self._parquet_available():
+                df.to_parquet(chunks_parquet, index=False)
+                wrote_parquet = True
+            else:
+                print("[WARN] Parquet requested but pyarrow/fastparquet not installed. Skipping parquet.")
+
+        manifest = {
+            "snapshot_name": self.snapshot_name,
+            "input_dir": str(self.in_dir.resolve()),
+            "num_articles": int(df["article_id"].nunique()) if not df.empty else 0,
+            "num_chunks": int(len(df)),
+            "tokenizer": self.tokenizer_name,
+            "chunking": {
+                "method": "fixed_token_blocks",
+                "target_tokens": self.target_tokens,
+                "stride": self.target_tokens,
+                "min_tokens": self.min_tokens,
+            },
+            "files": {
+                "chunks_csv": "chunks.csv" if self.write_csv else None,
+                "chunks_parquet": "chunks.parquet" if wrote_parquet else None,
+            },
+        }
+
+        manifest_path = self.out_dir / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+        print(f"Wrote: {manifest_path}")
+        if self.write_csv:
+            print(f"Wrote: {chunks_csv}  (rows={len(df):,}, articles={manifest['num_articles']:,})")
+        if wrote_parquet:
+            print(f"Wrote: {chunks_parquet}  (rows={len(df):,}, articles={manifest['num_articles']:,})")
+
+    def run(self) -> pd.DataFrame:
+        df = self.build_snapshot()
+        self.write_outputs(df)
+        return df
+
+
+
+
+
+
+
+@dataclass(frozen=True)
+class WeakAlignmentRow:
+    qa_row_id: int
+    report_rel_path: str
+    qa_type: str
+    claim_text: str
+    retrieved_chunk_ids_json: str
+    support_weights_json: str
+    embed_scores_json: str
+    lexical_scores_json: str
+    combined_scores_json: str
+
+class RadiopaediaWeakEvidenceAligner:
+    """
+    Step 4B: Weak claim–evidence alignment (no humans)
+
+    Input:
+      - qa_csv: Step 3 output (mimic_qa_step3.csv)
+      - chunks_parquet: Step 4A output (chunks.parquet)
+
+    Output:
+      - out_parquet: per-QA row: top-k retrieved chunk_ids + soft weights (JSON arrays)
+    """
+
+    def __init__(
+        self,
+        qa_csv: str | Path,
+        chunks_parquet: str | Path,
+        out_parquet: str | Path,
+        # HF embedder (fixed bootstrap)
+        model_name: str = "sentence-transformers/all-mpnet-base-v2",
+        max_query_tokens: int = 128,
+        max_doc_tokens: int = 256,
+        # retrieval
+        top_k: int = 20,
+        qa_batch_size: int = 256,
+        doc_batch_size: int = 128,
+        # scoring
+        alpha: float = 0.85,
+        temperature: float = 0.07,
+        # caching
+        cache_dir: Optional[str | Path] = None,
+        faiss_index_name: str = "radiopaedia_flatip.index",
+        chunk_embeds_name: str = "radiopaedia_chunk_embeds.npy",
+        # columns
+        claim_col: str = "claim_text",
+        report_path_col: str = "report_rel_path",
+        qa_type_col: str = "qa_type",
+        chunk_id_col: str = "chunk_id",
+        chunk_text_col: str = "chunk_text",
+        # determinism
+        seed: int = 13,
+        device: str = "cuda",
+        force_cpu_faiss: bool = True,
+        tqdm_desc: str = "Step 4B: weak claim–evidence alignment",
+        qa_chunksize_rows: int = 50_000,
+        # writer
+        parquet_compression: str = "zstd",
+    ) -> None:
+        self.qa_csv = Path(qa_csv)
+        self.chunks_parquet = Path(chunks_parquet)
+        self.out_parquet = Path(out_parquet)
+
+        self.model_name = str(model_name)
+        self.max_query_tokens = int(max_query_tokens)
+        self.max_doc_tokens = int(max_doc_tokens)
+
+        self.top_k = int(top_k)
+        self.qa_batch_size = int(qa_batch_size)
+        self.doc_batch_size = int(doc_batch_size)
+
+        self.alpha = float(alpha)
+        self.temperature = float(temperature)
+
+        self.cache_dir = Path(cache_dir) if cache_dir else self.out_parquet.parent
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+        self.faiss_index_path = self.cache_dir / faiss_index_name
+        self.chunk_embeds_path = self.cache_dir / chunk_embeds_name
+
+        self.claim_col = str(claim_col)
+        self.report_path_col = str(report_path_col)
+        self.qa_type_col = str(qa_type_col)
+
+        self.chunk_id_col = str(chunk_id_col)
+        self.chunk_text_col = str(chunk_text_col)
+
+        self.seed = int(seed)
+        self.device = str(device)
+        self.force_cpu_faiss = bool(force_cpu_faiss)
+        self.tqdm_desc = str(tqdm_desc)
+        self.qa_chunksize_rows = int(qa_chunksize_rows)
+        self.parquet_compression = str(parquet_compression)
+
+        self._word_re = re.compile(r"[a-z0-9]+")
+        self._tokenizer: Optional[AutoTokenizer] = None
+        self._model: Optional[AutoModel] = None
+
+        # will be set in _init_writer()
+        self._pa_schema: Optional[pa.Schema] = None
+
+        self._set_determinism()
+
+    # determinism
+
+    def _set_determinism(self) -> None:
+        random.seed(self.seed)
+        np.random.seed(self.seed)
+        torch.manual_seed(self.seed)
+        torch.cuda.manual_seed_all(self.seed)
+
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+        # Disable TF32 (important for reproducibility on Ampere+)
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+        except Exception:
+            pass
+
+        if self.device != "cuda":
+            try:
+                torch.use_deterministic_algorithms(True)
+            except Exception:
+                pass
+
+
+    def _normalize_text(self, s: str) -> str:
+        if s is None:
+            return ""
+        x = str(s).lower()
+        x = re.sub(r"\s+", " ", x).strip()
+        return x
+
+    def _tokenize_words(self, s: str) -> List[str]:
+        s = self._normalize_text(s)
+        if not s:
+            return []
+        return self._word_re.findall(s)
+
+    def _lexical_overlap(self, query: str, doc: str) -> float:
+        q = self._tokenize_words(query)
+        if not q:
+            return 0.0
+        qset = set(q)
+        dset = set(self._tokenize_words(doc))
+        if not dset:
+            return 0.0
+        return float(len(qset.intersection(dset))) / float(len(qset))
+
+
+    def _get_tokenizer_and_model(self) -> Tuple[AutoTokenizer, AutoModel]:
+        if self._tokenizer is not None and self._model is not None:
+            return self._tokenizer, self._model
+
+        tok = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
+        model = AutoModel.from_pretrained(self.model_name, ignore_mismatched_sizes=True)
+        model.eval()
+
+        if self.device == "cuda" and torch.cuda.is_available():
+            model = model.to("cuda")
+        else:
+            model = model.to("cpu")
+
+        self._tokenizer = tok
+        self._model = model
+        return tok, model
+
+    def _mean_pool(self, last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        mask = attention_mask.unsqueeze(-1).type_as(last_hidden)  # (B,T,1)
+        summed = (last_hidden * mask).sum(dim=1)
+        denom = mask.sum(dim=1).clamp(min=1e-6)
+        return summed / denom
+
+    def _encode_texts(
+        self,
+        texts: List[str],
+        max_len: int,
+        batch_size: int,
+        pbar: Optional["tqdm"] = None,
+    ) -> np.ndarray:
+        tok, model = self._get_tokenizer_and_model()
+
+        embs: List[np.ndarray] = []
+        n = len(texts)
+
+        for i in range(0, n, batch_size):
+            batch = texts[i : i + batch_size]
+            batch = [self._normalize_text(x) for x in batch]
+
+            enc = tok(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=max_len,
+                return_tensors="pt",
+            )
+            enc = {k: v.to(model.device) for k, v in enc.items()}
+
+            with torch.no_grad():
+                out = model(**enc)
+                pooled = self._mean_pool(out.last_hidden_state, enc["attention_mask"])
+                pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
+                embs.append(pooled.detach().cpu().numpy().astype(np.float32))
+
+            if pbar is not None:
+                pbar.update(len(batch))
+
+        return np.vstack(embs) if embs else np.zeros((0, 768), dtype=np.float32)
+
+
+    def _load_chunks_table(self) -> pd.DataFrame:
+        cols = [self.chunk_id_col, self.chunk_text_col]
+        df = pd.read_parquet(self.chunks_parquet, columns=cols)
+        df[self.chunk_id_col] = pd.to_numeric(df[self.chunk_id_col], errors="coerce")
+        df = df[~df[self.chunk_id_col].isna()].copy()
+        df[self.chunk_id_col] = df[self.chunk_id_col].astype(int)
+        df[self.chunk_text_col] = df[self.chunk_text_col].astype(str)
+
+        # stable order
+        df = df.sort_values(self.chunk_id_col).reset_index(drop=True)
+        return df
+
+    def _build_or_load_chunk_embeddings(self, chunks_df: pd.DataFrame) -> np.ndarray:
+        if self.chunk_embeds_path.exists():
+            emb = np.load(self.chunk_embeds_path)
+            if emb.shape[0] != len(chunks_df):
+                raise ValueError(
+                    f"Loaded embeddings rows ({emb.shape[0]}) != num chunks ({len(chunks_df)}). "
+                    f"Delete {self.chunk_embeds_path} and rerun."
+                )
+            return emb.astype(np.float32)
+
+        texts = chunks_df[self.chunk_text_col].tolist()
+
+        chunk_pbar = tqdm(total=len(texts), desc="Embedding Radiopaedia chunks", unit="chunks", miniters=1)
+        try:
+            emb = self._encode_texts(
+                texts,
+                max_len=self.max_doc_tokens,
+                batch_size=self.doc_batch_size,
+                pbar=chunk_pbar,
+            )
+        finally:
+            chunk_pbar.close()
+
+        np.save(self.chunk_embeds_path, emb)
+        return emb
+
+    def _build_or_load_faiss_index(self, chunk_embeds: np.ndarray) -> faiss.Index:
+        if self.faiss_index_path.exists():
+            idx = faiss.read_index(str(self.faiss_index_path))
+            return idx
+
+        dim = int(chunk_embeds.shape[1])
+        index = faiss.IndexFlatIP(dim)  # cosine via normalized embeddings
+        index.add(chunk_embeds)
+
+        faiss.write_index(index, str(self.faiss_index_path))
+        return index
+
+
+    def _softmax(self, x: np.ndarray) -> np.ndarray:
+        x = x.astype(np.float32)
+        x = x - np.max(x)
+        ex = np.exp(x)
+        s = float(np.sum(ex))
+        if s <= 0:
+            return np.ones_like(x, dtype=np.float32) / float(len(x))
+        return ex / s
+
+    def _weights_from_scores(self, combined: np.ndarray) -> np.ndarray:
+        if self.temperature <= 0:
+            w = np.zeros_like(combined, dtype=np.float32)
+            if len(w) > 0:
+                w[int(np.argmax(combined))] = 1.0
+            return w
+        return self._softmax(combined / float(self.temperature)).astype(np.float32)
+
+
+    def _init_writer(self) -> pq.ParquetWriter:
+        self.out_parquet.parent.mkdir(parents=True, exist_ok=True)
+
+        # store schema so every batch uses identical schema
+        self._pa_schema = pa.schema(
+            [
+                ("qa_row_id", pa.int64()),
+                ("report_rel_path", pa.string()),
+                ("qa_type", pa.string()),
+                ("claim_text", pa.string()),
+                ("retrieved_chunk_ids_json", pa.string()),
+                ("support_weights_json", pa.string()),
+                ("embed_scores_json", pa.string()),
+                ("lexical_scores_json", pa.string()),
+                ("combined_scores_json", pa.string()),
+            ]
+        )
+        return pq.ParquetWriter(
+            str(self.out_parquet),
+            schema=self._pa_schema,
+            compression=self.parquet_compression,
+        )
+
+    def _coerce_batch_df_for_parquet(self, batch_df: pd.DataFrame) -> pd.DataFrame:
+        # Force consistent dtypes to avoid string vs large_string mismatch
+        batch_df["qa_row_id"] = pd.to_numeric(batch_df["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
+
+        for c in [
+            "report_rel_path",
+            "qa_type",
+            "claim_text",
+            "retrieved_chunk_ids_json",
+            "support_weights_json",
+            "embed_scores_json",
+            "lexical_scores_json",
+            "combined_scores_json",
+        ]:
+            batch_df[c] = batch_df[c].astype(str)
+
+        return batch_df
+
+
+    def run(self) -> None:
+        if not self.qa_csv.exists():
+            raise FileNotFoundError(f"qa_csv not found: {self.qa_csv}")
+        if not self.chunks_parquet.exists():
+            raise FileNotFoundError(f"chunks_parquet not found: {self.chunks_parquet}")
+
+        # load chunks + index
+        chunks_df = self._load_chunks_table()
+        chunk_ids = chunks_df[self.chunk_id_col].to_numpy(dtype=np.int64)
+        chunk_texts = chunks_df[self.chunk_text_col].tolist()
+
+        chunk_embeds = self._build_or_load_chunk_embeddings(chunks_df)
+        index = self._build_or_load_faiss_index(chunk_embeds)
+
+        # stream QA CSV
+        writer = self._init_writer()
+        assert self._pa_schema is not None
+
+        total_rows = sum(1 for _ in open(self.qa_csv, "r", encoding="utf-8", errors="ignore")) - 1
+        pbar = tqdm(
+            total=max(total_rows, 0),
+            desc=self.tqdm_desc,
+            unit="rows",
+            miniters=1,
+        )
+
+        qa_row_id = 0
+        try:
+            for df in pd.read_csv(self.qa_csv, chunksize=self.qa_chunksize_rows):
+                for c in [self.report_path_col, self.qa_type_col, self.claim_col]:
+                    if c not in df.columns:
+                        raise ValueError(f"QA CSV missing required column: {c}")
+
+                df[self.report_path_col] = df[self.report_path_col].astype(str)
+                df[self.qa_type_col] = df[self.qa_type_col].astype(str)
+                df[self.claim_col] = df[self.claim_col].astype(str)
+
+                claims = df[self.claim_col].tolist()
+                q_emb = self._encode_texts(
+                    claims,
+                    max_len=self.max_query_tokens,
+                    batch_size=self.qa_batch_size,
+                    pbar=pbar,  # updates per encoder batch
+                )
+
+                D, I = index.search(q_emb, self.top_k)  # (B,k)
+
+                out_rows: List[Dict[str, object]] = []
+
+                for i in range(len(df)):
+                    report_rel_path = df.iloc[i][self.report_path_col]
+                    qa_type = df.iloc[i][self.qa_type_col]
+                    claim_text = df.iloc[i][self.claim_col]
+                    claim_norm = self._normalize_text(claim_text)
+
+                    if not claim_norm:
+                        out_rows.append(
+                            asdict(
+                                WeakAlignmentRow(
+                                    qa_row_id=qa_row_id,
+                                    report_rel_path=report_rel_path,
+                                    qa_type=qa_type,
+                                    claim_text=claim_text,
+                                    retrieved_chunk_ids_json="[]",
+                                    support_weights_json="[]",
+                                    embed_scores_json="[]",
+                                    lexical_scores_json="[]",
+                                    combined_scores_json="[]",
+                                )
+                            )
+                        )
+                        qa_row_id += 1
+                        continue
+
+                    faiss_idxs = I[i].tolist()
+                    embed_scores = D[i].astype(np.float32).tolist()
+
+                    retrieved_ids: List[int] = []
+                    retrieved_texts: List[str] = []
+                    valid_embed_scores: List[float] = []
+
+                    for j, sc in zip(faiss_idxs, embed_scores):
+                        if j < 0:
+                            continue
+                        retrieved_ids.append(int(chunk_ids[j]))
+                        retrieved_texts.append(chunk_texts[j])
+                        valid_embed_scores.append(float(sc))
+
+                    lex_scores = [float(self._lexical_overlap(claim_norm, t)) for t in retrieved_texts]
+
+                    e = np.array(valid_embed_scores, dtype=np.float32)
+                    l = np.array(lex_scores, dtype=np.float32)
+                    combined = self.alpha * e + (1.0 - self.alpha) * l
+
+                    w = self._weights_from_scores(combined)
+
+                    out_rows.append(
+                        asdict(
+                            WeakAlignmentRow(
+                                qa_row_id=qa_row_id,
+                                report_rel_path=report_rel_path,
+                                qa_type=qa_type,
+                                claim_text=claim_text,
+                                retrieved_chunk_ids_json=json.dumps(retrieved_ids),
+                                support_weights_json=json.dumps([float(x) for x in w.tolist()]),
+                                embed_scores_json=json.dumps([float(x) for x in e.tolist()]),
+                                lexical_scores_json=json.dumps([float(x) for x in l.tolist()]),
+                                combined_scores_json=json.dumps([float(x) for x in combined.tolist()]),
+                            )
+                        )
+                    )
+                    qa_row_id += 1
+
+                batch_df = pd.DataFrame(out_rows)
+                batch_df = self._coerce_batch_df_for_parquet(batch_df)
+
+                table = pa.Table.from_pandas(batch_df, schema=self._pa_schema, preserve_index=False)
+                writer.write_table(table)
+
+        finally:
+            pbar.close()
+            writer.close()
+
+        manifest = {
+            "step": "4B",
+            "qa_csv": str(self.qa_csv.resolve()),
+            "chunks_parquet": str(self.chunks_parquet.resolve()),
+            "out_parquet": str(self.out_parquet.resolve()),
+            "bootstrap_embedder": self.model_name,
+            "params": {
+                "max_query_tokens": self.max_query_tokens,
+                "max_doc_tokens": self.max_doc_tokens,
+                "top_k": self.top_k,
+                "alpha": self.alpha,
+                "temperature": self.temperature,
+                "seed": self.seed,
+                "force_cpu_faiss": self.force_cpu_faiss,
+                "qa_chunksize_rows": self.qa_chunksize_rows,
+                "qa_batch_size": self.qa_batch_size,
+                "doc_batch_size": self.doc_batch_size,
+                "device": self.device,
+            },
+            "cache": {
+                "chunk_embeds_npy": str(self.chunk_embeds_path),
+                "faiss_index": str(self.faiss_index_path),
+            },
+        }
+        (self.out_parquet.parent / "manifest_step4b.json").write_text(
+            json.dumps(manifest, indent=2), encoding="utf-8"
+        )
+
+        print(f"Wrote: {self.out_parquet}")
+        print(f"Wrote: {self.out_parquet.parent / 'manifest_step4b.json'}")
+        print(f"Cache: {self.chunk_embeds_path}  |  {self.faiss_index_path}")
+
+
+
+
+
+
+
+@dataclass(frozen=True)
+class RetrieverSupervisionRow:
+    qa_row_id: int
+    report_rel_path: str
+    qa_type: str
+    claim_text: str
+    pos_chunk_ids_json: str
+    pos_weights_json: str
+
+@dataclass(frozen=True)
+class VerifierSupervisionRow:
+    qa_row_id: int
+    report_rel_path: str
+    qa_type: str
+    case_context: str
+    question: str
+    answer_target: str
+    claim_text: str
+    evidence_chunk_ids_json: str
+    evidence_weights_json: str
+    soft_support_score: float  # deterministic scalar derived from combined_scores
+
+class RadiopaediaStep4CSupervisionBuilder:
+    """
+    Step 4C: Convert Step 3 + Step 4B outputs into final supervision artifacts
+
+    Inputs:
+      - qa_csv: mimic_qa_step3.csv  (Step 3)
+      - weak_alignment_parquet: weak_alignment_step4b.parquet (Step 4B)
+
+    Outputs (in out_dir):
+      - retriever_supervision.parquet
+          query = claim_text
+          targets = top-k evidence chunk ids + soft weights
+      - verifier_supervision.parquet
+          input = case_context + question + answer_target + evidence ids + weights
+          target = soft_support_score (scalar)
+
+    Notes:
+      - Does NOT store evidence text (IDs only).
+      - Streams both QA CSV and alignment parquet in the same qa_row_id order.
+      - Assumes Step 4B wrote rows in strict qa_row_id increasing order.
+    """
+
+    def __init__(
+        self,
+        qa_csv: str | Path,
+        weak_alignment_parquet: str | Path,
+        out_dir: str | Path,
+        # columns in qa_csv
+        report_path_col: str = "report_rel_path",
+        qa_type_col: str = "qa_type",
+        claim_col: str = "claim_text",
+        case_context_col: str = "case_context",
+        question_col: str = "question",
+        answer_col: str = "answer_target",
+        # streaming
+        qa_chunksize_rows: int = 50_000,
+        parquet_batch_rows: int = 50_000,
+        # supervision shaping
+        top_k: Optional[int] = None,  # if set, truncate to first k from 4B
+        min_weight: float = 0.0,      # drop items below this weight after truncation
+        # progress
+        tqdm_desc: str = "Step 4C: building supervision",
+        parquet_compression: str = "zstd",
+    ) -> None:
+        self.qa_csv = Path(qa_csv)
+        self.weak_alignment_parquet = Path(weak_alignment_parquet)
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+        self.report_path_col = str(report_path_col)
+        self.qa_type_col = str(qa_type_col)
+        self.claim_col = str(claim_col)
+        self.case_context_col = str(case_context_col)
+        self.question_col = str(question_col)
+        self.answer_col = str(answer_col)
+
+        self.qa_chunksize_rows = int(qa_chunksize_rows)
+        self.parquet_batch_rows = int(parquet_batch_rows)
+
+        self.top_k = int(top_k) if top_k is not None else None
+        self.min_weight = float(min_weight)
+
+        self.tqdm_desc = str(tqdm_desc)
+        self.parquet_compression = str(parquet_compression)
+
+        self.retriever_out = self.out_dir / "retriever_supervision.parquet"
+        self.verifier_out = self.out_dir / "verifier_supervision.parquet"
+        self.manifest_out = self.out_dir / "manifest_step4c.json"
+
+        self._retr_schema: Optional[pa.Schema] = None
+        self._ver_schema: Optional[pa.Schema] = None
+
+
+    def _safe_str(self, x) -> str:
+        if x is None:
+            return ""
+        s = str(x)
+        return "" if s.lower() == "nan" else s
+
+    def _loads_json_list(self, s: str) -> List:
+        try:
+            return json.loads(s)
+        except Exception:
+            return []
+
+    def _filter_and_truncate(self, ids: List[int], w: List[float]) -> Tuple[List[int], List[float]]:
+        if self.top_k is not None:
+            ids = ids[: self.top_k]
+            w = w[: self.top_k]
+        if self.min_weight > 0:
+            keep = [(i, ww) for i, ww in zip(ids, w) if float(ww) >= self.min_weight]
+            ids = [int(i) for i, _ in keep]
+            w = [float(ww) for _, ww in keep]
+        return ids, w
+
+    def _soft_support_from_combined(self, combined_scores: List[float]) -> float:
+        """
+        Deterministic scalar target for verifier.
+        We use max(combined_scores) because:
+          - stable
+          - monotone with best-evidence match
+          - does not depend on k length (beyond retrieval)
+        If list is empty -> 0.0
+        """
+        if not combined_scores:
+            return 0.0
+        try:
+            return float(np.max(np.asarray(combined_scores, dtype=np.float32)))
+        except Exception:
+            return 0.0
+
+
+    def _init_retriever_writer(self) -> pq.ParquetWriter:
+        self._retr_schema = pa.schema(
+            [
+                ("qa_row_id", pa.int64()),
+                ("report_rel_path", pa.string()),
+                ("qa_type", pa.string()),
+                ("claim_text", pa.string()),
+                ("pos_chunk_ids_json", pa.string()),
+                ("pos_weights_json", pa.string()),
+            ]
+        )
+        return pq.ParquetWriter(
+            str(self.retriever_out),
+            schema=self._retr_schema,
+            compression=self.parquet_compression,
+        )
+
+    def _init_verifier_writer(self) -> pq.ParquetWriter:
+        self._ver_schema = pa.schema(
+            [
+                ("qa_row_id", pa.int64()),
+                ("report_rel_path", pa.string()),
+                ("qa_type", pa.string()),
+                ("case_context", pa.string()),
+                ("question", pa.string()),
+                ("answer_target", pa.string()),
+                ("claim_text", pa.string()),
+                ("evidence_chunk_ids_json", pa.string()),
+                ("evidence_weights_json", pa.string()),
+                ("soft_support_score", pa.float32()),
+            ]
+        )
+        return pq.ParquetWriter(
+            str(self.verifier_out),
+            schema=self._ver_schema,
+            compression=self.parquet_compression,
+        )
+
+    def _to_table(self, df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
+        # Force stable dtypes to avoid string/large_string drift
+        for c in schema.names:
+            if c not in df.columns:
+                df[c] = None
+
+        df["qa_row_id"] = pd.to_numeric(df["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
+
+        for c in [
+            "report_rel_path",
+            "qa_type",
+            "claim_text",
+            "pos_chunk_ids_json",
+            "pos_weights_json",
+            "case_context",
+            "question",
+            "answer_target",
+            "evidence_chunk_ids_json",
+            "evidence_weights_json",
+        ]:
+            if c in df.columns:
+                df[c] = df[c].astype(str)
+
+        if "soft_support_score" in df.columns:
+            df["soft_support_score"] = pd.to_numeric(df["soft_support_score"], errors="coerce").fillna(0.0).astype(
+                np.float32
+            )
+
+        return pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+
+
+    def run(self) -> None:
+        if not self.qa_csv.exists():
+            raise FileNotFoundError(f"QA CSV not found: {self.qa_csv}")
+        if not self.weak_alignment_parquet.exists():
+            raise FileNotFoundError(f"Weak alignment parquet not found: {self.weak_alignment_parquet}")
+
+        total_rows = sum(1 for _ in open(self.qa_csv, "r", encoding="utf-8", errors="ignore")) - 1
+        pbar = tqdm(total=max(total_rows, 0), desc=self.tqdm_desc, unit="rows", miniters=1)
+
+        retr_writer = self._init_retriever_writer()
+        ver_writer = self._init_verifier_writer()
+        assert self._retr_schema is not None
+        assert self._ver_schema is not None
+
+        # Stream alignment parquet in row groups/batches
+        pf = pq.ParquetFile(str(self.weak_alignment_parquet))
+
+        # Alignment columns we need
+        align_cols = [
+            "qa_row_id",
+            "report_rel_path",
+            "qa_type",
+            "claim_text",
+            "retrieved_chunk_ids_json",
+            "support_weights_json",
+            "combined_scores_json",
+        ]
+
+        # QA columns we need
+        needed_qa_cols = [
+            self.report_path_col,
+            self.qa_type_col,
+            self.claim_col,
+            self.case_context_col,
+            self.question_col,
+            self.answer_col,
+        ]
+
+        qa_reader = pd.read_csv(self.qa_csv, chunksize=self.qa_chunksize_rows)
+
+        # We join by order: qa_row_id increments with QA row order in Step 4B.
+        # That means: the N-th row in QA CSV corresponds to alignment qa_row_id=N.
+        qa_row_id_expected = 0
+        align_row_id_expected = 0
+
+        try:
+            # iterate alignment parquet batches
+            align_iter = pf.iter_batches(batch_size=self.parquet_batch_rows, columns=align_cols)
+
+            for qa_chunk in qa_reader:
+                # Validate QA columns
+                for c in needed_qa_cols:
+                    if c not in qa_chunk.columns:
+                        raise ValueError(f"QA CSV missing required column: {c}")
+
+                # Make QA chunk deterministic and safe
+                qa_chunk = qa_chunk.copy()
+                qa_chunk[self.report_path_col] = qa_chunk[self.report_path_col].astype(str)
+                qa_chunk[self.qa_type_col] = qa_chunk[self.qa_type_col].astype(str)
+                qa_chunk[self.claim_col] = qa_chunk[self.claim_col].astype(str)
+                qa_chunk[self.case_context_col] = qa_chunk[self.case_context_col].astype(str)
+                qa_chunk[self.question_col] = qa_chunk[self.question_col].astype(str)
+                qa_chunk[self.answer_col] = qa_chunk[self.answer_col].astype(str)
+
+                n = len(qa_chunk)
+
+                # Pull exactly n alignment rows from parquet batches (may span multiple batches)
+                align_rows: List[pd.DataFrame] = []
+                need = n
+                while need > 0:
+                    batch = next(align_iter, None)
+                    if batch is None:
+                        raise RuntimeError(
+                            f"Alignment parquet ended early. Still needed {need} rows for current QA chunk."
+                        )
+                    bdf = batch.to_pandas()
+                    align_rows.append(bdf)
+                    need -= len(bdf)
+
+                align_df = pd.concat(align_rows, ignore_index=True)
+                if len(align_df) > n:
+                    # To keep code simple + deterministic, we disallow overread by requiring batch_size == qa_chunksize_rows.
+                    align_df = align_df.iloc[:n].copy()
+
+                # Sanity check ordering
+                # qa_row_id is required to be contiguous and match expected counters.
+                if "qa_row_id" not in align_df.columns:
+                    raise ValueError("Alignment parquet missing qa_row_id column.")
+
+                first_id = int(align_df.iloc[0]["qa_row_id"])
+                if first_id != align_row_id_expected:
+                    raise RuntimeError(
+                        f"Alignment qa_row_id mismatch: expected {align_row_id_expected}, got {first_id}. "
+                        f"(This usually means alignment parquet is not in the same order as QA CSV.)"
+                    )
+
+                # Build supervision rows
+                retr_rows: List[Dict[str, object]] = []
+                ver_rows: List[Dict[str, object]] = []
+
+                for i in range(n):
+                    # expected ids
+                    qa_row_id = qa_row_id_expected
+                    al_row = align_df.iloc[i]
+
+                    # parse retrieved ids + weights
+                    ids = self._loads_json_list(self._safe_str(al_row.get("retrieved_chunk_ids_json", "[]")))
+                    w = self._loads_json_list(self._safe_str(al_row.get("support_weights_json", "[]")))
+                    combined = self._loads_json_list(self._safe_str(al_row.get("combined_scores_json", "[]")))
+
+                    # coerce lists
+                    ids = [int(x) for x in ids if str(x).strip() != ""]
+                    w = [float(x) for x in w]
+                    combined = [float(x) for x in combined]
+
+                    ids, w = self._filter_and_truncate(ids, w)
+                    # keep list lengths consistent
+                    if len(w) != len(ids):
+                        m = min(len(w), len(ids))
+                        ids, w = ids[:m], w[:m]
+
+                    # QA fields
+                    report_rel_path = self._safe_str(qa_chunk.iloc[i][self.report_path_col])
+                    qa_type = self._safe_str(qa_chunk.iloc[i][self.qa_type_col])
+                    claim_text = self._safe_str(qa_chunk.iloc[i][self.claim_col])
+                    case_context = self._safe_str(qa_chunk.iloc[i][self.case_context_col])
+                    question = self._safe_str(qa_chunk.iloc[i][self.question_col])
+                    answer_target = self._safe_str(qa_chunk.iloc[i][self.answer_col])
+
+                    retr_rows.append(
+                        asdict(
+                            RetrieverSupervisionRow(
+                                qa_row_id=qa_row_id,
+                                report_rel_path=report_rel_path,
+                                qa_type=qa_type,
+                                claim_text=claim_text,
+                                pos_chunk_ids_json=json.dumps(ids),
+                                pos_weights_json=json.dumps([float(x) for x in w]),
+                            )
+                        )
+                    )
+
+                    ver_rows.append(
+                        asdict(
+                            VerifierSupervisionRow(
+                                qa_row_id=qa_row_id,
+                                report_rel_path=report_rel_path,
+                                qa_type=qa_type,
+                                case_context=case_context,
+                                question=question,
+                                answer_target=answer_target,
+                                claim_text=claim_text,
+                                evidence_chunk_ids_json=json.dumps(ids),
+                                evidence_weights_json=json.dumps([float(x) for x in w]),
+                                soft_support_score=self._soft_support_from_combined(combined),
+                            )
+                        )
+                    )
+
+                    qa_row_id_expected += 1
+                    align_row_id_expected += 1
+
+                # Write batches
+                retr_df = pd.DataFrame(retr_rows)
+                ver_df = pd.DataFrame(ver_rows)
+
+                retr_writer.write_table(self._to_table(retr_df, self._retr_schema))
+                ver_writer.write_table(self._to_table(ver_df, self._ver_schema))
+
+                pbar.update(n)
+
+        finally:
+            pbar.close()
+            retr_writer.close()
+            ver_writer.close()
+
+        manifest = {
+            "step": "4C",
+            "inputs": {
+                "qa_csv": str(self.qa_csv.resolve()),
+                "weak_alignment_parquet": str(self.weak_alignment_parquet.resolve()),
+            },
+            "outputs": {
+                "retriever_supervision": str(self.retriever_out),
+                "verifier_supervision": str(self.verifier_out),
+            },
+            "params": {
+                "qa_chunksize_rows": self.qa_chunksize_rows,
+                "parquet_batch_rows": self.parquet_batch_rows,
+                "top_k": self.top_k,
+                "min_weight": self.min_weight,
+                "soft_support_scalar": "max(combined_scores)",
+            },
+        }
+        self.manifest_out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+        print(f"Wrote: {self.retriever_out}")
+        print(f"Wrote: {self.verifier_out}")
+        print(f"Wrote: {self.manifest_out}")
+
+
+
+
+
 
 if __name__ == "__main__":
-    builder = MimicCaseContextBuilder(
-        master_csv="//MIMIC/mimic_master_list_forReports.csv",
-        reports_root="//MIMIC",
-        out_path="mimic_case_contexts.csv",
-    )
-    out_df = builder.build_case_context_table()
-    print(out_df[["report_rel_path", "case_context"]].head(3))
-    print("Rows:", len(out_df))
-
-
-    # step 2
-    builder = MimicFactTableBuilder(
-        master_csv="//MIMIC/mimic_master_list_forReports.csv",
-        case_context_csv="//MIMIC/mimic_case_contexts.csv",
-        out_path="mimic_facts_long.csv",
-    )
-    facts_df = builder.build_fact_table()
-    print(facts_df.head(10))
-    print("n_facts:", len(facts_df))
-
-
-
-    # step 3
-    builder = MimicQATableBuilder(
-        facts_long_csv="//MIMIC/mimic_facts_long.csv",
-        out_path="mimic_qa_step3.csv",
-    )
-    qa_df = builder.build_qa_table()
-    print("QA rows:", len(qa_df))
-    print(qa_df[["qa_type", "question", "answer_target"]].head(10))
-
+    # # step 1
+    # builder = MimicCaseContextBuilder(
+    #     master_csv="//MIMIC/mimic_master_list_forReports.csv",
+    #     reports_root="//MIMIC",
+    #     out_path="mimic_case_contexts.csv",
+    # )
+    # out_df = builder.build_case_context_table()
+    # print(out_df[["report_rel_path", "case_context"]].head(3))
+    # print("Rows:", len(out_df))
+    #
+    #
+    # # step 2
+    # builder = MimicFactTableBuilder(
+    #     master_csv="//MIMIC/mimic_master_list_forReports.csv",
+    #     case_context_csv="/MIMIC/mimic_case_contexts.csv",
+    #     out_path="mimic_facts_long.csv",
+    # )
+    # facts_df = builder.build_fact_table()
+    # print(facts_df.head(10))
+    # print("n_facts:", len(facts_df))
+    #
+    #
+    #
+    # # step 3
+    # builder = MimicQATableBuilder(
+    #     facts_long_csv="//MIMIC/mimic_facts_long.csv",
+    #     out_path="mimic_qa_step3.csv",
+    # )
+    # qa_df = builder.build_qa_table()
+    # print("QA rows:", len(qa_df))
+    # print(qa_df[["qa_type", "question", "answer_target"]].head(10))
+    #
+    #
+    #
+    # # # step 4a
+    # builder = RadiopaediaSnapshotBuilder(
+    #     in_dir="/PATH/Radiopaedia/Text_only/Articles_Processed_Jan_2026/articles_clean_txt",
+    #     out_dir="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026",
+    #     snapshot_name="RadiopaediaSnapshot_29_01_2026",
+    #     tokenizer_name="sentence-transformers/all-mpnet-base-v2",
+    #     target_tokens=200,
+    #     min_tokens=50,
+    #     write_csv=False,
+    # )
+    # chunks_df = builder.run()
+    #
+    #
+    #
+    # # # step 4b
+    # builder = RadiopaediaWeakEvidenceAligner(
+    #     qa_csv="/PATH/MIMIC/mimic_qa_step3.csv",
+    #     chunks_parquet="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026/chunks.parquet",
+    #     out_parquet="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026/weak_alignment_step4b.parquet",
+    #     model_name="sentence-transformers/all-mpnet-base-v2",
+    #     top_k=20,
+    #     alpha=0.85,
+    #     temperature=0.07,  # keep >0; deterministic with fixed seeds + eval()
+    #     seed=13,
+    #     cache_dir="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026/cache_step4b",
+    #     device="cuda",
+    #     # device="cpu",
+    #     force_cpu_faiss=True,
+    # )
+    # builder.run()
+    #
+    #
+    #
+    # # # step 4c
+    # builder = RadiopaediaStep4CSupervisionBuilder(
+    #     qa_csv="/PATH/MIMIC/mimic_qa_step3.csv",
+    #     weak_alignment_parquet="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026/weak_alignment_step4b.parquet",
+    #     out_dir="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026/step4c_supervision",
+    #     top_k=20,  # keep only first 20
+    #     min_weight=0.0,  # keep all weights
+    #     qa_chunksize_rows=50_000,
+    #     parquet_batch_rows=50_000,
+    # )
+    # builder.run()
