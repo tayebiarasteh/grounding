@@ -22,6 +22,8 @@ import pyarrow.parquet as pq
 import torch
 import random
 import numpy as np
+import os
+import yaml
 
 
 import warnings
@@ -2437,87 +2439,116 @@ class RadiopaediaStep4CSupervisionBuilder:
 
 
 
+
+
+
+
+
+
+
+
+
+
+
 if __name__ == "__main__":
-    # # step 1
+    global_config_path = "/PATH/grounding/config/config.yaml"
+
+    with open(global_config_path, 'r') as yaml_file:
+        params = yaml.safe_load(yaml_file)
+    base_path_mimicData = params['Preprocessing']['base_path_mimicData']
+    base_path_evidenceData = params['Preprocessing']['base_path_evidenceData']
+
+
+
+    ''' step 1 '''
     # builder = MimicCaseContextBuilder(
-    #     master_csv="//MIMIC/mimic_master_list_forReports.csv",
-    #     reports_root="//MIMIC",
+    #     master_csv=os.path.join(base_path_mimicData, "mimic_master_list_forReports.csv"),
+    #     reports_root=base_path_mimicData,
     #     out_path="mimic_case_contexts.csv",
     # )
     # out_df = builder.build_case_context_table()
     # print(out_df[["report_rel_path", "case_context"]].head(3))
     # print("Rows:", len(out_df))
-    #
-    #
-    # # step 2
+
+
+
+    ''' step 2 '''
     # builder = MimicFactTableBuilder(
-    #     master_csv="//MIMIC/mimic_master_list_forReports.csv",
-    #     case_context_csv="/MIMIC/mimic_case_contexts.csv",
+    #     master_csv=os.path.join(base_path_mimicData, "mimic_master_list_forReports.csv"),
+    #     case_context_csv=os.path.join(base_path_mimicData, "mimic_case_contexts.csv"),
     #     out_path="mimic_facts_long.csv",
     # )
     # facts_df = builder.build_fact_table()
     # print(facts_df.head(10))
     # print("n_facts:", len(facts_df))
-    #
-    #
-    #
-    # # step 3
+
+
+
+    ''' step 3 '''
     # builder = MimicQATableBuilder(
-    #     facts_long_csv="//MIMIC/mimic_facts_long.csv",
+    #     facts_long_csv=os.path.join(base_path_mimicData, "mimic_facts_long.csv"),
     #     out_path="mimic_qa_step3.csv",
     # )
     # qa_df = builder.build_qa_table()
     # print("QA rows:", len(qa_df))
     # print(qa_df[["qa_type", "question", "answer_target"]].head(10))
-    #
-    #
-    #
-    # # # step 4a
+
+
+
+
+    ''' step 4a: RadiopaediaSnapshot_v1 (chunking only, no embeddings) '''
     # builder = RadiopaediaSnapshotBuilder(
-    #     in_dir="/PATH/Radiopaedia/Text_only/Articles_Processed_Jan_2026/articles_clean_txt",
-    #     out_dir="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026",
-    #     snapshot_name="RadiopaediaSnapshot_29_01_2026",
-    #     tokenizer_name="sentence-transformers/all-mpnet-base-v2",
+    #     in_dir=os.path.join(base_path_mimicData, "articles_clean_txt"),  # folder with ~17k *.txt
+    #     out_dir=base_path_evidenceData,
+    #     snapshot_name=params['Preprocessing']['snapshot_name'],
+    #     tokenizer_name=params['Preprocessing']['tokenizer_name'],
     #     target_tokens=200,
     #     min_tokens=50,
-    #     write_csv=False,
+    #     write_csv=False,  # parquet is preferred
     # )
     # chunks_df = builder.run()
-    #
-    #
-    #
-    # # # step 4b
+    # print(chunks_df.head(10))
+    # print("n_chunks:", len(chunks_df))
+    # print("n_articles:", chunks_df["article_id"].nunique())
+    # print(chunks_df[["chunk_id", "article_id", "article_title", "chunk_token_count"]].head(10))
+
+
+
+
+
+    ''' step 4b '''
     # builder = RadiopaediaWeakEvidenceAligner(
-    #     qa_csv="/PATH/MIMIC/mimic_qa_step3.csv",
-    #     chunks_parquet="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026/chunks.parquet",
-    #     out_parquet="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026/weak_alignment_step4b.parquet",
-    #     model_name="sentence-transformers/all-mpnet-base-v2",
+    #     qa_csv=os.path.join(base_path_mimicData, "mimic_qa_step3.csv"),
+    #     chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
+    #     out_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step4b.parquet"),
+    #     model_name=params['Preprocessing']['tokenizer_name'],
     #     top_k=20,
     #     alpha=0.85,
     #     temperature=0.07,  # keep >0; deterministic with fixed seeds + eval()
     #     seed=13,
-    #     cache_dir="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026/cache_step4b",
+    #     cache_dir=os.path.join(base_path_evidenceData, "cache_step4b"),
     #     device="cuda",
     #     # device="cpu",
     #     force_cpu_faiss=True,
     # )
     # builder.run()
-    #
-    #
-    #
-    # # # step 4c
-    # builder = RadiopaediaStep4CSupervisionBuilder(
-    #     qa_csv="/PATH/MIMIC/mimic_qa_step3.csv",
-    #     weak_alignment_parquet="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026/weak_alignment_step4b.parquet",
-    #     out_dir="/PATH/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026/step4c_supervision",
-    #     top_k=20,
-    #     min_weight=0.0,
-    #     qa_chunksize_rows=50_000,
-    #     parquet_batch_rows=50_000,
-    #     subject_id_col="subject_id",  # must exist in mimic_qa_step3.csv
-    #     split_seed=13,
-    #     frac_train=0.75,
-    #     frac_valid=0.10,
-    #     frac_test=0.15,
-    # )
-    # builder.run()
+
+
+
+
+    ''' step 4c '''
+    builder = RadiopaediaStep4CSupervisionBuilder(
+        qa_csv=os.path.join(base_path_mimicData, "mimic_qa_step3.csv"),
+        weak_alignment_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step4b.parquet"),
+        out_dir=os.path.join(base_path_evidenceData, "step4c_supervision"),
+        top_k=20,
+        min_weight=0.0,
+        qa_chunksize_rows=50_000,
+        parquet_batch_rows=50_000,
+        subject_id_col="subject_id",  # must exist in mimic_qa_step3.csv
+        split_seed=13,
+        frac_train=0.75,
+        frac_valid=0.10,
+        frac_test=0.15,
+    )
+    builder.run()
