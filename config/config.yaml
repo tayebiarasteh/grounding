@@ -1,0 +1,41 @@
+retriever:
+  model_name: sentence-transformers/all-mpnet-base-v2
+  tied_encoders: true            # true = shared weights
+  pooling: mean                  # mean pooling over last_hidden_state
+#  max_query_tokens: 128
+  max_query_tokens: 64
+#  max_doc_tokens: 256
+  max_doc_tokens: 128
+  temperature: 0.07              # tau in InfoNCE
+#  top_k_positives: 20            # K per query (must match step4c top_k)
+  top_k_positives: 8            # K per query (must match step4c top_k)
+  min_pos_weight: 0.0            # drop positives below this weight (usually 0.0)
+
+paths:
+  base_path: /PATH/RadiopaediaSnapshot_29_01_2026
+  output_dir: /PATH/outputs_step5_retriever
+
+Network:
+  seed: 13
+  num_epochs: 10
+  batch_size: 8                 # effective docs per batch = batch_size * top_k_positives
+  lr: 2e-5
+  weight_decay: 0.01
+  grad_clip_norm: 1.0
+
+runtime:
+  use_amp: true # useful for speed
+
+
+network_output_path: network_data/
+output_data_path: output_data/
+tb_logs_path: tensor_board_logs/
+stat_log_path: stat_logs
+checkpoint_name: checkpoint.tar
+trained_model_name: trained_model.pth
+hf_login: "xxxxxxxxxxx"
+
+
+# changeable items:
+target_dir: /PATH/grounding/
+display_stats_freq: 1 # valid freq is equal to this
