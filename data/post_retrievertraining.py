@@ -1212,7 +1212,6 @@ class RadiopaediaStep6CSupervisionBuilder:
 
 
 
-
 @dataclass(frozen=True)
 class VerifierMaterializedRow:
     qa_row_id: int
@@ -1230,6 +1229,7 @@ class VerifierMaterializedRow:
 
     evidence_texts_json: str          # list[str] aligned with ids
     evidence_text_concat: str         # concatenated evidence text for DeBERTa input
+    evidence_text: str                # SAME AS evidence_text_concat (for downstream dataset compatibility)
 
     soft_support_score: float
 
@@ -1238,9 +1238,10 @@ class RadiopaediaStep7VerifierMaterializer:
     """
     Step 7 — Prepare verifier training examples (materialize evidence text)
 
-    Why:
-      - verifier_supervision.parquet stores only chunk IDs + weights.
-      - verifier training needs actual evidence text.
+    Fixes:
+      1) Writes an 'evidence_text' column (alias of evidence_text_concat) so Step 8 Dataset can find it.
+      2) Keeps streaming; does NOT read full parquet into RAM.
+      3) Avoids pandas iterrows; uses Arrow batch -> Python lists (faster, lower overhead).
 
     Inputs:
       - verifier_supervision.parquet  (from Step 6C)
@@ -1341,7 +1342,6 @@ class RadiopaediaStep7VerifierMaterializer:
 
         df[self.chunk_text_col] = df[self.chunk_text_col].astype(str).map(self._normalize_text)
 
-        # build dict
         chunk_map: Dict[int, str] = {}
         for cid, txt in zip(df[self.chunk_id_col].tolist(), df[self.chunk_text_col].tolist()):
             chunk_map[int(cid)] = txt
@@ -1366,6 +1366,7 @@ class RadiopaediaStep7VerifierMaterializer:
                 ("evidence_weights_json", pa.string()),
                 ("evidence_texts_json", pa.string()),
                 ("evidence_text_concat", pa.string()),
+                ("evidence_text", pa.string()),          # NEW: alias for Step 8 dataset compatibility
                 ("soft_support_score", pa.float32()),
             ]
         )
@@ -1397,12 +1398,11 @@ class RadiopaediaStep7VerifierMaterializer:
             "evidence_weights_json",
             "evidence_texts_json",
             "evidence_text_concat",
+            "evidence_text",
         ]:
             df[c] = df[c].astype(str)
 
-        df["soft_support_score"] = pd.to_numeric(df["soft_support_score"], errors="coerce").fillna(0.0).astype(
-            np.float32
-        )
+        df["soft_support_score"] = pd.to_numeric(df["soft_support_score"], errors="coerce").fillna(0.0).astype(np.float32)
         return df
 
     def run(self) -> None:
@@ -1440,29 +1440,44 @@ class RadiopaediaStep7VerifierMaterializer:
 
         try:
             for batch in pf.iter_batches(batch_size=self.parquet_batch_rows, columns=in_cols):
-                bdf = batch.to_pandas()
+                # Arrow -> python lists (avoid pandas iterrows)
+                b = batch  # RecordBatch
+
+                qa_row_ids = b.column(b.schema.get_field_index("qa_row_id")).to_pylist()
+                subject_ids = b.column(b.schema.get_field_index("subject_id")).to_pylist()
+                splits = b.column(b.schema.get_field_index("split")).to_pylist()
+                report_rel_paths = b.column(b.schema.get_field_index("report_rel_path")).to_pylist()
+                qa_types = b.column(b.schema.get_field_index("qa_type")).to_pylist()
+                case_contexts = b.column(b.schema.get_field_index("case_context")).to_pylist()
+                questions = b.column(b.schema.get_field_index("question")).to_pylist()
+                answer_targets = b.column(b.schema.get_field_index("answer_target")).to_pylist()
+                claim_texts = b.column(b.schema.get_field_index("claim_text")).to_pylist()
+                ids_jsons = b.column(b.schema.get_field_index("evidence_chunk_ids_json")).to_pylist()
+                w_jsons = b.column(b.schema.get_field_index("evidence_weights_json")).to_pylist()
+                scores = b.column(b.schema.get_field_index("soft_support_score")).to_pylist()
 
                 out_rows: List[Dict[str, object]] = []
+                n = len(qa_row_ids)
 
-                for _, row in bdf.iterrows():
-                    qa_row_id = int(row["qa_row_id"])
-                    subject_id = int(row["subject_id"])
-                    split = self._safe_str(row["split"])
+                for i in range(n):
+                    qa_row_id = int(qa_row_ids[i]) if qa_row_ids[i] is not None else -1
+                    subject_id = int(subject_ids[i]) if subject_ids[i] is not None else -1
+                    split = self._safe_str(splits[i])
 
-                    report_rel_path = self._safe_str(row["report_rel_path"])
-                    qa_type = self._safe_str(row["qa_type"])
-                    case_context = self._safe_str(row["case_context"])
-                    question = self._safe_str(row["question"])
-                    answer_target = self._safe_str(row["answer_target"])
-                    claim_text = self._safe_str(row["claim_text"])
+                    report_rel_path = self._safe_str(report_rel_paths[i])
+                    qa_type = self._safe_str(qa_types[i])
+                    case_context = self._safe_str(case_contexts[i])
+                    question = self._safe_str(questions[i])
+                    answer_target = self._safe_str(answer_targets[i])
+                    claim_text = self._safe_str(claim_texts[i])
 
-                    ids = self._loads_json_list(self._safe_str(row["evidence_chunk_ids_json"]))
-                    w = self._loads_json_list(self._safe_str(row["evidence_weights_json"]))
+                    ids = self._loads_json_list(self._safe_str(ids_jsons[i]))
+                    w = self._loads_json_list(self._safe_str(w_jsons[i]))
 
                     ids = [int(x) for x in ids if str(x).strip() != ""]
                     w = [float(x) for x in w]
 
-                    # keep aligned lengths
+                    # length align
                     if len(ids) != len(w):
                         m = min(len(ids), len(w))
                         ids, w = ids[:m], w[:m]
@@ -1472,15 +1487,20 @@ class RadiopaediaStep7VerifierMaterializer:
                         m = min(len(ids), len(w))
                         ids, w = ids[:m], w[:m]
 
-                    # materialize texts
+                    # materialize texts aligned with ids (keep empties if missing)
                     texts: List[str] = []
                     for cid in ids:
                         txt = self._chunk_map.get(int(cid), "")
                         texts.append(self._normalize_text(txt))
 
-                    # concat (even if some are empty, keep them; the verifier sees what the retriever produced)
-                    evidence_concat = self.evidence_sep.join([t for t in texts if t != ""])
-                    soft_support_score = float(row.get("soft_support_score", 0.0))
+                    # concat using non-empty chunks (keeps signal, avoids huge separators)
+                    evidence_concat = self.evidence_sep.join([t for t in texts if t.strip() != ""])
+                    evidence_text = evidence_concat  # NEW: alias
+
+                    try:
+                        soft_support_score = float(scores[i]) if scores[i] is not None else 0.0
+                    except Exception:
+                        soft_support_score = 0.0
 
                     out_rows.append(
                         asdict(
@@ -1498,6 +1518,7 @@ class RadiopaediaStep7VerifierMaterializer:
                                 evidence_weights_json=json.dumps([float(x) for x in w]),
                                 evidence_texts_json=json.dumps(texts),
                                 evidence_text_concat=evidence_concat,
+                                evidence_text=evidence_text,
                                 soft_support_score=soft_support_score,
                             )
                         )
@@ -1524,6 +1545,7 @@ class RadiopaediaStep7VerifierMaterializer:
             },
             "outputs": {
                 "verifier_train_materialized": str(self.out_parquet.resolve()),
+                "manifest_step7": str(self.manifest_out.resolve()),
             },
             "params": {
                 "max_evidence_chunks": self.max_evidence_chunks,
@@ -1531,6 +1553,7 @@ class RadiopaediaStep7VerifierMaterializer:
                 "evidence_sep": self.evidence_sep,
                 "parquet_batch_rows": self.parquet_batch_rows,
                 "parquet_compression": self.parquet_compression,
+                "evidence_text_column": "evidence_text (alias of evidence_text_concat)",
             },
             "stats": {
                 "rows_written": int(written),
@@ -1546,10 +1569,7 @@ class RadiopaediaStep7VerifierMaterializer:
 
 
 
-
 if __name__ == "__main__":
-    global_config_path = "/PATH/grounding/config/config.yaml"
-    model_weights_path = "/PATH/trained_model.pth"
     experiment_name = "name"
 
 
@@ -1614,10 +1634,12 @@ if __name__ == "__main__":
 
     ''' step 7 '''
     builder = RadiopaediaStep7VerifierMaterializer(
-        verifier_supervision_parquet=os.path.join(base_path_evidenceData, "step6c_supervision_rstar/verifier_supervision.parquet"),
+        verifier_supervision_parquet=os.path.join(
+            base_path_evidenceData, "step6c_supervision_rstar/verifier_supervision.parquet"
+        ),
         chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
         out_dir=os.path.join(base_path_evidenceData, "step7_verifier_materialized_rstar"),
-        max_evidence_chunks=20,      # keep consistent with top_k
+        max_evidence_chunks=20,  # keep consistent with top_k
         min_evidence_weight=0.0,
         parquet_batch_rows=50_000,
         parquet_compression="zstd",
