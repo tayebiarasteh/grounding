@@ -12,21 +12,19 @@ import os
 from torch.utils.data import Dataset
 from torch.nn import BCEWithLogitsLoss
 from torchvision import transforms, models
-import timm
 import numpy as np
 from torch import nn
-from sklearn import metrics
 import pandas as pd
 import matplotlib
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoImageProcessor, AutoModel
 matplotlib.use('Agg')
-from transformers import AutoImageProcessor, AutoModel
-from opacus.validators import ModuleValidator
 
 from config.serde import open_experiment, create_experiment, delete_experiment, write_config
 from Train_Valid_grounding import Training
 from Prediction_grounding import Prediction
-from data.data_provider import RadiopaediaChunksStore, RetrieverSupervisionDataset, retriever_collate_fn
+from data.data_provider import RadiopaediaChunksStore, RetrieverSupervisionDataset, retriever_collate_fn, VerifierSupervisionDataset, verifier_collate_fn
 from models.model import BiEncoder, WeightedInfoNCELoss
+from Train_Valid_verifier import TrainingVerifier
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -112,96 +110,118 @@ def main_train_retriever(global_config_path="/PATH/config/config.yaml", valid=Fa
 
 
 
-
-
-def main_test_retriever(demographics, global_config_path="/PATH/dp_dinov3/config/config.yaml",
-                                                 experiment_name='central_exp_for_test', experiment_epoch_num=100,
-                        dataset_name='vindr', dino=True, image_size=224, new_seed=False):
-    """Main function for multi label prediction
-
-    Parameters
-    ----------
-    experiment_name: str
-        name of the experiment to be loaded.
+def main_train_verifier(global_config_path="/PATH/config/config.yaml", valid=False, resume=False, experiment_name="name"):
     """
-    params = open_experiment(experiment_name, global_config_path)
-    cfg_path = params['cfg_path']
-    login(token=params["hf_login"])
+    Main function for verifier (Step 8) training + optional validation.
 
-    if dataset_name == 'vindr':
-        test_dataset = vindr_data_loader_2D(cfg_path=cfg_path, mode='test', augment=False, image_size=image_size, demographics=demographics)
-    elif dataset_name == 'chexpert':
-        test_dataset = chexpert_data_loader_2D(cfg_path=cfg_path, mode='test', augment=False, image_size=image_size, demographics=demographics)
-    elif dataset_name == 'mimic':
-        test_dataset = mimic_data_loader_2D(cfg_path=cfg_path, mode='test', augment=False, image_size=image_size, demographics=demographics)
-    elif dataset_name == 'UKA':
-        test_dataset = UKA_data_loader_2D(cfg_path=cfg_path, mode='test', augment=False, image_size=image_size, demographics=demographics)
-    elif dataset_name == 'cxr14':
-        test_dataset = cxr14_data_loader_2D(cfg_path=cfg_path, mode='test', augment=False, image_size=image_size, demographics=demographics)
-    elif dataset_name == 'padchest':
-        test_dataset = padchest_data_loader_2D(cfg_path=cfg_path, mode='test', augment=False, image_size=image_size, demographics=demographics)
-    weight = test_dataset.pos_weight()
-    label_names = test_dataset.chosen_labels
-
-
-    # Changeable network parameters
-    if dino:
-        model = AutoModel.from_pretrained(
-            "facebook/dinov3-convnext-small-pretrain-lvd1689m",  # dinov3
-            # "facebook/dinov3-convnext-tiny-pretrain-lvd1689m",  # dinov3
-            use_safetensors=True
-        )
-        model.head = torch.nn.Linear(in_features=768, out_features=len(weight))
+    Mirrors your retriever main_train_retriever structure.
+    """
+    if resume is True:
+        params = open_experiment(experiment_name, global_config_path)
     else:
-        model = AutoModel.from_pretrained(
-            "facebook/convnext-small-224", # ImageNet-1k
-            # "facebook/convnext-tiny-224", # ImageNet-1k
-            use_safetensors=True
-        )
-        model.head = torch.nn.Linear(in_features=768, out_features=len(weight))
+        params = create_experiment(experiment_name, global_config_path)
 
+    cfg_path = params["cfg_path"]
 
-    test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=params['Network']['batch_size'],
-                                               pin_memory=True, drop_last=False, shuffle=False, num_workers=11)
+    # datasets
+    train_dataset = VerifierSupervisionDataset(cfg_path=cfg_path, split_name="train")
+    valid_dataset = VerifierSupervisionDataset(cfg_path=cfg_path, split_name="valid")
 
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=int(params["Network"]["batch_size"]),
+        shuffle=True,
+        num_workers=2,
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=2,
+        collate_fn=verifier_collate_fn,
+        drop_last=True)
 
-    os.makedirs(os.path.join(params['target_dir'], params['stat_log_path'], demographics), exist_ok=True)
-    if new_seed:
-        index_list = []
-        for counter in range(1000):
-            index_list.append(np.random.choice(len(test_dataset), len(test_dataset)))
-        np.save(os.path.join(params['target_dir'], params['stat_log_path'], demographics) + '/bootstrapping_seeds_' + str(dataset_name) + ".npy", index_list, allow_pickle=True)
-
-
+    if valid:
+        valid_loader = torch.utils.data.DataLoader(
+            valid_dataset,
+            batch_size=int(params["Network"]["batch_size"]),
+            shuffle=False,
+            num_workers=2,
+            pin_memory=True,
+            persistent_workers=True,
+            prefetch_factor=2,
+            collate_fn=verifier_collate_fn,
+            drop_last=False)
     else:
-        index_list = np.load(os.path.join(params['target_dir'], params['stat_log_path'], demographics) + '/bootstrapping_seeds_' + str(dataset_name) + ".npy", allow_pickle=True)
+        valid_loader = None
 
-    # Initialize prediction
-    predictor = Prediction(cfg_path, label_names)
-    predictor.setup_model(model=model, epoch_num=experiment_epoch_num)
-    pred_array, target_array = predictor.predict_only(test_loader)
-
-    #########################################
-    pred_array = pred_array.cpu().numpy()
-    target_array = target_array.int().cpu().numpy()
-    np.save(os.path.join(params['target_dir'], params['stat_log_path'], demographics) + '/pred_array_'  + str(dataset_name) + '.npy', pred_array, allow_pickle=True)
-    np.save(os.path.join(params['target_dir'], params['stat_log_path'], demographics) + '/target_array_'  + str(dataset_name) + '.npy', target_array, allow_pickle=True)
-
-    df = pd.DataFrame(pred_array.mean(1), columns=['probability_mean'])
-    for idx in range(pred_array.shape[-1]):
-        df.insert(idx + 1, 'prob_' + label_names[idx], pred_array[:, idx])
-        df.insert(idx + 1, 'gt_' + label_names[idx], target_array[:, idx])
-    df.to_csv(os.path.join(params['target_dir'], params['stat_log_path'], demographics) + '/predictions_teston_' + str(
-        dataset_name) + '.csv', sep=',', index=False)
+    # model
+    model = AutoModelForSequenceClassification.from_pretrained(params["Verifier"]["model_name"],
+        num_labels=1,  # regression head
+        problem_type="regression")
 
 
-    msg = (
-        f'\n\n\n\t Epoch number: {experiment_epoch_num} below:'
-    )
-    with open(os.path.join(params['target_dir'], params['stat_log_path'], demographics) + '/Test_on_' + str(dataset_name), 'a') as f:
-        f.write(msg)
+    # # ---------- memory saver for small GPUs ----------
+    # freeze_backbone = bool(params["Verifier"].get("freeze_backbone", False))
+    # unfreeze_last_n = int(params["Verifier"].get("unfreeze_last_n_layers", 0))
+    #
+    # if freeze_backbone:
+    #     # Freeze everything first
+    #     for p in model.parameters():
+    #         p.requires_grad = False
+    #
+    #     # Unfreeze regression head
+    #     for p in model.classifier.parameters():
+    #         p.requires_grad = True
+    #
+    #     # Optionally unfreeze last N encoder layers
+    #     if unfreeze_last_n > 0:
+    #         enc_layers = model.deberta.encoder.layer
+    #         for layer in enc_layers[-unfreeze_last_n:]:
+    #             for p in layer.parameters():
+    #                 p.requires_grad = True
+    #
+    #     print(
+    #         f"[Verifier] Frozen backbone. Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    # # -----------------------------------------------
 
-    AUC_list = predictor.bootstrapper(pred_array, target_array, index_list, dataset_name, demographics=demographics)
+
+
+
+    # loss (regression)
+    loss_function = torch.nn.MSELoss
+
+    # optimizer
+    optimizer = torch.optim.AdamW(model.parameters(),
+        lr=float(params["Network"]["lr"]),
+        weight_decay=float(params["Network"]["weight_decay"]))
+
+
+
+    # trainable_params = [p for p in model.parameters() if p.requires_grad]
+    # optimizer = torch.optim.AdamW(
+    #     trainable_params,
+    #     lr=float(params["Network"]["lr"]),
+    #     weight_decay=float(params["Network"]["weight_decay"]),
+    # )
+
+
+
+
+
+    # write some info into config (same style as retriever)
+    model_info = params["Network"]
+    model_info["lr"] = float(params["Network"]["lr"])
+    model_info["batch_size"] = int(params["Network"]["batch_size"])
+    params["Network"] = model_info
+    write_config(params, cfg_path, sort_keys=True)
+
+    trainer = TrainingVerifier(cfg_path, resume=resume)
+
+    if resume is True:
+        trainer.load_checkpoint(model=model, optimiser=optimizer, loss_function=loss_function)
+    else:
+        trainer.setup_model(model=model, optimiser=optimizer, loss_function=loss_function)
+
+    trainer.train_epoch(train_loader=train_loader, valid_loader=valid_loader, num_epochs=int(params["Network"]["num_epochs"]))
+
 
 
 
@@ -210,7 +230,8 @@ def main_test_retriever(demographics, global_config_path="/PATH/dp_dinov3/config
 
 
 if __name__ == '__main__':
-    global_config_path = "/PATH/grounding/config/config.yaml"
-    # delete_experiment(experiment_name="name", global_config_path=global_config_path)
+    delete_experiment(experiment_name="nameverifier", global_config_path=global_config_path)
 
-    main_train_retriever(global_config_path=global_config_path, valid=True, resume=False, experiment_name='name')
+    # main_train_retriever(global_config_path=global_config_path, valid=True, resume=False, experiment_name='name')
+
+    main_train_verifier(global_config_path=global_config_path, valid=True, resume=False, experiment_name="nameverifier")

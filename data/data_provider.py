@@ -8,6 +8,7 @@ https://github.com/tayebiarasteh/
 
 import json
 import os.path
+import pdb
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Optional
 
@@ -219,3 +220,258 @@ def retriever_collate_fn(batch: List[Dict], top_k: int) -> Optional[RetrieverBat
                 pos_weights[i, base + j] = float(w[j])
 
     return RetrieverBatch(queries=queries, docs=docs, pos_mask=pos_mask, pos_weights=pos_weights)
+
+
+
+
+
+@dataclass(frozen=True)
+class VerifierBatch:
+    inputs: List[str]                 # B (full text fed to DeBERTa)
+    targets: torch.Tensor             # (B,) float32 soft_support_score
+    qa_row_ids: Optional[List[int]]   # for debugging / analysis
+
+
+class VerifierSupervisionDataset(Dataset):
+    """
+    Memory-safe, fast map-style Dataset for large materialized verifier parquet.
+
+    Works with Step 7 output (updated):
+      - evidence_text exists (alias of evidence_text_concat)
+      - evidence_text_concat may also exist (kept for debugging)
+
+    Strategy:
+      1) Build an index of rows belonging to split_name WITHOUT converting to pandas:
+         stores (row_group_id, row_in_group) for each selected row.
+      2) In __getitem__, load the needed row-group (cached), fetch row fields, build input text.
+
+    Avoids:
+      - pd.read_parquet() loading the entire file into RAM
+      - huge Arrow->pandas string object blowups
+      - per-sample random disk reads (we read row groups, not single rows)
+
+    Notes:
+      - Each DataLoader worker has its own cache.
+      - Keep num_workers moderate (2-8). More workers means more caches.
+    """
+
+    def __init__(
+        self,
+        cfg_path: str,
+        split_name: str,
+        # paths
+        materialized_relpath: str = "step7_verifier_materialized_rstar/verifier_train_materialized.parquet",
+        # columns
+        split_col: str = "split",
+        qa_row_id_col: str = "qa_row_id",
+        case_context_col: str = "case_context",
+        question_col: str = "question",
+        answer_col: str = "answer_target",
+        claim_col: str = "claim_text",
+        evidence_text_col: str = "evidence_text",           # preferred (new Step 7)
+        evidence_text_fallback_col: str = "evidence_text_concat",  # fallback if older file
+        target_col: str = "soft_support_score",
+        # formatting
+        max_evidence_chars: int = 20_000,
+        join_with_newlines: bool = True,
+        # performance knobs
+        cache_row_groups: int = 2,   # how many row groups to keep in-memory per worker
+        assume_split_is_string: bool = True,
+    ) -> None:
+        self.cfg_path = cfg_path
+        self.params = read_config(cfg_path)
+        self.base_path = self.params["paths"]["base_path"]
+
+        self.split_name = str(split_name)
+
+        self.split_col = str(split_col)
+        self.qa_row_id_col = str(qa_row_id_col)
+        self.case_context_col = str(case_context_col)
+        self.question_col = str(question_col)
+        self.answer_col = str(answer_col)
+        self.claim_col = str(claim_col)
+        self.evidence_text_col = str(evidence_text_col)
+        self.evidence_text_fallback_col = str(evidence_text_fallback_col)
+        self.target_col = str(target_col)
+
+        self.max_evidence_chars = int(max_evidence_chars)
+        self.join_with_newlines = bool(join_with_newlines)
+
+        self.cache_row_groups = int(cache_row_groups)
+        self.assume_split_is_string = bool(assume_split_is_string)
+
+        self.materialized_path = os.path.join(self.base_path, materialized_relpath)
+        if not os.path.exists(self.materialized_path):
+            raise FileNotFoundError(f"Materialized verifier parquet not found: {self.materialized_path}")
+
+        # Open parquet lazily
+        self.pf = pq.ParquetFile(self.materialized_path)
+
+        # Validate columns exist without loading data
+        schema_names = set(self.pf.schema.names)
+        required_base = [
+            self.split_col,
+            self.case_context_col,
+            self.question_col,
+            self.answer_col,
+            self.claim_col,
+            self.target_col,
+        ]
+        for c in required_base:
+            if c not in schema_names:
+                raise ValueError(f"Missing required column in verifier materialized parquet: {c}")
+
+        # Evidence column selection:
+        # - prefer evidence_text (new Step 7)
+        # - fallback to evidence_text_concat (older Step 7)
+        if self.evidence_text_col in schema_names:
+            self._evidence_col_in_file = self.evidence_text_col
+        elif self.evidence_text_fallback_col in schema_names:
+            self._evidence_col_in_file = self.evidence_text_fallback_col
+        else:
+            raise ValueError(
+                f"Missing evidence text column. Expected '{self.evidence_text_col}' or "
+                f"fallback '{self.evidence_text_fallback_col}'."
+            )
+
+        self.has_qa_row_id = self.qa_row_id_col in schema_names
+
+        # Build split index: list of (row_group_id, row_in_group)
+        self._rg_row_index: List[Tuple[int, int]] = []
+        self._build_split_index()
+
+        # Row-group cache (per-process/worker)
+        self._rg_cache: Dict[int, Dict[str, List]] = {}
+        self._rg_cache_order: List[int] = []
+
+    def _build_split_index(self) -> None:
+        for rg in range(self.pf.num_row_groups):
+            t = self.pf.read_row_group(rg, columns=[self.split_col])
+            split_arr = t.column(0)
+
+            if self.assume_split_is_string:
+                split_list = split_arr.to_pylist()
+                for i, s in enumerate(split_list):
+                    if str(s) == self.split_name:
+                        self._rg_row_index.append((rg, i))
+            else:
+                split_list = [str(x) for x in split_arr.to_pylist()]
+                for i, s in enumerate(split_list):
+                    if s == self.split_name:
+                        self._rg_row_index.append((rg, i))
+
+        if len(self._rg_row_index) == 0:
+            print(f"[WARN] No rows found for split='{self.split_name}' in {self.materialized_path}")
+
+    def __len__(self) -> int:
+        return len(self._rg_row_index)
+
+    def _safe_str(self, x) -> str:
+        if x is None:
+            return ""
+        s = str(x)
+        return "" if s.lower() == "nan" else s
+
+    def _truncate_evidence(self, s: str) -> str:
+        s = self._safe_str(s)
+        if self.max_evidence_chars > 0 and len(s) > self.max_evidence_chars:
+            return s[: self.max_evidence_chars]
+        return s
+
+    def _build_input_text(
+        self,
+        case_context: str,
+        question: str,
+        answer_target: str,
+        claim_text: str,
+        evidence_text: str,
+    ) -> str:
+        sep = "\n\n" if self.join_with_newlines else " "
+        return sep.join(
+            [
+                "CASE:",
+                self._safe_str(case_context).strip(),
+                "QUESTION:",
+                self._safe_str(question).strip(),
+                "ANSWER_TARGET:",
+                self._safe_str(answer_target).strip(),
+                "CLAIM:",
+                self._safe_str(claim_text).strip(),
+                "EVIDENCE:",
+                self._truncate_evidence(evidence_text).strip(),
+            ]
+        )
+
+    def _cache_put(self, rg: int, payload: Dict[str, List]) -> None:
+        self._rg_cache[rg] = payload
+        self._rg_cache_order.append(rg)
+
+        while len(self._rg_cache_order) > self.cache_row_groups:
+            old = self._rg_cache_order.pop(0)
+            if old in self._rg_cache:
+                del self._rg_cache[old]
+
+    def _get_row_group_columns(self, rg: int) -> Dict[str, List]:
+        cached = self._rg_cache.get(rg)
+        if cached is not None:
+            return cached
+
+        cols = [
+            self.case_context_col,
+            self.question_col,
+            self.answer_col,
+            self.claim_col,
+            self._evidence_col_in_file,  # selected evidence column
+            self.target_col,
+        ]
+        if self.has_qa_row_id:
+            cols.append(self.qa_row_id_col)
+
+        t = self.pf.read_row_group(rg, columns=cols)
+
+        payload: Dict[str, List] = {}
+        for c in cols:
+            payload[c] = t.column(c).to_pylist()
+
+        self._cache_put(rg, payload)
+        return payload
+
+    def __getitem__(self, idx: int) -> Dict:
+        rg, row_in_group = self._rg_row_index[idx]
+        payload = self._get_row_group_columns(rg)
+
+        if self.has_qa_row_id:
+            try:
+                qa_row_id = int(payload[self.qa_row_id_col][row_in_group])
+            except Exception:
+                qa_row_id = -1
+        else:
+            qa_row_id = int(idx)
+
+        case_context = payload[self.case_context_col][row_in_group]
+        question = payload[self.question_col][row_in_group]
+        answer_target = payload[self.answer_col][row_in_group]
+        claim_text = payload[self.claim_col][row_in_group]
+        evidence_text = payload[self._evidence_col_in_file][row_in_group]
+
+        input_text = self._build_input_text(
+            case_context=case_context,
+            question=question,
+            answer_target=answer_target,
+            claim_text=claim_text,
+            evidence_text=evidence_text,
+        )
+
+        try:
+            target = float(payload[self.target_col][row_in_group])
+        except Exception:
+            target = 0.0
+
+        return {"qa_row_id": qa_row_id, "input_text": input_text, "target": target}
+
+
+def verifier_collate_fn(batch: List[Dict]) -> VerifierBatch:
+    inputs: List[str] = [str(x.get("input_text", "")).strip() for x in batch]
+    targets = torch.tensor([float(x.get("target", 0.0)) for x in batch], dtype=torch.float32)
+    qa_row_ids = [int(x.get("qa_row_id", -1)) for x in batch]
+    return VerifierBatch(inputs=inputs, targets=targets, qa_row_ids=qa_row_ids)
