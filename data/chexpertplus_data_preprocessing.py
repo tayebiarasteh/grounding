@@ -25,10 +25,54 @@ import numpy as np
 import os
 import yaml
 import math
-
+from sklearn.model_selection import train_test_split
 
 import warnings
 warnings.filterwarnings('ignore')
+
+
+
+
+def patient_split(csv_path, outpath, patient_col="deid_patient_id",
+                  train_frac=0.75, valid_frac=0.10, test_frac=0.15, seed=42):
+    assert abs((train_frac + valid_frac + test_frac) - 1.0) < 1e-9
+
+    df = pd.read_csv(csv_path)
+
+    # Get unique patients as a plain NumPy array (avoid pyarrow-backed arrays)
+    patients = (
+        df[patient_col]
+        .dropna()
+        .astype(str)          # optional but helps if IDs are mixed types
+        .unique()
+    )
+    patients = np.asarray(patients)
+
+    rng = np.random.default_rng(seed)
+    rng.shuffle(patients)
+
+    n = len(patients)
+    n_train = int(round(n * train_frac))
+    n_valid = int(round(n * valid_frac))
+    # ensure exact total
+    n_test = n - n_train - n_valid
+
+    train_patients = set(patients[:n_train])
+    valid_patients = set(patients[n_train:n_train + n_valid])
+    test_patients  = set(patients[n_train + n_valid:])
+
+    # Overwrite split column (ignore existing values)
+    df["split"] = "unassigned"
+    pid = df[patient_col].astype(str)
+
+    df.loc[pid.isin(train_patients), "split"] = "train"
+    df.loc[pid.isin(valid_patients), "split"] = "valid"
+    df.loc[pid.isin(test_patients),  "split"] = "test"
+
+    df.to_csv(outpath, index=False)
+
+    print("Patient counts:", n, "| train/valid/test:", n_train, n_valid, n_test)
+    print(df["split"].value_counts(dropna=False, normalize=True))
 
 
 
@@ -1385,7 +1429,6 @@ class ChexpertPlusFactsAndQABuilder:
 
 
 
-
 @dataclass(frozen=True)
 class WeakAlignmentRowChexpert:
     qa_row_id: int
@@ -1406,14 +1449,12 @@ class ChexpertPlusRStarWeakEvidenceAligner:
     """
     CheXpert-Plus external dataset: Step 6B-equivalent
 
-    Fix for your Step 6C mismatch:
       - DO NOT coerce deid_patient_id to numeric. Many CheXpert ids are strings like "patient00001".
-      - Splits are created patient-wise on the RAW deid_patient_id string.
       - Parquet writes deid_patient_id as STRING (and also writes a stable int64 hash column).
 
     Inputs:
       - qa_csv: chexpertplus_qa_step3.csv
-          required: report_id, deid_patient_id, qa_type, claim_text
+          required: report_id, deid_patient_id, qa_type, claim_text, split
       - chunks_parquet: chunks.parquet (for lexical scoring)
       - faiss_index: faiss_Rstar.index
       - chunk_ids_npy: chunk_ids.npy aligned with FAISS rows
@@ -1421,7 +1462,7 @@ class ChexpertPlusRStarWeakEvidenceAligner:
 
     Output:
       - out_parquet: one row per QA row with retrieved chunk ids + weights
-      - patient_split_map_chexpertplus.json next to out_parquet (string patient_id -> split)
+      - patient_split_map_chexpertplus.json next to out_parquet (string patient_id -> split) [read from CSV]
       - manifest_step6b_chexpertplus.json next to out_parquet
     """
 
@@ -1458,7 +1499,7 @@ class ChexpertPlusRStarWeakEvidenceAligner:
         qa_chunksize_rows: int = 50_000,
         parquet_compression: str = "zstd",
         use_lexical: bool = True,
-        # split params
+        # split params (kept for API compatibility; not used to create splits)
         split_seed: int = 13,
         frac_train: float = 0.75,
         frac_valid: float = 0.10,
@@ -1520,8 +1561,6 @@ class ChexpertPlusRStarWeakEvidenceAligner:
 
         self._set_determinism()
 
-
-
     def _set_determinism(self) -> None:
         random.seed(self.seed)
         np.random.seed(self.seed)
@@ -1536,7 +1575,6 @@ class ChexpertPlusRStarWeakEvidenceAligner:
         except Exception:
             pass
 
-    # ---------- patient id helpers ----------
 
     def _safe_str(self, x) -> str:
         if x is None:
@@ -1555,37 +1593,6 @@ class ChexpertPlusRStarWeakEvidenceAligner:
         h = hashlib.md5(pid_raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
         u = int(h, 16)
         return int(u % (2**63 - 1))
-
-
-
-    def _make_patient_splits(self, patient_ids_raw: List[str]) -> Dict[str, str]:
-        """
-        Deterministic patient-wise split on RAW patient_id strings.
-        Uses floor-based boundaries to keep counts stable.
-        """
-        uniq = sorted({p for p in patient_ids_raw if p})
-        rng = np.random.RandomState(self.split_seed)
-        perm = rng.permutation(len(uniq)).tolist()
-
-        n = len(uniq)
-        n_train = int(math.floor(self.frac_train * n))
-        n_valid = int(math.floor(self.frac_valid * n))
-        # remainder to test
-        _ = n - n_train - n_valid  # n_test implicit
-
-        idx_train = set(perm[:n_train])
-        idx_valid = set(perm[n_train : n_train + n_valid])
-
-        out: Dict[str, str] = {}
-        for i, pid in enumerate(uniq):
-            if i in idx_train:
-                out[pid] = "train"
-            elif i in idx_valid:
-                out[pid] = "valid"
-            else:
-                out[pid] = "test"
-        return out
-
 
     def _normalize_text(self, s: str) -> str:
         if s is None:
@@ -1626,8 +1633,6 @@ class ChexpertPlusRStarWeakEvidenceAligner:
                 w[int(np.argmax(combined))] = 1.0
             return w
         return self._softmax(combined / float(self.temperature)).astype(np.float32)
-
-
 
     def _get_tokenizer_and_query_model(self) -> Tuple[AutoTokenizer, AutoModel]:
         if self._tokenizer is not None and self._query_model is not None:
@@ -1695,7 +1700,6 @@ class ChexpertPlusRStarWeakEvidenceAligner:
             return np.zeros((0, 768), dtype=np.float32)
         return np.vstack(embs)
 
-
     # evidence loading
 
     def _load_chunks_table(self) -> pd.DataFrame:
@@ -1722,8 +1726,6 @@ class ChexpertPlusRStarWeakEvidenceAligner:
                 f"FAISS index ntotal ({index.ntotal}) != len(chunk_ids.npy) ({len(faiss_chunk_ids)})."
             )
         return index, faiss_chunk_ids
-
-
 
     def _init_writer(self) -> pq.ParquetWriter:
         self.out_parquet.parent.mkdir(parents=True, exist_ok=True)
@@ -1761,7 +1763,6 @@ class ChexpertPlusRStarWeakEvidenceAligner:
 
         return batch_df
 
-
     def run(self) -> None:
         if not self.qa_csv.exists():
             raise FileNotFoundError(f"QA CSV not found: {self.qa_csv}")
@@ -1785,17 +1786,28 @@ class ChexpertPlusRStarWeakEvidenceAligner:
         writer = self._init_writer()
         assert self._pa_schema is not None
 
-        # Pass 1: build patient split map (RAW strings)
-        patient_set: set[str] = set()
+        # Pass 1: read patient->split map from CSV column "split"
+        patient_to_split: Dict[str, str] = {}
         for df0 in pd.read_csv(self.qa_csv, chunksize=self.qa_chunksize_rows):
-            if self.patient_col not in df0.columns:
-                raise ValueError(f"QA CSV missing required column: {self.patient_col}")
-            for x in df0[self.patient_col].tolist():
-                k = self._patient_key(x)
-                if k:
-                    patient_set.add(k)
+            for c in [self.patient_col, self.split_col]:
+                if c not in df0.columns:
+                    raise ValueError(f"QA CSV missing required column: {c}")
 
-        patient_to_split = self._make_patient_splits(sorted(patient_set))
+            pid_list = df0[self.patient_col].tolist()
+            split_list = df0[self.split_col].tolist()
+
+            for pid_raw, sp in zip(pid_list, split_list):
+                pid = self._patient_key(pid_raw)
+                if not pid:
+                    continue
+                s = self._safe_str(sp).strip().lower()
+                if s not in {"train", "valid", "test"}:
+                    continue
+                prev = patient_to_split.get(pid)
+                if prev is None:
+                    patient_to_split[pid] = s
+                elif prev != s:
+                    raise ValueError(f"Conflicting split assignments for patient '{pid}': '{prev}' vs '{s}'")
 
         if self.write_patient_split_map_json:
             split_map_path = self.out_parquet.parent / "patient_split_map_chexpertplus.json"
@@ -1808,7 +1820,7 @@ class ChexpertPlusRStarWeakEvidenceAligner:
 
         try:
             for df in pd.read_csv(self.qa_csv, chunksize=self.qa_chunksize_rows):
-                for c in [self.report_id_col, self.patient_col, self.qa_type_col, self.claim_col]:
+                for c in [self.report_id_col, self.patient_col, self.qa_type_col, self.claim_col, self.split_col]:
                     if c not in df.columns:
                         raise ValueError(f"QA CSV missing required column: {c}")
 
@@ -1817,10 +1829,20 @@ class ChexpertPlusRStarWeakEvidenceAligner:
                 df[self.qa_type_col] = df[self.qa_type_col].astype(str).str.strip()
                 df[self.claim_col] = df[self.claim_col].astype(str)
 
-                # patient raw string + split
+                # patient raw string + split (read from CSV)
                 pid_raw_list = [self._patient_key(x) for x in df[self.patient_col].tolist()]
                 df[self.patient_col] = pid_raw_list
-                df[self.split_col] = [patient_to_split.get(pid, "train") for pid in pid_raw_list]
+
+                split_raw_list = [self._safe_str(x).strip().lower() for x in df[self.split_col].tolist()]
+                split_norm_list: List[str] = []
+                for pid, sp in zip(pid_raw_list, split_raw_list):
+                    if sp in {"train", "valid", "test"}:
+                        split_norm_list.append(sp)
+                    else:
+                        # fallback to patient map if row value is missing/invalid
+                        split_norm_list.append(patient_to_split.get(pid, "train"))
+
+                df[self.split_col] = split_norm_list
                 df["__pid_int64"] = [self._patient_to_int64(pid) for pid in pid_raw_list]
 
                 claims = df[self.claim_col].tolist()
@@ -1877,7 +1899,10 @@ class ChexpertPlusRStarWeakEvidenceAligner:
 
                     e = np.asarray(valid_embed_scores, dtype=np.float32)
                     if self.use_lexical:
-                        l = np.asarray([float(self._lexical_overlap(claim_norm, t)) for t in retrieved_texts], dtype=np.float32)
+                        l = np.asarray(
+                            [float(self._lexical_overlap(claim_norm, t)) for t in retrieved_texts],
+                            dtype=np.float32,
+                        )
                     else:
                         l = np.zeros_like(e, dtype=np.float32)
 
@@ -1955,7 +1980,6 @@ class ChexpertPlusRStarWeakEvidenceAligner:
 
         print(f"Wrote: {self.out_parquet}")
         print(f"Wrote: {manifest_path}")
-
 
 
 
@@ -3065,18 +3089,18 @@ def print_test_eval_stats(test_eval_parquet: str):
 
 
 if __name__ == "__main__":
+    # patient_split(csv_path=os.path.join(base_path_chexpertData, "df_chexpert_plus_240401.csv"),
+    #               outpath=os.path.join(base_path_chexpertData, "chexpert_plus_reports.csv"))
 
     with open(global_config_path, "r") as f:
         params = yaml.safe_load(f)
-    base_path_chexpertData = params["Preprocessing"]["base_path_chexpertData"]
+    base_path_chexpertData = params["Preprocessing"]["base_path_mimicData"]
     base_path_evidenceData = params["Preprocessing"]["base_path_evidenceData"]
-
-
 
 
     ''' step 1 '''
     # builder = ChexpertPlusCaseContextBuilder(
-    #     master_csv=os.path.join(base_path_chexpertData, "df_chexpert_plus_240401.csv"),
+    #     master_csv=os.path.join(base_path_chexpertData, "chexpert_plus_reports.csv"),
     #     out_path=os.path.join(base_path_chexpertData, "chexpertplus_case_contexts.csv"),
     # )
     # out_df = builder.build_case_context_table()
@@ -3087,7 +3111,7 @@ if __name__ == "__main__":
 
     ''' steps 2 & 3 '''
     # builder = ChexpertPlusFactsAndQABuilder(
-    #     master_csv=os.path.join(base_path_chexpertData, "df_chexpert_plus_240401.csv"),
+    #     master_csv=os.path.join(base_path_chexpertData, "chexpert_plus_reports.csv"),
     #     case_context_csv=os.path.join(base_path_chexpertData, "chexpertplus_case_contexts.csv"),
     #     out_facts_path=os.path.join(base_path_chexpertData, "chexpertplus_facts_long.csv"),
     #     out_qa_path=os.path.join(base_path_chexpertData, "chexpertplus_qa_step3.csv"),
@@ -3099,76 +3123,76 @@ if __name__ == "__main__":
 
 
     ''' step 6B '''
-    # builder = ChexpertPlusRStarWeakEvidenceAligner(
-    #     qa_csv=os.path.join(base_path_chexpertData, "chexpertplus_qa_step3.csv"),
-    #     chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
-    #     faiss_index=os.path.join(base_path_evidenceData, "step6_faiss_rstar", "faiss_Rstar.index"),
-    #     chunk_ids_npy=os.path.join(base_path_evidenceData, "step6_faiss_rstar", "chunk_ids.npy"),
-    #     out_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step6b_Rstar_chexpertplus.parquet"),
-    #     model_name=params["Preprocessing"]["tokenizer_name"],
-    #     rstar_query_encoder_ckpt=model_weights_path,
-    #     top_k=20,
-    #     alpha=0.85,
-    #     temperature=0.07,
-    #     seed=13,
-    #     device="cuda",
-    #     use_lexical=True,
-    #     # split
-    #     split_seed=13,
-    #     frac_train=0.75,
-    #     frac_valid=0.10,
-    #     frac_test=0.15,
-    # )
-    # builder.run()
+    builder = ChexpertPlusRStarWeakEvidenceAligner(
+        qa_csv=os.path.join(base_path_chexpertData, "chexpertplus_qa_step3.csv"),
+        chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
+        faiss_index=os.path.join(base_path_evidenceData, "step6_faiss_rstar", "faiss_Rstar.index"),
+        chunk_ids_npy=os.path.join(base_path_evidenceData, "step6_faiss_rstar", "chunk_ids.npy"),
+        out_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step6b_Rstar_chexpertplus.parquet"),
+        model_name=params["Preprocessing"]["tokenizer_name"],
+        rstar_query_encoder_ckpt=model_weights_path,
+        top_k=20,
+        alpha=0.85,
+        temperature=0.07,
+        seed=13,
+        device="cuda",
+        use_lexical=True,
+        # split
+        split_seed=13,
+        frac_train=0.75,
+        frac_valid=0.10,
+        frac_test=0.15,
+    )
+    builder.run()
 
 
 
 
     ''' step 6C '''
-    # builder = ChexpertPlusStep6CSupervisionBuilder(
-    #     qa_csv=os.path.join(base_path_chexpertData, "chexpertplus_qa_step3.csv"),
-    #     weak_alignment_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step6b_Rstar_chexpertplus.parquet"),
-    #     out_dir=os.path.join(base_path_evidenceData, "step6c_supervision_rstar_chexpertplus"),
-    #     top_k=20,
-    #     min_weight=0.0,
-    #     qa_chunksize_rows=50_000,
-    #     parquet_batch_rows=50_000,
-    #     # allowed_splits=["train", "valid"],
-    # )
-    # builder.run()
+    builder = ChexpertPlusStep6CSupervisionBuilder(
+        qa_csv=os.path.join(base_path_chexpertData, "chexpertplus_qa_step3.csv"),
+        weak_alignment_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step6b_Rstar_chexpertplus.parquet"),
+        out_dir=os.path.join(base_path_evidenceData, "step6c_supervision_rstar_chexpertplus"),
+        top_k=20,
+        min_weight=0.0,
+        qa_chunksize_rows=50_000,
+        parquet_batch_rows=50_000,
+        # allowed_splits=["train", "valid"],
+    )
+    builder.run()
 
 
 
 
 
     ''' step 7 '''
-    # builder = ChexpertPlusStep7VerifierMaterializer(
-    #     verifier_supervision_parquet=os.path.join(
-    #         base_path_evidenceData,
-    #         "step6c_supervision_rstar_chexpertplus/verifier_supervision.parquet",
-    #     ),
-    #     chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
-    #     out_dir=os.path.join(base_path_evidenceData, "step7_verifier_materialized_rstar_chexpertplus"),
-    #     max_evidence_chunks=20,
-    #     min_evidence_weight=0.0,
-    #     parquet_batch_rows=50_000,
-    #     parquet_compression="zstd",
-    # )
-    # builder.run()
+    builder = ChexpertPlusStep7VerifierMaterializer(
+        verifier_supervision_parquet=os.path.join(
+            base_path_evidenceData,
+            "step6c_supervision_rstar_chexpertplus/verifier_supervision.parquet",
+        ),
+        chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
+        out_dir=os.path.join(base_path_evidenceData, "step7_verifier_materialized_rstar_chexpertplus"),
+        max_evidence_chunks=20,
+        min_evidence_weight=0.0,
+        parquet_batch_rows=50_000,
+        parquet_compression="zstd",
+    )
+    builder.run()
 
 
 
 
 
     ''' Creating the final mimic test parquet '''
-    # in_parquet = os.path.join(base_path_evidenceData, "step7_verifier_materialized_rstar_chexpertplus",
-    #     "verifier_train_materialized.parquet")
-    #
-    # out_parquet = os.path.join(base_path_evidenceData, "phase1_fixed_test_eval_chexpertplus",
-    #     "chexpertplus_test_eval.parquet")
-    #
-    # create_fixed_chexpertplus_test_eval_parquet(verifier_materialized_parquet=in_parquet,
-    #     out_parquet=out_parquet, split_value="test", parquet_batch_rows=50_000,
-    #     parquet_compression="zstd", seed=13, write_manifest_json=True)
+    in_parquet = os.path.join(base_path_evidenceData, "step7_verifier_materialized_rstar_chexpertplus",
+        "verifier_train_materialized.parquet")
+
+    out_parquet = os.path.join(base_path_evidenceData, "phase1_fixed_test_eval_chexpertplus",
+        "chexpertplus_test_eval.parquet")
+
+    create_fixed_chexpertplus_test_eval_parquet(verifier_materialized_parquet=in_parquet,
+        out_parquet=out_parquet, split_value="test", parquet_batch_rows=50_000,
+        parquet_compression="zstd", seed=13, write_manifest_json=True)
 
     print_test_eval_stats(test_eval_parquet=os.path.join(base_path_evidenceData, "phase1_fixed_test_eval_chexpertplus", "chexpertplus_test_eval.parquet"))

@@ -1986,7 +1986,6 @@ class RadiopaediaWeakEvidenceAligner:
 
 
 
-
 @dataclass(frozen=True)
 class RetrieverSupervisionRow:
     qa_row_id: int
@@ -2018,9 +2017,6 @@ class VerifierSupervisionRow:
 class RadiopaediaStep4CSupervisionBuilder:
     """
     Step 4C: Convert Step 3 + Step 4B outputs into final supervision artifacts
-
-      - Create a fresh patient-wise split (train=75%, valid=10%, test=15%)
-      - Write subject_id + split into both output parquets
 
     Split is computed ONLY from subject_id (no leakage across patients) and is deterministic.
     """
@@ -2124,37 +2120,12 @@ class RadiopaediaStep4CSupervisionBuilder:
 
     # patient-wise split map (deterministic)
     def _build_patient_split_map(self) -> Dict[int, str]:
-        # Read only subject_id column (fast)
-        if not self.qa_csv.exists():
-            raise FileNotFoundError(f"QA CSV not found: {self.qa_csv}")
-
-        subj = pd.read_csv(self.qa_csv, usecols=[self.subject_id_col])
-        subj[self.subject_id_col] = pd.to_numeric(subj[self.subject_id_col], errors="coerce")
-        subj = subj[~subj[self.subject_id_col].isna()]
-        subject_ids = np.array(sorted(subj[self.subject_id_col].astype(int).unique().tolist()), dtype=np.int64)
-
-        rng = np.random.RandomState(self.split_seed)
-        perm = rng.permutation(subject_ids)
-
-        n = len(perm)
-        n_train = int(round(self.frac_train * n))
-        n_valid = int(round(self.frac_valid * n))
-        # ensure exact total
-        n_test = n - n_train - n_valid
-        if n_test < 0:
-            n_test = 0
-            n_valid = n - n_train
-
-        split_map: Dict[int, str] = {}
-        for sid in perm[:n_train]:
-            split_map[int(sid)] = "train"
-        for sid in perm[n_train : n_train + n_valid]:
-            split_map[int(sid)] = "valid"
-        for sid in perm[n_train + n_valid :]:
-            split_map[int(sid)] = "test"
-
-        # write map for reuse
-        self.split_map_out.write_text(json.dumps(split_map, indent=2), encoding="utf-8")
+        split_map_path = os.path.join(base_path_evidenceData, "step4c_supervision/patient_split_map.json")
+        if not os.path.exists(split_map_path):
+            raise FileNotFoundError(f"Patient split map not found: {split_map_path}")
+        with open(split_map_path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        split_map: Dict[int, str] = {int(k): str(v) for k, v in raw.items()}
         return split_map
 
     def _init_retriever_writer(self) -> pq.ParquetWriter:
@@ -2442,7 +2413,273 @@ class RadiopaediaStep4CSupervisionBuilder:
 
 
 
+def create_fixed_mimic_test_eval_parquet(
+    verifier_materialized_parquet: str | Path,
+    out_parquet: str | Path,
+    *,
+    split_value: str = "test",
+    parquet_batch_rows: int = 50_000,
+    parquet_compression: str = "zstd",
+    seed: int = 13,
+    write_manifest_json: bool = True,
+) -> Dict[str, object]:
+    """
+    Phase 1 — Freeze the evaluation object.
 
+    Reads Step 7 output:
+      step7_verifier_materialized_rstar/verifier_train_materialized.parquet
+
+    Filters to split == "test" (split already fixed upstream via Step 4C map reused in Step 6C/7),
+    writes ONE immutable test artifact:
+      mimic_test_eval.parquet
+
+    Output columns:
+      qa_row_id, subject_id, split, qa_type, case_context, question, answer_target, claim_text,
+      evidence_chunk_ids_json, evidence_text, soft_support_score,
+      report_length_bucket, device_present, uncertainty_present, label_vs_extractive
+
+    Notes:
+      - Does NOT change any split.
+      - Does NOT touch retrieval; just freezes the test set.
+      - Streaming read/write (keeps memory stable).
+    """
+    rng = np.random.RandomState(seed)  # deterministic if you ever add sampling later (currently unused)
+
+    in_path = Path(verifier_materialized_parquet)
+    out_path = Path(out_parquet)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not in_path.exists():
+        raise FileNotFoundError(f"verifier_materialized_parquet not found: {in_path}")
+
+    # Heuristics consistent with your Step 3 device vocab and uncertainty cues
+    device_re = re.compile(
+        r"\b("
+        r"picc|peripherally inserted central catheter|central venous catheter|cvc|"
+        r"endotracheal tube|ett|nasogastric|ng tube|enteric|dobhoff|feeding tube|"
+        r"chest tube|pigtail|pleural catheter|"
+        r"swan[-\s]?ganz|pa catheter|introducer sheath|"
+        r"subclavian catheter|internal jugular|ij\b|"
+        r"line tip|catheter tip|tip\b|terminates|terminating|"
+        r"svc|s\.v\.c\.|cavoatrial junction|right atrium|carina|cavoatrial"
+        r")\b",
+        re.IGNORECASE,
+    )
+    uncertainty_re = re.compile(
+        r"\b("
+        r"may|might|possible|likely|cannot exclude|cannot be excluded|"
+        r"limited|limitation|poorly assessed|not well seen|underlying .* cannot be excluded"
+        r")\b",
+        re.IGNORECASE,
+    )
+
+    # Phase-1 buckets (simple + stable)
+    def report_length_bucket(case_context: str) -> str:
+        # length by word count (robust, no tokenizer dependency)
+        n = len(str(case_context).split())
+        if n < 80:
+            return "short"
+        if n < 160:
+            return "medium"
+        return "long"
+
+    def label_vs_extractive_flag(qa_type: str) -> str:
+        # "label" = derived from labels or structured yes/no templates
+        # "extractive" = span-based / descriptive answers from report text
+        t = str(qa_type).strip().lower()
+        if t in {"label_presence", "multi_label_conjunction", "device_presence"}:
+            return "label"
+        return "extractive"
+
+    # Input columns we require from Step 7
+    required_in_cols = [
+        "qa_row_id",
+        "subject_id",
+        "split",
+        "qa_type",
+        "case_context",
+        "question",
+        "answer_target",
+        "claim_text",
+        "evidence_chunk_ids_json",
+        "evidence_text",          # alias already created in Step 7
+        "soft_support_score",
+    ]
+
+    pf = pq.ParquetFile(str(in_path))
+
+    # Output schema (frozen protocol)
+    out_schema = pa.schema(
+        [
+            ("qa_row_id", pa.int64()),
+            ("subject_id", pa.int64()),
+            ("split", pa.string()),
+            ("qa_type", pa.string()),
+            ("case_context", pa.string()),
+            ("question", pa.string()),
+            ("answer_target", pa.string()),
+            ("claim_text", pa.string()),
+            ("evidence_chunk_ids_json", pa.string()),
+            ("evidence_text", pa.string()),
+            ("soft_support_score", pa.float32()),
+            ("report_length_bucket", pa.string()),
+            ("device_present", pa.int8()),
+            ("uncertainty_present", pa.int8()),
+            ("label_vs_extractive", pa.string()),
+        ]
+    )
+
+    writer = pq.ParquetWriter(
+        str(out_path),
+        schema=out_schema,
+        compression=parquet_compression,
+    )
+
+    total_rows = pf.metadata.num_rows if pf.metadata is not None else 0
+    pbar = tqdm(total=total_rows, desc="Phase 1: freezing mimic_test_eval.parquet", unit="rows", miniters=1)
+
+    written = 0
+    kept = 0
+    try:
+        for batch in pf.iter_batches(batch_size=parquet_batch_rows, columns=required_in_cols):
+            df = batch.to_pandas()
+
+            # Coerce + filter split
+            df["split"] = df["split"].astype(str)
+            mask = df["split"] == split_value
+            if not mask.any():
+                pbar.update(len(df))
+                written += len(df)
+                continue
+
+            d = df.loc[mask].copy()
+
+            # Stable types
+            d["qa_row_id"] = pd.to_numeric(d["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
+            d["subject_id"] = pd.to_numeric(d["subject_id"], errors="coerce").fillna(-1).astype(np.int64)
+            d["soft_support_score"] = pd.to_numeric(d["soft_support_score"], errors="coerce").fillna(0.0).astype(np.float32)
+
+            for c in [
+                "split",
+                "qa_type",
+                "case_context",
+                "question",
+                "answer_target",
+                "claim_text",
+                "evidence_chunk_ids_json",
+                "evidence_text",
+            ]:
+                d[c] = d[c].astype(str)
+
+            # Derived tags
+            d["report_length_bucket"] = d["case_context"].map(report_length_bucket).astype(str)
+            d["device_present"] = d["case_context"].map(lambda x: 1 if device_re.search(str(x)) else 0).astype(np.int8)
+            d["uncertainty_present"] = d["case_context"].map(lambda x: 1 if uncertainty_re.search(str(x)) else 0).astype(np.int8)
+            d["label_vs_extractive"] = d["qa_type"].map(label_vs_extractive_flag).astype(str)
+
+            # Ensure exact column order + schema compatibility
+            d = d[
+                [
+                    "qa_row_id",
+                    "subject_id",
+                    "split",
+                    "qa_type",
+                    "case_context",
+                    "question",
+                    "answer_target",
+                    "claim_text",
+                    "evidence_chunk_ids_json",
+                    "evidence_text",
+                    "soft_support_score",
+                    "report_length_bucket",
+                    "device_present",
+                    "uncertainty_present",
+                    "label_vs_extractive",
+                ]
+            ]
+
+            table = pa.Table.from_pandas(d, schema=out_schema, preserve_index=False)
+            writer.write_table(table)
+
+            kept += len(d)
+            pbar.update(len(df))
+            written += len(df)
+
+    finally:
+        pbar.close()
+        writer.close()
+
+    manifest = {
+        "phase": "1",
+        "input": str(in_path.resolve()),
+        "output": str(out_path.resolve()),
+        "filter": {"split_value": split_value},
+        "params": {
+            "parquet_batch_rows": int(parquet_batch_rows),
+            "parquet_compression": str(parquet_compression),
+            "seed": int(seed),
+            "derived_tags": [
+                "report_length_bucket",
+                "device_present",
+                "uncertainty_present",
+                "label_vs_extractive",
+            ],
+        },
+        "stats": {
+            "input_rows_seen": int(written),
+            "rows_written": int(kept),
+        },
+    }
+
+    if write_manifest_json:
+        manifest_path = out_path.parent / "manifest_phase1_test_eval.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    print(f"Wrote: {out_path}  (rows={kept:,})")
+    if write_manifest_json:
+        print(f"Wrote: {out_path.parent / 'manifest_phase1_test_eval.json'}")
+
+    return manifest
+
+
+
+
+
+
+def print_mimic_test_eval_stats(test_eval_parquet: str):
+    df = pd.read_parquet(test_eval_parquet)
+
+    print("==== BASIC INFO ====")
+    print("Rows:", len(df))
+    print("Unique subjects:", df["subject_id"].nunique())
+    print("QA types:", df["qa_type"].nunique())
+    print()
+
+    print("==== QA TYPE DISTRIBUTION ====")
+    print(df["qa_type"].value_counts())
+    print()
+
+    print("==== REPORT LENGTH BUCKET ====")
+    print(df["report_length_bucket"].value_counts())
+    print()
+
+    print("==== DEVICE PRESENT ====")
+    print(df["device_present"].value_counts())
+    print()
+
+    print("==== UNCERTAINTY PRESENT ====")
+    print(df["uncertainty_present"].value_counts())
+    print()
+
+    print("==== LABEL vs EXTRACTIVE ====")
+    print(df["label_vs_extractive"].value_counts())
+    print()
+
+    print("==== TARGET STATISTICS (soft_support_score) ====")
+    print("Min:", df["soft_support_score"].min())
+    print("Max:", df["soft_support_score"].max())
+    print("Mean:", df["soft_support_score"].mean())
+    print("Std:", df["soft_support_score"].std())
 
 
 
@@ -2451,12 +2688,13 @@ class RadiopaediaStep4CSupervisionBuilder:
 
 
 if __name__ == "__main__":
-    global_config_path = "/PATH/grounding/config/config.yaml"
 
     with open(global_config_path, 'r') as yaml_file:
         params = yaml.safe_load(yaml_file)
     base_path_mimicData = params['Preprocessing']['base_path_mimicData']
     base_path_evidenceData = params['Preprocessing']['base_path_evidenceData']
+
+
 
 
 
@@ -2552,3 +2790,31 @@ if __name__ == "__main__":
         frac_test=0.15,
     )
     builder.run()
+
+
+
+
+    ''' Creating the final mimic test parquet '''
+    # verifier_materialized_parquet = os.path.join(
+    #     base_path_evidenceData,
+    #     "step7_verifier_materialized_rstar",
+    #     "verifier_train_materialized.parquet")
+    #
+    # out_test_eval_parquet = os.path.join(
+    #     base_path_evidenceData,
+    #     # "phase1_fixed_test_eval", "mimic_test_eval.parquet")
+    #     "phase1_fixed_valid_eval", "mimic_valid_eval.parquet")
+    #
+    # create_fixed_mimic_test_eval_parquet(
+    #     verifier_materialized_parquet=verifier_materialized_parquet,
+    #     out_parquet=out_test_eval_parquet,
+    #     # split_value="test",
+    #     split_value="valid",
+    #     parquet_batch_rows=50_000,
+    #     parquet_compression="zstd",
+    #     seed=13,
+    #     write_manifest_json=True,
+    # )
+    #
+    # # print_mimic_test_eval_stats(test_eval_parquet=os.path.join(base_path_evidenceData, "phase1_fixed_test_eval", "mimic_test_eval.parquet"))
+    # print_mimic_test_eval_stats(test_eval_parquet=os.path.join(base_path_evidenceData, "phase1_fixed_valid_eval", "mimic_valid_eval.parquet"))
