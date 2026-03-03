@@ -986,6 +986,114 @@ class S4Tier123End2EndEvaluator:
         print(f"Wrote: {faith_path}")
         print(f"Wrote: {slice_path}")
         print(f"Wrote: {summary_path}")
+
+
+
+        # summarizing to a single csv ....
+        # summarizing to a single csv ....
+        # summarizing to a single csv ....
+        tier1_path = os.path.join(self.out_dir, "s4_tier123_summary.json")
+        tier2_faith_path = os.path.join(self.out_dir, "s4_tier2_faithfulness_report.json")
+        tier2_ret_path = os.path.join(self.out_dir, "s4_tier2_retrieval_metrics.json")
+        tier3_path = os.path.join(self.out_dir, "s4_tier3_slices_report.json")
+        valid_path = os.path.join(self.out_dir, "valid_results/s4_valid_calibration_report.json")
+
+        out_csv = os.path.join(self.out_dir, "S4_full_results.csv")
+
+        def load_json(p):
+            with open(p, "r") as f:
+                return json.load(f)
+
+        def fmt3(x):
+            if isinstance(x, (int, float)) and pd.notna(x):
+                return f"{x:.3f}"
+            return x
+
+        def safe_get(d, keys, default=None):
+            cur = d
+            for k in keys:
+                if not isinstance(cur, dict) or k not in cur:
+                    return default
+                cur = cur[k]
+            return cur
+
+        rows = []
+
+        t1 = load_json(tier1_path)
+        t2f = load_json(tier2_faith_path)
+        t2r = load_json(tier2_ret_path)
+        t3 = load_json(tier3_path)
+        v = load_json(valid_path)
+
+        # Prefer metrics_used if present, else fallback
+        t1m = t1.get("metrics_used", t1.get("metrics_uncalibrated", {}))
+
+        for k in ["MSE", "MAE", "Pearson", "Spearman", "ECE", "Brier"]:
+            if k in t1m:
+                rows.append(["Tier1", "overall", k, t1m[k]])
+
+        risk80 = safe_get(t1m, ["SelectiveRisk", "risk_mse@80"])
+        if risk80 is not None:
+            rows.append(["Tier1", "overall", "risk_mse@80", risk80])
+
+        T = safe_get(t1, ["calibration", "fit", "T"])
+        if T is not None:
+            rows.append(["Tier1", "overall", "calibration_T", T])
+
+        for k, val in t2r.get("metrics", {}).items():
+            rows.append(["Tier2_Retrieval", "overall", k, val])
+
+        base = t2f.get("baseline_metrics_uncalibrated", {})
+        for k in ["MSE", "ECE", "Brier"]:
+            if k in base:
+                rows.append(["Tier2_Faithfulness", "baseline", k, base[k]])
+
+        for name, vals in t2f.get("perturbations", {}).items():
+            d = vals.get("delta_vs_base_uncalibrated", {})
+            if "ΔMSE" in d:
+                rows.append(["Tier2_Faithfulness", name, "ΔMSE_vs_base", d["ΔMSE"]])
+            if "ΔECE" in d:
+                rows.append(["Tier2_Faithfulness", name, "ΔECE_vs_base", d["ΔECE"]])
+
+        for slice_name, vals in t3.get("metrics", {}).items():
+            n = vals.get("n")
+            if n is not None:
+                rows.append(["Tier3", slice_name, "n", n])
+
+            for k in ["MSE", "ECE", "Brier"]:
+                if k in vals:
+                    rows.append(["Tier3", slice_name, k, vals[k]])
+
+            r80 = vals.get("risk_mse@80")
+            if r80 is not None:
+                rows.append(["Tier3", slice_name, "risk_mse@80", r80])
+
+        Tv = safe_get(v, ["calibration_fit", "T"])
+        if Tv is not None:
+            rows.append(["Validation", "overall", "calibration_T", Tv])
+
+        v_unc = v.get("valid_metrics_uncalibrated", {})
+        v_cal = v.get("valid_metrics_calibrated", {})
+
+        for k in ["MSE", "MAE", "Pearson", "Spearman", "ECE", "Brier"]:
+            if k in v_unc:
+                rows.append(["Validation", "uncalibrated", k, v_unc[k]])
+            if k in v_cal:
+                rows.append(["Validation", "calibrated", k, v_cal[k]])
+
+        r80_unc = safe_get(v_unc, ["SelectiveRisk", "risk_mse@80"])
+        r80_cal = safe_get(v_cal, ["SelectiveRisk", "risk_mse@80"])
+        if r80_unc is not None:
+            rows.append(["Validation", "uncalibrated", "risk_mse@80", r80_unc])
+        if r80_cal is not None:
+            rows.append(["Validation", "calibrated", "risk_mse@80", r80_cal])
+
+        df = pd.DataFrame(rows, columns=["Tier", "Subgroup", "Metric", "Value"])
+        df["Value"] = df["Value"].apply(fmt3)
+        df.to_csv(out_csv, index=False)
+        print(f"Saved: {out_csv}")
+
+
         return summary_path
 
 
@@ -1922,6 +2030,65 @@ class S2Tier123End2EndEvaluator:
         print(f"Wrote: {faith_path}")
         print(f"Wrote: {tier3_path}")
         print(f"Wrote: {summary_path}")
+
+
+        # summarizing to a single CSV............
+        # summarizing to a single CSV............
+        # summarizing to a single CSV............
+        tier1_path = os.path.join(self.out_dir, "s2_tier1_report.json")
+        tier2_faith_path = os.path.join(self.out_dir, "s2_tier2_faithfulness_report.json")
+        tier2_ret_path = os.path.join(self.out_dir, "s2_tier2_retrieval_metrics.json")
+        tier3_path = os.path.join(self.out_dir, "s2_tier3_slices_report.json")
+
+        with open(tier1_path) as f:
+            t1 = json.load(f)
+
+        with open(tier2_faith_path) as f:
+            t2f = json.load(f)
+
+        with open(tier2_ret_path) as f:
+            t2r = json.load(f)
+
+        with open(tier3_path) as f:
+            t3 = json.load(f)
+
+        rows = []
+
+        def r(x):
+            return round(float(x), 3)
+
+        t1m = t1["metrics_uncalibrated"]
+        rows.extend([
+            ["Tier1", "overall", "MSE", r(t1m["MSE"])],
+            ["Tier1", "overall", "MAE", r(t1m["MAE"])],
+            ["Tier1", "overall", "Pearson", r(t1m["Pearson"])],
+            ["Tier1", "overall", "Spearman", r(t1m["Spearman"])],
+            ["Tier1", "overall", "ECE", r(t1m["ECE"])],
+            ["Tier1", "overall", "Brier", r(t1m["Brier"])],
+            ["Tier1", "overall", "risk_mse@80", r(t1m["SelectiveRisk"]["risk_mse@80"])],
+        ])
+
+        for k, v in t2r["metrics"].items():
+            rows.append(["Tier2_Retrieval", "overall", k, r(v)])
+
+        base = t2f["baseline_metrics_uncalibrated"]
+        rows.append(["Tier2_Faithfulness", "baseline", "MSE", r(base["MSE"])])
+        rows.append(["Tier2_Faithfulness", "baseline", "ECE", r(base["ECE"])])
+        for name, vals in t2f["perturbations"].items():
+            delta = vals["delta_vs_base_uncalibrated"]["ΔMSE"]
+            rows.append(["Tier2_Faithfulness", name, "ΔMSE_vs_base", r(delta)])
+
+        for slice_name, vals in t3["metrics"].items():
+            rows.append(["Tier3", slice_name, "MSE", r(vals["MSE"])])
+            rows.append(["Tier3", slice_name, "ECE", r(vals["ECE"])])
+            rows.append(["Tier3", slice_name, "risk_mse@80", r(vals["risk_mse@80"])])
+
+        df = pd.DataFrame(rows, columns=["Tier", "Subgroup", "Metric", "Value"])
+        df["Value"] = df["Value"].map(lambda x: f"{x:.3f}")
+        output_path = os.path.join(self.out_dir, "S2_full_results.csv")
+        df.to_csv(output_path, index=False)
+        print("Saved:", output_path)
+
         return summary_path
 
 
@@ -2800,6 +2967,68 @@ class S3Tier123End2EndEvaluator:
         print(f"Wrote: {faith_path}")
         print(f"Wrote: {tier3_path}")
         print(f"Wrote: {summary_path}")
+
+
+
+
+        # summarizing to a single csv .....
+        tier1_path = os.path.join(self.out_dir, "s3_tier1_report.json")
+        tier2_faith_path = os.path.join(self.out_dir, "s3_tier2_faithfulness_report.json")
+        tier2_ret_path = os.path.join(self.out_dir, "s3_tier2_retrieval_metrics.json")
+        tier3_path = os.path.join(self.out_dir, "s3_tier3_slices_report.json")
+
+        with open(tier1_path) as f:
+            t1 = json.load(f)
+
+        with open(tier2_faith_path) as f:
+            t2f = json.load(f)
+
+        with open(tier2_ret_path) as f:
+            t2r = json.load(f)
+
+        with open(tier3_path) as f:
+            t3 = json.load(f)
+
+        rows = []
+
+        def r(x):
+            return round(float(x), 3)
+
+        t1m = t1["metrics_uncalibrated"]
+
+        rows.extend([
+            ["Tier1", "overall", "MSE", r(t1m["MSE"])],
+            ["Tier1", "overall", "MAE", r(t1m["MAE"])],
+            ["Tier1", "overall", "Pearson", r(t1m["Pearson"])],
+            ["Tier1", "overall", "Spearman", r(t1m["Spearman"])],
+            ["Tier1", "overall", "ECE", r(t1m["ECE"])],
+            ["Tier1", "overall", "Brier", r(t1m["Brier"])],
+            ["Tier1", "overall", "risk_mse@80", r(t1m["SelectiveRisk"]["risk_mse@80"])],
+        ])
+
+        for k, v in t2r["metrics"].items():
+            rows.append(["Tier2_Retrieval", "overall", k, r(v)])
+
+        base = t2f["baseline_metrics_uncalibrated"]
+        rows.append(["Tier2_Faithfulness", "baseline", "MSE", r(base["MSE"])])
+        rows.append(["Tier2_Faithfulness", "baseline", "ECE", r(base["ECE"])])
+        for name, vals in t2f["perturbations"].items():
+            delta = vals["delta_vs_base_uncalibrated"]["ΔMSE"]
+            rows.append(["Tier2_Faithfulness", name, "ΔMSE_vs_base", r(delta)])
+
+        for slice_name, vals in t3["metrics"].items():
+            rows.append(["Tier3", slice_name, "MSE", r(vals["MSE"])])
+            rows.append(["Tier3", slice_name, "ECE", r(vals["ECE"])])
+            rows.append(["Tier3", slice_name, "risk_mse@80", r(vals["risk_mse@80"])])
+
+        df = pd.DataFrame(rows, columns=["Tier", "Subgroup", "Metric", "Value"])
+        df["Value"] = df["Value"].map(lambda x: f"{x:.3f}")
+
+        output_path = os.path.join(self.out_dir, "S3_full_results.csv")
+        df.to_csv(output_path, index=False)
+
+        print("Saved:", output_path)
+
         return summary_path
 
 
@@ -3280,6 +3509,47 @@ class S1Tier123CaseOnlyEvaluator:
         print(f"Wrote: {tier1_path}")
         print(f"Wrote: {tier3_path}")
         print(f"Wrote: {summary_path}")
+
+
+        # summarizing to a single csv
+        tier1_path = os.path.join(self.out_dir, "s1_tier1_report.json")
+        tier3_path = os.path.join(self.out_dir, "s1_tier3_slices_report.json")
+
+        with open(tier1_path) as f:
+            t1 = json.load(f)
+
+        with open(tier3_path) as f:
+            t3 = json.load(f)
+
+        rows = []
+
+        def r(x):
+            return round(float(x), 3)
+
+        t1m = t1["metrics_uncalibrated"]
+
+        rows.extend([
+            ["Tier1", "overall", "MSE", r(t1m["MSE"])],
+            ["Tier1", "overall", "MAE", r(t1m["MAE"])],
+            ["Tier1", "overall", "Pearson", r(t1m["Pearson"])],
+            ["Tier1", "overall", "Spearman", r(t1m["Spearman"])],
+            ["Tier1", "overall", "ECE", r(t1m["ECE"])],
+            ["Tier1", "overall", "Brier", r(t1m["Brier"])],
+            ["Tier1", "overall", "risk_mse@80", r(t1m["SelectiveRisk"]["risk_mse@80"])],
+        ])
+
+        for slice_name, vals in t3["metrics"].items():
+            rows.append(["Tier3", slice_name, "MSE", r(vals["MSE"])])
+            rows.append(["Tier3", slice_name, "ECE", r(vals["ECE"])])
+            rows.append(["Tier3", slice_name, "risk_mse@80", r(vals["risk_mse@80"])])
+
+        df = pd.DataFrame(rows, columns=["Tier", "Subgroup", "Metric", "Value"])
+        df["Value"] = df["Value"].map(lambda x: f"{x:.3f}")
+
+        output_path = os.path.join(self.out_dir, "S1_full_results.csv")
+        df.to_csv(output_path, index=False)
+
+        print("Saved:", output_path)
         return summary_path
 
 
@@ -3641,7 +3911,120 @@ class CrossSystemComparatorPredOnly:
 
         print(f"Wrote: {self.out_path}")
         print(f"n_eval={final['n_eval']} dropped={final['dropped_counts']}")
+
+
+        # summarizing all to a single csv ...
+        # summarizing all to a single csv ...
+        # summarizing all to a single csv ...
+        ppath = os.path.dirname(self.out_path)
+        base_path = os.path.dirname(ppath)
+
+        s1_csv = os.path.join(base_path, "tier123_results_s1_end2end", "S1_full_results.csv")
+        s2_csv = os.path.join(base_path, "tier123_results_s2_end2end", "S2_full_results.csv")
+        s3_csv = os.path.join(base_path, "tier123_results_s3_end2end", "S3_full_results.csv")
+        s4_csv = os.path.join(base_path, "tier123_results_s4_end2end", "S4_full_results.csv")
+
+        cross_json = self.out_path
+
+        out_csv = os.path.join(ppath, "ALL_systems_plus_cross_summary.csv")
+
+        def _ensure_cols(df: pd.DataFrame) -> pd.DataFrame:
+            # Expecting: Tier, Subgroup, Metric, Value
+            # If your per-system CSVs already have extra cols, we keep them.
+            needed = ["Tier", "Subgroup", "Metric", "Value"]
+            missing = [c for c in needed if c not in df.columns]
+            if missing:
+                raise ValueError(f"Missing columns in a system CSV: {missing}. Found: {list(df.columns)}")
+            return df
+
+        def _to_rows(prefix_tier: str, subgroup: str, d: dict):
+            rows = []
+            for k, v in d.items():
+                if isinstance(v, (int, float)):
+                    rows.append([prefix_tier, subgroup, k, v])
+                elif isinstance(v, dict):
+                    # flatten one level deep with key.key
+                    for kk, vv in v.items():
+                        if isinstance(vv, (int, float)):
+                            rows.append([prefix_tier, subgroup, f"{k}.{kk}", vv])
+            return rows
+
+        dfs = []
+        for sys_name, path in [("S1", s1_csv), ("S2", s2_csv), ("S3", s3_csv), ("S4", s4_csv)]:
+            df = pd.read_csv(path)
+            df = _ensure_cols(df)
+            df.insert(0, "Source", sys_name)
+            dfs.append(df)
+
+        systems_df = pd.concat(dfs, ignore_index=True)
+
+        with open(cross_json, "r") as f:
+            cross = json.load(f)
+
+        cross_rows = []
+
+        # (A) Per-system metrics
+        per_sys = cross.get("per_system_metrics", {})
+        for sys_name, metrics in per_sys.items():
+            cross_rows += [["cross", "Cross_PerSystem", sys_name, k, v]
+                           for k, v in metrics.items()
+                           if isinstance(v, (int, float))]
+
+        # (B) Pairwise: win_rates + bootstrap deltas (mean + CI)
+        pairwise = cross.get("pairwise_all_pairs", {})
+        for pair_name, block in pairwise.items():
+            # win_rates
+            win = block.get("win_rates", {})
+            for k, v in win.items():
+                if isinstance(v, (int, float)):
+                    cross_rows.append(["cross", "Cross_Pairwise_WinRates", pair_name, k, v])
+
+            # bootstrap_deltas_A_minus_B
+            deltas = block.get("bootstrap_deltas_A_minus_B", {})
+            for metric_name, stats in deltas.items():
+                if not isinstance(stats, dict):
+                    continue
+                for stat_k in ["mean_delta", "ci_low", "ci_high"]:
+                    if stat_k in stats and isinstance(stats[stat_k], (int, float)):
+                        cross_rows.append([
+                            "cross",
+                            "Cross_Pairwise_Deltas",
+                            pair_name,
+                            f"{metric_name}.{stat_k}",
+                            stats[stat_k],
+                        ])
+
+        # (C) Faithfulness severity (if present)
+        faith_sev = cross.get("faithfulness_severity", {})
+        for sys_name, sys_block in faith_sev.items():
+            if not isinstance(sys_block, dict) or not sys_block.get("available", False):
+                continue
+            perts = sys_block.get("perturbations", {})
+            for pert_name, pert_metrics in perts.items():
+                subgroup = f"{sys_name}/{pert_name}"
+                # keep only numeric fields (including nested if any)
+                if isinstance(pert_metrics, dict):
+                    for k, v in pert_metrics.items():
+                        if isinstance(v, (int, float)):
+                            cross_rows.append(["cross", "Cross_FaithfulnessSeverity", subgroup, k, v])
+
+        cross_df = pd.DataFrame(cross_rows, columns=["Source", "Tier", "Subgroup", "Metric", "Value"])
+
+        final_df = pd.concat([systems_df, cross_df], ignore_index=True)
+
+        # Make sure Value is numeric where possible (so float_format applies)
+        final_df["Value"] = pd.to_numeric(final_df["Value"], errors="coerce")
+
+        # Optional: stable ordering
+        final_df = final_df.sort_values(by=["Source", "Tier", "Subgroup", "Metric"], kind="stable").reset_index(
+            drop=True)
+
+        final_df.to_csv(out_csv, index=False, float_format="%.3f")
+        print(f"Saved: {out_csv}")
+
+
         return self.out_path
+
 
 
 
@@ -3777,3 +4160,4 @@ if __name__ == "__main__":
         seed=13,
     )
     comparator.run()
+

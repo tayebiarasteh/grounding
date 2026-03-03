@@ -972,6 +972,73 @@ class VignetteS4Tier123End2EndEvaluator:
         print(f"Wrote: {tier1_path}")
         print(f"Wrote: {tier2_path}")
         print(f"Wrote: {summary_path}")
+
+
+
+
+        # summarizing all to a single csv ...
+        # summarizing all to a single csv ...
+        # summarizing all to a single csv ...
+
+        tier1_path = os.path.join(self.out_dir, "tier1_report.json")
+        tier2_faith_path = os.path.join(self.out_dir, "tier2_faithfulness_report.json")
+
+        out_csv = os.path.join(self.out_dir, "S4_vignette_full_results.csv")
+
+        def f3(x):
+            if x is None:
+                return None
+            try:
+                return float(f"{float(x):.3f}")
+            except Exception:
+                return None
+
+        def add_metrics(rows, tier, subgroup, metrics_dict, keys):
+            for k in keys:
+                if k in metrics_dict:
+                    rows.append([tier, subgroup, k, f3(metrics_dict.get(k))])
+
+        with open(tier1_path, "r") as f:
+            t1 = json.load(f)
+
+        with open(tier2_faith_path, "r") as f:
+            t2f = json.load(f)
+
+        rows = []
+
+        t1u = t1.get("tier1_uncalibrated", {}) or {}
+        add_metrics(rows, "Tier1", "overall", t1u, ["Accuracy", "NLL", "Brier", "ECE"])
+
+        sr = (t1u.get("SelectiveRisk") or {})
+        if sr:
+            rows.append(["Tier1", "overall", "AURC01", f3(sr.get("AURC01"))])
+            rows.append(["Tier1", "overall", "risk_01@60", f3(sr.get("risk_01@60"))])
+            rows.append(["Tier1", "overall", "risk_01@80", f3(sr.get("risk_01@80"))])
+            rows.append(["Tier1", "overall", "risk_01@90", f3(sr.get("risk_01@90"))])
+
+        base = (t2f.get("baseline_uncalibrated") or {})
+        if base:
+            add_metrics(rows, "Tier2_Faithfulness", "baseline", base, ["Accuracy", "NLL", "Brier", "ECE"])
+
+        pert = (t2f.get("perturbations") or {})
+        for name, obj in pert.items():
+            du = (obj.get("delta_uncalibrated") or {})
+            # keep deltas (main ones)
+            for k in ["ΔAccuracy", "ΔNLL", "ΔBrier", "ΔECE"]:
+                if k in du:
+                    rows.append(["Tier2_Faithfulness", name, k, f3(du.get(k))])
+
+        t3u = (t1.get("tier3_slices_uncalibrated") or {})
+        for slice_name, m in t3u.items():
+            add_metrics(rows, "Tier3", slice_name, m, ["n", "Accuracy", "NLL", "Brier", "ECE", "AURC01"])
+
+        df = pd.DataFrame(rows, columns=["Tier", "Subgroup", "Metric", "Value"])
+        df.to_csv(out_csv, index=False)
+
+        print(f"Saved: {out_csv}")
+
+
+
         return summary_path
 
 
@@ -1885,6 +1952,97 @@ class VignetteS3Tier123End2EndEvaluator:
         print(f"Wrote: {tier1_path}")
         print(f"Wrote: {tier2_path}")
         print(f"Wrote: {summary_path}")
+
+
+
+
+        # summarizing all into a single csv ....
+        # summarizing all into a single csv ....
+        # summarizing all into a single csv ....
+        tier1_path = os.path.join(self.out_dir, "s3_tier1_report.json")
+        tier2_faith_path = os.path.join(self.out_dir, "s3_tier2_faithfulness_report.json")
+        out_csv = os.path.join(self.out_dir, "S3_vignette_full_results.csv")
+
+        with open(tier1_path, "r") as f:
+            t1 = json.load(f)
+
+        with open(tier2_faith_path, "r") as f:
+            t2f = json.load(f)
+
+        rows = []
+
+        def add_row(tier, subgroup, metric, value):
+            rows.append({"Tier": tier, "Subgroup": subgroup, "Metric": metric, "Value": value})
+
+        def add_metrics_block(tier, subgroup, block, keys):
+            if not block:
+                return
+            for k in keys:
+                if k in block and block[k] is not None:
+                    add_row(tier, subgroup, k, block[k])
+
+        t1_uncal = t1.get("tier1_uncalibrated")
+        add_metrics_block("Tier1", "overall_uncal", t1_uncal, ["Accuracy", "NLL", "Brier", "ECE"])
+        if t1_uncal and t1_uncal.get("SelectiveRisk"):
+            sr = t1_uncal["SelectiveRisk"]
+            add_metrics_block("Tier1", "overall_uncal", sr, ["AURC01", "risk_01@60", "risk_01@80", "risk_01@90"])
+
+        t1_cal = t1.get("tier1_calibrated")
+        add_metrics_block("Tier1", "overall_cal", t1_cal, ["Accuracy", "NLL", "Brier", "ECE"])
+        if t1_cal and t1_cal.get("SelectiveRisk"):
+            sr = t1_cal["SelectiveRisk"]
+            add_metrics_block("Tier1", "overall_cal", sr, ["AURC01", "risk_01@60", "risk_01@80", "risk_01@90"])
+
+        base_u = t2f.get("baseline_uncalibrated")
+        add_metrics_block("Tier2_Faithfulness", "baseline_uncal", base_u, ["Accuracy", "NLL", "Brier", "ECE"])
+
+        base_c = t2f.get("baseline_calibrated")
+        add_metrics_block("Tier2_Faithfulness", "baseline_cal", base_c, ["Accuracy", "NLL", "Brier", "ECE"])
+
+        for pert_name, pert in (t2f.get("perturbations") or {}).items():
+            # keep both absolute metrics and deltas (when present)
+            add_metrics_block("Tier2_Faithfulness", pert_name, pert.get("uncalibrated"),
+                              ["Accuracy", "NLL", "Brier", "ECE"])
+            add_metrics_block("Tier2_Faithfulness", pert_name, pert.get("delta_uncalibrated"),
+                              ["ΔAccuracy", "ΔNLL", "ΔBrier", "ΔECE"])
+            add_metrics_block("Tier2_Faithfulness", pert_name, pert.get("calibrated"),
+                              ["Accuracy", "NLL", "Brier", "ECE"])
+            add_metrics_block("Tier2_Faithfulness", pert_name, pert.get("delta_calibrated"),
+                              ["ΔAccuracy", "ΔNLL", "ΔBrier", "ΔECE"])
+
+        slices_u = t1.get("tier3_slices_uncalibrated") or {}
+        for slice_name, vals in slices_u.items():
+            if "n" in vals and vals["n"] is not None:
+                add_row("Tier3", slice_name, "n", vals["n"])
+            add_metrics_block("Tier3", slice_name, vals, ["Accuracy", "NLL", "Brier", "ECE", "AURC01"])
+
+        slices_c = t1.get("tier3_slices_calibrated") or {}
+        for slice_name, vals in slices_c.items():
+            if "n" in vals and vals["n"] is not None:
+                add_row("Tier3_cal", slice_name, "n", vals["n"])
+            add_metrics_block("Tier3_cal", slice_name, vals, ["Accuracy", "NLL", "Brier", "ECE", "AURC01"])
+
+        df = pd.DataFrame(rows, columns=["Tier", "Subgroup", "Metric", "Value"])
+
+        def fmt3(x):
+            if pd.isna(x):
+                return x
+            # keep ints as ints (like n), format everything else to 3 decimals
+            if isinstance(x, (int,)) or (
+                    isinstance(x, float) and float(x).is_integer() and df.loc[df["Value"] == x, "Metric"].eq(
+                    "n").any()):
+                return int(x)
+            try:
+                return f"{float(x):.3f}"
+            except Exception:
+                return x
+
+        df["Value"] = df["Value"].apply(fmt3)
+
+        df.to_csv(out_csv, index=False)
+        print(f"Saved: {out_csv}")
+
+
         return summary_path
 
 
@@ -2797,6 +2955,77 @@ class VignetteS2Tier123End2EndEvaluator:
         print(f"Wrote: {tier1_path}")
         print(f"Wrote: {tier2_path}")
         print(f"Wrote: {summary_path}")
+
+
+
+        # summarizing all to a single csv ...
+        # summarizing all to a single csv ...
+        # summarizing all to a single csv ...
+
+        tier1_path = os.path.join(self.out_dir, "s2_tier1_report.json")
+        tier2_faith_path = os.path.join(self.out_dir, "s2_tier2_faithfulness_report.json")
+        out_csv = os.path.join(self.out_dir, "S2_vignette_full_results.csv")
+
+        def load_json(p):
+            with open(p, "r") as f:
+                return json.load(f)
+
+        def add_row(rows, tier, subgroup, metric, value):
+            rows.append({"Tier": tier, "Subgroup": subgroup, "Metric": metric, "Value": value})
+
+        t1 = load_json(tier1_path)
+        t2f = load_json(tier2_faith_path)
+
+        rows = []
+
+        t1u = t1.get("tier1_uncalibrated", {})
+
+        for k in ["Accuracy", "NLL", "Brier", "ECE"]:
+            if k in t1u:
+                add_row(rows, "Tier1", "overall", k, t1u[k])
+
+        sr = (t1u.get("SelectiveRisk") or {})
+        for k in ["AURC01", "risk_01@60", "risk_01@80", "risk_01@90"]:
+            if k in sr:
+                add_row(rows, "Tier1", "overall", k, sr[k])
+
+        # Tier 3 slices (stored inside tier1 report for Vignette)
+        slices = t1.get("tier3_slices_uncalibrated", {}) or {}
+        for slice_name, vals in slices.items():
+            for k in ["n", "Accuracy", "NLL", "Brier", "ECE", "AURC01"]:
+                if k in vals:
+                    add_row(rows, "Tier3", slice_name, k, vals[k])
+
+        base = t2f.get("baseline_uncalibrated", {}) or {}
+        for k in ["Accuracy", "NLL", "Brier", "ECE"]:
+            if k in base:
+                add_row(rows, "Tier2_Faithfulness", "baseline", k, base[k])
+
+        perts = t2f.get("perturbations", {}) or {}
+        for pname, p in perts.items():
+            uncal = p.get("uncalibrated", {}) or {}
+            delta = p.get("delta_uncalibrated", {}) or {}
+
+            for k in ["Accuracy", "NLL", "Brier", "ECE"]:
+                if k in uncal:
+                    add_row(rows, "Tier2_Faithfulness", pname, k, uncal[k])
+
+            for k in ["ΔAccuracy", "ΔNLL", "ΔBrier", "ΔECE"]:
+                if k in delta:
+                    add_row(rows, "Tier2_Faithfulness", pname, k, delta[k])
+
+        df = pd.DataFrame(rows)
+
+        # round ALL numeric values to 3 decimals
+        df["Value"] = pd.to_numeric(df["Value"], errors="ignore")
+        df["Value"] = df["Value"].apply(lambda x: round(float(x), 3) if isinstance(x, (int, float)) else x)
+
+        df.to_csv(out_csv, index=False)
+        print(f"Saved: {out_csv}")
+        print(df.head(20).to_string(index=False))
+
+
+
         return summary_path
 
 
@@ -3462,7 +3691,87 @@ class VignetteS1Tier123End2EndEvaluator:
         print(f"Wrote: {tier1_path}")
         print(f"Wrote: {tier2_path}")
         print(f"Wrote: {summary_path}")
+
+
+
+        # summarizing all to a single csv ...
+        # summarizing all to a single csv ...
+        # summarizing all to a single csv ...
+
+        tier1_path = os.path.join(self.out_dir, "s1_tier1_report.json")
+        tier2_path = os.path.join(self.out_dir, "s1_tier2_input_perturbations_report.json")
+        out_csv = os.path.join(self.out_dir, "S1_vignette_full_results.csv")
+
+        def _fmt3(x):
+            if x is None or (isinstance(x, float) and pd.isna(x)):
+                return ""
+            if isinstance(x, (int, float)):
+                return f"{x:.3f}"
+            return str(x)
+
+        def add_row(rows, tier, subgroup, metric, value, split="uncalibrated", n=None):
+            rows.append({
+                "System": "S1",
+                "Dataset": "Vignette",
+                "Tier": tier,
+                "Split": split,
+                "Subgroup": subgroup,
+                "Metric": metric,
+                "Value": value,
+                "N": n if n is not None else ""
+            })
+
+        # -------- Load --------
+        with open(tier1_path, "r") as f:
+            t1 = json.load(f)
+
+        with open(tier2_path, "r") as f:
+            t2 = json.load(f)
+
+        rows = []
+
+        t1u = t1.get("tier1_uncalibrated", {}) or {}
+        n_q = t1.get("n_questions", "")
+
+        for k in ["Accuracy", "NLL", "Brier", "ECE"]:
+            if k in t1u:
+                add_row(rows, "Tier1", "overall", k, t1u[k], "uncalibrated", n_q)
+
+        sel = (t1u.get("SelectiveRisk") or {})
+        if "AURC01" in sel:
+            add_row(rows, "Tier1", "overall", "AURC01", sel["AURC01"], "uncalibrated", n_q)
+        for k in ["risk_01@60", "risk_01@80", "risk_01@90"]:
+            if k in sel:
+                add_row(rows, "Tier1", "overall", k, sel[k], "uncalibrated", n_q)
+
+        base = (t2.get("baseline_uncalibrated") or {})
+        for k in ["Accuracy", "NLL", "Brier", "ECE"]:
+            if k in base:
+                add_row(rows, "Tier2_InputPerturb", "baseline", k, base[k], "uncalibrated", n_q)
+
+        perts = (t2.get("perturbations") or {})
+        for pname, pobj in perts.items():
+            d = (pobj.get("delta_uncalibrated") or {})
+            for k in ["ΔAccuracy", "ΔNLL", "ΔBrier", "ΔECE"]:
+                if k in d:
+                    add_row(rows, "Tier2_InputPerturb", pname, k, d[k], "uncalibrated", n_q)
+
+        t3u = t1.get("tier3_slices_uncalibrated", {}) or {}
+        for slice_name, vals in t3u.items():
+            n = vals.get("n", "")
+            for k in ["Accuracy", "NLL", "Brier", "ECE", "AURC01"]:
+                if k in vals:
+                    add_row(rows, "Tier3", slice_name, k, vals[k], "uncalibrated", n)
+
+        df = pd.DataFrame(rows, columns=["System", "Dataset", "Tier", "Split", "Subgroup", "Metric", "Value", "N"])
+        df["Value"] = df["Value"].apply(_fmt3)
+        df.to_csv(out_csv, index=False)
+
+        print(f"Saved: {out_csv}")
+
+
         return summary_path
+
 
 
 
@@ -3760,6 +4069,147 @@ class CrossSystemComparatorPredOnlyVignette:
         print(f"Wrote: {self.out_path}")
         print(f"Wrote: {aligned_path}")
         print(f"n_eval={final['n_eval']} dropped={final['dropped_counts']}")
+
+
+
+        # summarizing all to a single csv ...
+        # summarizing all to a single csv ...
+        # summarizing all to a single csv ...
+        ppath = os.path.dirname(self.out_path)
+        base_path = os.path.dirname(ppath)
+
+        s1_csv = os.path.join(base_path, "tier123_results_s1_end2end", "S1_vignette_full_results.csv")
+        s2_csv = os.path.join(base_path, "tier123_results_s2_end2end", "S2_vignette_full_results.csv")
+        s3_csv = os.path.join(base_path, "tier123_results_s3_end2end", "S3_vignette_full_results.csv")
+        s4_csv = os.path.join(base_path, "tier123_results_s4_end2end", "S4_vignette_full_results.csv")
+
+        cross_json = self.out_path
+
+        out_csv = os.path.join(ppath, "Vignette_ALL_systems_plus_cross.csv")
+
+        def _to_float(x):
+            try:
+                if x is None:
+                    return np.nan
+                return float(x)
+            except Exception:
+                return np.nan
+
+        def _round3(x):
+            x = _to_float(x)
+            return np.nan if pd.isna(x) else round(x, 3)
+
+        def load_summary_csv(path, system_name):
+            df = pd.read_csv(path)
+
+            # Normalize columns (keep it robust to slightly different headers)
+            col_map = {}
+            for c in df.columns:
+                lc = c.strip().lower()
+                if lc in {"tier"}:
+                    col_map[c] = "Tier"
+                elif lc in {"subgroup", "slice", "group"}:
+                    col_map[c] = "Subgroup"
+                elif lc in {"metric"}:
+                    col_map[c] = "Metric"
+                elif lc in {"value", "val"}:
+                    col_map[c] = "Value"
+            df = df.rename(columns=col_map)
+
+            # Minimal required columns
+            for req in ["Tier", "Subgroup", "Metric", "Value"]:
+                if req not in df.columns:
+                    raise ValueError(f"{path} is missing required column: {req}. Found: {list(df.columns)}")
+
+            df["System"] = system_name
+
+            # Force numeric where possible and round to 3 decimals
+            df["Value"] = df["Value"].apply(_to_float).apply(_round3)
+
+            # Order columns
+            df = df[["Dataset", "System", "Tier", "Subgroup", "Metric", "Value"]] if "Dataset" in df.columns else df
+            if "Dataset" not in df.columns:
+                df.insert(0, "Dataset", "Vignette")
+
+            return df[["Dataset", "System", "Tier", "Subgroup", "Metric", "Value"]]
+
+        def add_row(rows, system, tier, subgroup, metric, value, dataset="Vignette"):
+            rows.append({
+                "Dataset": dataset,
+                "System": system,
+                "Tier": tier,
+                "Subgroup": subgroup,
+                "Metric": metric,
+                "Value": _round3(value),
+            })
+
+        df_all = pd.concat(
+            [
+                load_summary_csv(s1_csv, "S1"),
+                load_summary_csv(s2_csv, "S2"),
+                load_summary_csv(s3_csv, "S3"),
+                load_summary_csv(s4_csv, "S4"),
+            ],
+            ignore_index=True,
+        )
+
+        with open(cross_json, "r") as f:
+            cx = json.load(f)
+
+        rows = []
+
+        # Per-system metrics (from cross JSON)
+        per_sys = cx.get("per_system_metrics", {})
+        for sys_name, metrics in per_sys.items():
+            for m, v in metrics.items():
+                add_row(rows, sys_name, "CrossSystem", "per_system_metrics", m, v)
+
+        # Pairwise metrics: win_rates and bootstrap deltas
+        pairs = cx.get("pairwise_all_pairs", {})
+        for pair_name, block in pairs.items():
+            # win rates
+            win = block.get("win_rates", {})
+            for m, v in win.items():
+                add_row(rows, "ALL", "CrossSystem", f"{pair_name}::win_rates", m, v)
+
+            # bootstrap deltas
+            deltas = block.get("bootstrap_deltas_A_minus_B", {})
+            for m, stats in deltas.items():
+                add_row(rows, "ALL", "CrossSystem", f"{pair_name}::bootstrap", f"{m}::mean", stats.get("mean_delta"))
+                add_row(rows, "ALL", "CrossSystem", f"{pair_name}::bootstrap", f"{m}::ci_low", stats.get("ci_low"))
+                add_row(rows, "ALL", "CrossSystem", f"{pair_name}::bootstrap", f"{m}::ci_high", stats.get("ci_high"))
+
+        # Tier2 severity optional (accuracy drops etc)
+        sev = cx.get("tier2_severity_optional", {})
+        for sys_name, block in sev.items():
+            if not isinstance(block, dict):
+                continue
+            add_row(rows, sys_name, "CrossSystem", "tier2_severity_optional", "available",
+                    int(bool(block.get("available", False))))
+            if block.get("available", False):
+                add_row(rows, sys_name, "CrossSystem", "tier2_severity_optional", "base_acc", block.get("base_acc"))
+                perts = block.get("perturbations", {})
+                for pert_name, pvals in perts.items():
+                    add_row(rows, sys_name, "CrossSystem", f"tier2_severity::{pert_name}", "pert_acc",
+                            pvals.get("pert_acc"))
+                    add_row(rows, sys_name, "CrossSystem", f"tier2_severity::{pert_name}", "acc_drop",
+                            pvals.get("acc_drop"))
+                    add_row(rows, sys_name, "CrossSystem", f"tier2_severity::{pert_name}", "frac_questions_worse",
+                            pvals.get("frac_questions_worse"))
+
+        df_cross = pd.DataFrame(rows, columns=["Dataset", "System", "Tier", "Subgroup", "Metric", "Value"])
+
+        df_final = pd.concat([df_all, df_cross], ignore_index=True)
+
+        # Keep it clean
+        df_final["Dataset"] = df_final["Dataset"].fillna("Vignette")
+        df_final["System"] = df_final["System"].fillna("")
+
+        df_final.to_csv(out_csv, index=False)
+        print(f"Saved: {out_csv}")
+
+
+
         return self.out_path
 
 
@@ -3778,99 +4228,99 @@ if __name__ == "__main__":
 
 
     ''' S4 Vignette '''
-    # runner = VignetteS4Tier123End2EndEvaluator(
-    #     cfg_path=global_config_path,
-    #     experiment_name=experiment_name,
-    #     base_path_evidenceData=base_path_evidenceData,
-    #     model_weights_path=model_weights_path,
-    #     verifier_weights_path=verifier_weights_path,
-    #     vignette_paths=VignetteEvalPaths(
-    #         csv_4option=os.path.join(base_path_chexpertData, "Vignette_4option.csv"),
-    #         csv_5option=os.path.join(base_path_chexpertData, "Vignette_5option.csv"),
-    #     ),
-    #     device="cuda",
-    #     top_k=20,
-    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-    #     batch_size_retrieve=256,
-    #     batch_size_verify=4,
-    #     ece_bins=15,
-    #     seed=13,
-    #     faithfulness_random_trials=1,
-    #     out_dir=os.path.join(base_path_evidenceData, "external_validation", "Vignette", "tier123_results_s4_end2end"),
-    # )
-    # runner.run()
+    runner = VignetteS4Tier123End2EndEvaluator(
+        cfg_path=global_config_path,
+        experiment_name=experiment_name,
+        base_path_evidenceData=base_path_evidenceData,
+        model_weights_path=model_weights_path,
+        verifier_weights_path=verifier_weights_path,
+        vignette_paths=VignetteEvalPaths(
+            csv_4option=os.path.join(base_path_chexpertData, "Vignette_4option.csv"),
+            csv_5option=os.path.join(base_path_chexpertData, "Vignette_5option.csv"),
+        ),
+        device="cuda",
+        top_k=20,
+        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+        batch_size_retrieve=256,
+        batch_size_verify=4,
+        ece_bins=15,
+        seed=13,
+        faithfulness_random_trials=1,
+        out_dir=os.path.join(base_path_evidenceData, "external_validation", "Vignette", "tier123_results_s4_end2end"),
+    )
+    runner.run()
 
 
 
     ''' S3 Vignette '''
-    # s3 = VignetteS3Tier123End2EndEvaluator(
-    #     cfg_path=global_config_path,
-    #     experiment_name=experiment_name,
-    #     base_path_evidenceData=base_path_evidenceData,
-    #     verifier_weights_path=verifier_weights_path,
-    #     vignette_paths=VignetteEvalPaths(
-    #         csv_4option=os.path.join(base_path_chexpertData, "Vignette_4option.csv"),
-    #         csv_5option=os.path.join(base_path_chexpertData, "Vignette_5option.csv")),
-    #     device="cuda",
-    #     top_k=20,
-    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-    #     batch_size_verify=4,
-    #     ece_bins=15,
-    #     seed=13,
-    #     bm25_k1=1.2,
-    #     bm25_b=0.75,
-    #     # tier2 speed knobs
-    #     # faithfulness_max_eval_questions=100,
-    #     # faithfulness_random_trials=1,
-    #     out_dir=os.path.join(base_path_evidenceData, "external_validation", "Vignette", "tier123_results_s3_end2end"),
-    # )
-    # s3.run()
+    s3 = VignetteS3Tier123End2EndEvaluator(
+        cfg_path=global_config_path,
+        experiment_name=experiment_name,
+        base_path_evidenceData=base_path_evidenceData,
+        verifier_weights_path=verifier_weights_path,
+        vignette_paths=VignetteEvalPaths(
+            csv_4option=os.path.join(base_path_chexpertData, "Vignette_4option.csv"),
+            csv_5option=os.path.join(base_path_chexpertData, "Vignette_5option.csv")),
+        device="cuda",
+        top_k=20,
+        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+        batch_size_verify=4,
+        ece_bins=15,
+        seed=13,
+        bm25_k1=1.2,
+        bm25_b=0.75,
+        # tier2 speed knobs
+        # faithfulness_max_eval_questions=100,
+        # faithfulness_random_trials=1,
+        out_dir=os.path.join(base_path_evidenceData, "external_validation", "Vignette", "tier123_results_s3_end2end"),
+    )
+    s3.run()
 
 
 
     ''' S2 Vignette '''
-    # s2 = VignetteS2Tier123End2EndEvaluator(
-    #     cfg_path=global_config_path,
-    #     experiment_name=experiment_name,
-    #     base_path_evidenceData=base_path_evidenceData,
-    #     verifier_weights_path=verifier_weights_path,
-    #     vignette_paths=VignetteEvalPaths(
-    #         csv_4option=os.path.join(base_path_chexpertData, "Vignette_4option.csv"),
-    #         csv_5option=os.path.join(base_path_chexpertData, "Vignette_5option.csv")),
-    #     device="cuda",
-    #     top_k=20,
-    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-    #     batch_size_embed_chunks=128,
-    #     batch_size_retrieve=256,
-    #     batch_size_verify=4,
-    #     ece_bins=15,
-    #     seed=13,
-    #     # tier2 speed knobs
-    #     # faithfulness_max_eval_questions=100,
-    #     # faithfulness_random_trials=1,
-    #     out_dir=os.path.join(base_path_evidenceData, "external_validation", "Vignette", "tier123_results_s2_end2end"),
-    # )
-    # s2.run()
+    s2 = VignetteS2Tier123End2EndEvaluator(
+        cfg_path=global_config_path,
+        experiment_name=experiment_name,
+        base_path_evidenceData=base_path_evidenceData,
+        verifier_weights_path=verifier_weights_path,
+        vignette_paths=VignetteEvalPaths(
+            csv_4option=os.path.join(base_path_chexpertData, "Vignette_4option.csv"),
+            csv_5option=os.path.join(base_path_chexpertData, "Vignette_5option.csv")),
+        device="cuda",
+        top_k=20,
+        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+        batch_size_embed_chunks=128,
+        batch_size_retrieve=256,
+        batch_size_verify=4,
+        ece_bins=15,
+        seed=13,
+        # tier2 speed knobs
+        # faithfulness_max_eval_questions=100,
+        # faithfulness_random_trials=1,
+        out_dir=os.path.join(base_path_evidenceData, "external_validation", "Vignette", "tier123_results_s2_end2end"),
+    )
+    s2.run()
 
 
 
     ''' S1 Vignette '''
-    # s1 = VignetteS1Tier123End2EndEvaluator(
-    #     cfg_path=global_config_path,
-    #     experiment_name=experiment_name,
-    #     base_path_evidenceData=base_path_evidenceData,
-    #     verifier_weights_path=verifier_weights_path,
-    #     vignette_paths=VignetteEvalPaths(
-    #         csv_4option=os.path.join(base_path_chexpertData, "Vignette_4option.csv"),
-    #         csv_5option=os.path.join(base_path_chexpertData, "Vignette_5option.csv")),
-    #     device="cuda",
-    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-    #     batch_size_verify=4,
-    #     ece_bins=15,
-    #     seed=13,
-    #     out_dir=os.path.join(base_path_evidenceData, "external_validation", "Vignette", "tier123_results_s1_end2end"),
-    # )
-    # s1.run()
+    s1 = VignetteS1Tier123End2EndEvaluator(
+        cfg_path=global_config_path,
+        experiment_name=experiment_name,
+        base_path_evidenceData=base_path_evidenceData,
+        verifier_weights_path=verifier_weights_path,
+        vignette_paths=VignetteEvalPaths(
+            csv_4option=os.path.join(base_path_chexpertData, "Vignette_4option.csv"),
+            csv_5option=os.path.join(base_path_chexpertData, "Vignette_5option.csv")),
+        device="cuda",
+        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+        batch_size_verify=4,
+        ece_bins=15,
+        seed=13,
+        out_dir=os.path.join(base_path_evidenceData, "external_validation", "Vignette", "tier123_results_s1_end2end"),
+    )
+    s1.run()
 
 
 
