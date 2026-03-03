@@ -1,12 +1,10 @@
 """
 Created on Feb 24, 2026.
-Tier1_prediction.py
+Tier1_2_3_prediction.py
 
 @author: Soroosh Tayebi Arasteh <soroosh.arasteh@rwth-aachen.de>
 https://github.com/tayebiarasteh/
 
-
-Tier1 + Tier2 end-to-end evaluator for each system
 
 Tier1:
   - End2End R* retrieval -> V* predictions
@@ -23,9 +21,28 @@ Tier2:
       (d) shuffle chunk order
     For each: compute ΔMSE/ΔPearson/ΔECE relative to baseline S4.
 
-Tier3:
-  -
+Tier3: Distribution shift slices on the fixed test set:
+    (a) report_length_bucket (short/medium/long)
+    (b) device_present (0/1)
+    (c) uncertainty_present (0/1)
+    (d) label_vs_extractive (label/extractive)
+    For each slice: report n, per-system metrics, and bootstrap CIs for key deltas (ΔMSE/ΔECE/ΔAURC) vs S4.
+
+
+Cross-system:
+    Align S1–S4 by qa_row_id
+    Per-system metrics (MSE/MAE/Pearson/Spearman/ECE/Brier/NLL/AURC)
+    Pairwise comparisons (all pairs):
+    (a) paired bootstrap 95% CI for metric deltas
+    (b) example-level win rates:
+    - abs error win rate: |y−ŷ_A| < |y−ŷ_B|
+    - calibration win rate: |p_A−y| < |p_B−y|
+
+    faithfulness severity index (S2–S4 if tier2 faithfulness predictions exist):
+    relative MSE degradation per perturbation
+    fraction of examples with worse absolute error under corruption
 """
+
 import os.path
 import pdb
 import re
@@ -3270,64 +3287,48 @@ class S1Tier123CaseOnlyEvaluator:
 
 
 
-class CrossSystemComparatorV2:
+
+class CrossSystemComparatorPredOnly:
     """
-    Cross-system evaluation on the SAME fixed test set.
+    Evaluation set = intersection of qa_row_id across all provided systems.
 
-    Inputs:
-      - system_test_predictions: dict system_name -> test_predictions.parquet
-      - test_parquet: fixed protocol parquet (for gold evidence ids + slice tags)
-      - system_faithfulness_predictions: optional dict system_name -> tier2_faithfulness_predictions.parquet
+    What it computes (on the intersection):
+      - Per-system: MSE/MAE/Pearson/Spearman/ECE/Brier/NLL/AURC
+      - Pairwise (all pairs, not just vs S4):
+          * win rates (abs error, calibration error)
+          * paired bootstrap CI for deltas (Δ metric = A - B)
+      - faithfulness severity (if faithfulness prediction parquets are provided)
 
-    Outputs:
-      - per-system metrics (MSE/MAE/Pearson/Spearman/ECE/Brier/NLL/AURC)
-      - paired bootstrap CIs for deltas vs S4
-      - example-level win rates
-      - slice robustness deltas (S4 vs others) with bootstrap
-      - retrieval-quality vs error correlation (S2–S4 if retrieved ids exist)
-      - faithfulness severity indices (S2–S4 if faithfulness preds exist)
+    Requirements inside each system test_predictions.parquet:
+      - qa_row_id
+      - soft_support_score  (gold target; must match across systems on eval ids)
+      - a pred raw column containing "pred_support_raw" (or ending with "_pred_support_raw")
     """
 
     def __init__(
         self,
         system_test_predictions: Dict[str, str],
-        test_parquet: str,
         out_path: str,
         *,
         ece_bins: int = 15,
-        recall_ks: Tuple[int, ...] = (1, 5, 10, 20),
-        mrr_k: int = 10,
         n_boot: int = 2000,
         seed: int = 13,
         system_faithfulness_predictions: Optional[Dict[str, str]] = None,
     ) -> None:
         self.system_test_predictions = dict(system_test_predictions)
         self.system_faithfulness_predictions = dict(system_faithfulness_predictions or {})
-        self.test_parquet = test_parquet
         self.out_path = out_path
 
         self.ece_bins = int(ece_bins)
-        self.recall_ks = tuple(int(x) for x in recall_ks)
-        self.mrr_k = int(mrr_k)
         self.n_boot = int(n_boot)
         self.seed = int(seed)
-
         self.rng = np.random.RandomState(self.seed)
 
-    # -------------------------
-    # Basic utils
-    # -------------------------
+
     def _sigmoid(self, x: np.ndarray) -> np.ndarray:
         return 1.0 / (1.0 + np.exp(-np.clip(x, -20, 20)))
 
-    def _loads_json_list(self, s: str) -> List:
-        try:
-            return json.loads(s)
-        except Exception:
-            return []
-
     def _rankdata(self, x: np.ndarray) -> np.ndarray:
-        # average rank for ties (like scipy.stats.rankdata(method="average"))
         return pd.Series(x).rank(method="average").to_numpy(dtype=np.float64)
 
     def _pearson(self, a: np.ndarray, b: np.ndarray) -> float:
@@ -3341,9 +3342,7 @@ class CrossSystemComparatorV2:
         return float((a * b).sum() / denom)
 
     def _spearman(self, a: np.ndarray, b: np.ndarray) -> float:
-        ra = self._rankdata(a)
-        rb = self._rankdata(b)
-        return self._pearson(ra, rb)
+        return self._pearson(self._rankdata(a), self._rankdata(b))
 
     def _mse(self, y: np.ndarray, yhat: np.ndarray) -> float:
         return float(np.mean((y - yhat) ** 2))
@@ -3355,7 +3354,6 @@ class CrossSystemComparatorV2:
         return float(np.mean((p - y01) ** 2))
 
     def _nll_soft_bernoulli(self, y01: np.ndarray, p: np.ndarray) -> float:
-        # Soft-label Bernoulli cross-entropy
         eps = 1e-12
         p = np.clip(p, eps, 1.0 - eps)
         return float(np.mean(-(y01 * np.log(p) + (1.0 - y01) * np.log(1.0 - p))))
@@ -3381,10 +3379,10 @@ class CrossSystemComparatorV2:
         order = np.argsort(-conf)
         y = y01[order]
         yh = yhat[order]
-        risks = []
+        csum = 0.0
         for k in range(1, len(y) + 1):
-            risks.append(np.mean((y[:k] - yh[:k]) ** 2))
-        return float(np.mean(risks))
+            csum += float(np.mean((y[:k] - yh[:k]) ** 2))
+        return float(csum / max(1, len(y)))
 
     def _paired_bootstrap_delta(self, y01: np.ndarray, a: np.ndarray, b: np.ndarray, fn) -> Dict[str, float]:
         n = len(y01)
@@ -3398,30 +3396,7 @@ class CrossSystemComparatorV2:
             "ci_high": float(np.percentile(deltas, 97.5)),
         }
 
-    # -------------------------
-    # Retrieval quality per example (needs retrieved ids + gold ids)
-    # -------------------------
-    def _recall_at_k(self, retrieved: List[int], gold: List[int], k: int) -> float:
-        if not gold:
-            return 0.0
-        g = set(gold)
-        for x in retrieved[:k]:
-            if x in g:
-                return 1.0
-        return 0.0
-
-    def _mrr_at_k(self, retrieved: List[int], gold: List[int], k: int) -> float:
-        if not gold:
-            return 0.0
-        g = set(gold)
-        for i, x in enumerate(retrieved[:k]):
-            if x in g:
-                return 1.0 / float(i + 1)
-        return 0.0
-
-    # -------------------------
-    # Loading + column inference
-    # -------------------------
+    # Column inference
     def _infer_cols(self, df: pd.DataFrame) -> Dict[str, Optional[str]]:
         cols = list(df.columns)
 
@@ -3437,48 +3412,80 @@ class CrossSystemComparatorV2:
                 pred_prob = c
                 break
 
-        retrieved_ids = None
-        for c in cols:
-            if ("retrieved_chunk_ids_json" in c):
-                retrieved_ids = c
-                break
+        return {"pred_raw": pred_raw, "pred_prob": pred_prob}
 
-        return {"pred_raw": pred_raw, "pred_prob": pred_prob, "retrieved_ids": retrieved_ids}
 
-    def _load_all(self):
-        if not os.path.exists(self.test_parquet):
-            raise FileNotFoundError(self.test_parquet)
+    def _load_and_align_systems(self):
+        systems_raw: Dict[str, pd.DataFrame] = {}
 
-        base_df = pd.read_parquet(self.test_parquet)
-        if "split" in base_df.columns:
-            base_df = base_df[base_df["split"].astype(str) == "test"].copy()
-        base_df = base_df.sort_values("qa_row_id").reset_index(drop=True)
-
-        systems = {}
         for sys_name, path in self.system_test_predictions.items():
             if not os.path.exists(path):
                 raise FileNotFoundError(path)
             df = pd.read_parquet(path)
+
+            if "qa_row_id" not in df.columns:
+                raise RuntimeError(f"{sys_name} predictions parquet missing qa_row_id")
+            if "soft_support_score" not in df.columns:
+                raise RuntimeError(f"{sys_name} predictions parquet missing soft_support_score")
+
+            df = df.copy()
+            df["qa_row_id"] = pd.to_numeric(df["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
+            df = df[df["qa_row_id"] >= 0].copy()
             df = df.sort_values("qa_row_id").reset_index(drop=True)
 
-            if len(df) != len(base_df) or not np.all(df["qa_row_id"].values == base_df["qa_row_id"].values):
-                raise RuntimeError(f"qa_row_id mismatch for {sys_name}. Ensure all runs use the same fixed test parquet.")
+            systems_raw[sys_name] = df
 
-            systems[sys_name] = df
+        # Intersection ids
+        sys_ids = {k: set(v["qa_row_id"].tolist()) for k, v in systems_raw.items()}
+        eval_ids = None
+        for ids in sys_ids.values():
+            eval_ids = set(ids) if eval_ids is None else (eval_ids & ids)
+        eval_ids = np.array(sorted(list(eval_ids or [])), dtype=np.int64)
 
-        return base_df, systems
+        if len(eval_ids) == 0:
+            raise RuntimeError("No overlapping qa_row_id across provided systems.")
 
-    # -------------------------
-    # Faithfulness severity (optional)
-    # -------------------------
+        # Filter + align
+        systems: Dict[str, pd.DataFrame] = {}
+        dropped = {}
+        for sys_name, df in systems_raw.items():
+            df_f = df[df["qa_row_id"].isin(eval_ids)].copy()
+            df_f = df_f.sort_values("qa_row_id").reset_index(drop=True)
+            systems[sys_name] = df_f
+            dropped[f"{sys_name}_dropped"] = int(len(df) - len(df_f))
+
+        # Sanity: exact id order match
+        ref = next(iter(systems.values()))["qa_row_id"].to_numpy()
+        for sys_name, df in systems.items():
+            if not np.array_equal(df["qa_row_id"].to_numpy(), ref):
+                raise RuntimeError(f"Internal alignment failure for {sys_name}")
+
+        # Gold y: take from S4 if present else first system, and verify consistency
+        prefer = "S4" if "S4" in systems else list(systems.keys())[0]
+        y = pd.to_numeric(systems[prefer]["soft_support_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+        y01 = np.clip(y, 0.0, 1.0)
+
+        # Verify soft_support_score matches across systems on eval ids (small float tolerance)
+        for sys_name, df in systems.items():
+            y_other = pd.to_numeric(df["soft_support_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+            if not np.allclose(y_other, y, rtol=0.0, atol=1e-6):
+                # Not ethical to compare if "gold" differs across files for same ids
+                raise RuntimeError(
+                    f"soft_support_score mismatch between {prefer} and {sys_name} on aligned eval ids. "
+                    f"Make sure all test_predictions were produced from the same fixed test set rows."
+                )
+
+        meta = {
+            "n_eval": int(len(eval_ids)),
+            "eval_id_source": "intersection_of_system_outputs_only",
+            "dropped_counts": dropped,
+            "systems": list(systems.keys()),
+        }
+        return systems, y01, meta
+
+
+    # Faithfulness severity
     def _faithfulness_severity(self, y01: np.ndarray, faith_df: pd.DataFrame, sys_prefix: str) -> Dict[str, object]:
-        # Expect columns like:
-        #   <prefix>_pred_base_raw
-        #   <prefix>_pred_top1_raw
-        #   <prefix>_pred_top3_raw
-        #   <prefix>_pred_shuffle_raw
-        #   <prefix>_pred_swapped_raw
-        #   <prefix>_pred_random_avg_raw (optional)
         base_col = f"{sys_prefix}_pred_base_raw"
         if base_col not in faith_df.columns:
             return {"available": False}
@@ -3495,7 +3502,6 @@ class CrossSystemComparatorV2:
             mse_base = self._mse(y01, yhat_base)
             mse_p = self._mse(y01, yhat_p)
             rel = float((mse_p - mse_base) / (mse_base + 1e-12))
-
             frac_worse = float(np.mean(err_p > base_err))
             return {
                 "mse_base": float(mse_base),
@@ -3512,28 +3518,13 @@ class CrossSystemComparatorV2:
         out["perturbations"]["random_evidence"] = summarize(f"{sys_prefix}_pred_random_avg_raw")
         return out
 
-    # -------------------------
+
     # Main run
-    # -------------------------
     def run(self) -> str:
-        base_df, systems = self._load_all()
-
-        y = pd.to_numeric(base_df["soft_support_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
-        y01 = np.clip(y, 0.0, 1.0)
-
-        # Gold evidence ids for retrieval-quality analysis
-        gold_lists = []
-        if "evidence_chunk_ids_json" in base_df.columns:
-            for s in base_df["evidence_chunk_ids_json"].astype(str).tolist():
-                ids = self._loads_json_list(s)
-                ids = [int(x) for x in ids if str(x).strip() != ""]
-                gold_lists.append(ids)
-        else:
-            gold_lists = None
+        systems, y01, meta = self._load_and_align_systems()
 
         per_system = {}
-        per_system_series = {}
-        retrieval_quality = {}
+        series = {}
 
         for sys_name, df in systems.items():
             cols = self._infer_cols(df)
@@ -3548,7 +3539,7 @@ class CrossSystemComparatorV2:
             else:
                 p = self._sigmoid(yhat).astype(np.float32)
 
-            metrics = {
+            per_system[sys_name] = {
                 "MSE": self._mse(y01, yhat),
                 "MAE": self._mae(y01, yhat),
                 "Pearson": self._pearson(y01, yhat),
@@ -3558,144 +3549,87 @@ class CrossSystemComparatorV2:
                 "NLL": self._nll_soft_bernoulli(y01, p),
                 "AURC": self._aurc(y01, yhat),
             }
+            series[sys_name] = {"yhat": yhat, "p": p}
 
-            per_system[sys_name] = metrics
-            per_system_series[sys_name] = {"yhat": yhat, "p": p}
+        # Pairwise comparisons for ALL ordered pairs A vs B
+        def ece_p_fn(yy, pp): return self._ece(yy, pp, self.ece_bins)
+        def brier_p_fn(yy, pp): return self._brier(yy, pp)
+        def nll_p_fn(yy, pp): return self._nll_soft_bernoulli(yy, pp)
 
-            # Retrieval-quality vs error (only if retrieved ids exist and gold exists)
-            if gold_lists is not None:
-                rid_col = cols["retrieved_ids"]
-                if rid_col is not None and rid_col in df.columns:
-                    retrieved_lists = []
-                    for s in df[rid_col].astype(str).tolist():
-                        ids = self._loads_json_list(s)
-                        ids = [int(x) for x in ids if str(x).strip() != ""]
-                        retrieved_lists.append(ids)
-
-                    rr = np.array([self._mrr_at_k(r, g, self.mrr_k) for r, g in zip(retrieved_lists, gold_lists)], dtype=np.float32)
-                    hit20 = np.array([self._recall_at_k(r, g, 20) for r, g in zip(retrieved_lists, gold_lists)], dtype=np.float32)
-                    abs_err = np.abs(y01 - yhat)
-
-                    retrieval_quality[sys_name] = {
-                        "available": True,
-                        "Spearman_rr_vs_abs_error": self._spearman(rr, abs_err),
-                        "Spearman_hit20_vs_abs_error": self._spearman(hit20, abs_err),
-                        "mean_MRR@k": float(rr.mean()),
-                        "mean_Recall@20": float(hit20.mean()),
-                    }
-                else:
-                    retrieval_quality[sys_name] = {"available": False}
-            else:
-                retrieval_quality[sys_name] = {"available": False}
-
-        # Paired deltas vs S4
-        if "S4" not in systems:
-            raise RuntimeError("Comparator expects 'S4' in system_test_predictions.")
-
-        yhat_s4 = per_system_series["S4"]["yhat"]
-        p_s4 = per_system_series["S4"]["p"]
-
-        def ece_fn(y01_i, yhat_i):
-            # yhat_i is not used; caller will pass p via closure if needed
-            raise RuntimeError("Use ece_p_fn instead.")
-
-        def ece_p_fn(y01_i, p_i):
-            return self._ece(y01_i, p_i, self.ece_bins)
-
-        def brier_p_fn(y01_i, p_i):
-            return self._brier(y01_i, p_i)
-
-        def nll_p_fn(y01_i, p_i):
-            return self._nll_soft_bernoulli(y01_i, p_i)
-
-        pairwise_vs_s4 = {}
-        for other in [k for k in systems.keys() if k != "S4"]:
-            yhat_o = per_system_series[other]["yhat"]
-            p_o = per_system_series[other]["p"]
-
-            # win rates
-            abs_err_s4 = np.abs(y01 - yhat_s4)
-            abs_err_o = np.abs(y01 - yhat_o)
-            win_abs = float(np.mean(abs_err_s4 < abs_err_o))
-
-            cal_err_s4 = np.abs(p_s4 - y01)
-            cal_err_o = np.abs(p_o - y01)
-            win_cal = float(np.mean(cal_err_s4 < cal_err_o))
-
-            pairwise_vs_s4[f"S4_vs_{other}"] = {
-                "win_rates": {
-                    "frac_examples_abs_error_S4_better": win_abs,
-                    "frac_examples_calibration_error_S4_better": win_cal,
-                },
-                "bootstrap_deltas": {
-                    "ΔMSE": self._paired_bootstrap_delta(y01, yhat_s4, yhat_o, self._mse),
-                    "ΔMAE": self._paired_bootstrap_delta(y01, yhat_s4, yhat_o, self._mae),
-                    "ΔPearson": self._paired_bootstrap_delta(y01, yhat_s4, yhat_o, lambda yy, aa: self._pearson(yy, aa)),
-                    "ΔSpearman": self._paired_bootstrap_delta(y01, yhat_s4, yhat_o, lambda yy, aa: self._spearman(yy, aa)),
-                    "ΔAURC": self._paired_bootstrap_delta(y01, yhat_s4, yhat_o, self._aurc),
-                    # ECE/Brier/NLL bootstrap must use p directly
-                    "ΔECE": self._paired_bootstrap_delta(y01, p_s4, p_o, ece_p_fn),
-                    "ΔBrier": self._paired_bootstrap_delta(y01, p_s4, p_o, brier_p_fn),
-                    "ΔNLL": self._paired_bootstrap_delta(y01, p_s4, p_o, nll_p_fn),
-                },
-            }
-
-        # Slice robustness (bootstrap within slice)
-        slice_cols = ["report_length_bucket", "device_present", "uncertainty_present", "label_vs_extractive"]
-        slice_report = {}
-
-        for col in slice_cols:
-            if col not in base_df.columns:
-                continue
-            for val, idxs in base_df.groupby(col).groups.items():
-                idxs = np.array(list(idxs), dtype=np.int64)
-                if len(idxs) < 30:
+        pairwise = {}
+        names = list(systems.keys())
+        for a in names:
+            for b in names:
+                if a == b:
                     continue
 
-                y_s = y01[idxs]
-                s4_yhat = yhat_s4[idxs]
-                s4_p = p_s4[idxs]
+                yhat_a = series[a]["yhat"]
+                yhat_b = series[b]["yhat"]
+                p_a = series[a]["p"]
+                p_b = series[b]["p"]
 
-                entry = {"n": int(len(idxs)), "pairs": {}}
-                for other in [k for k in systems.keys() if k != "S4"]:
-                    o_yhat = per_system_series[other]["yhat"][idxs]
-                    o_p = per_system_series[other]["p"][idxs]
+                abs_err_a = np.abs(y01 - yhat_a)
+                abs_err_b = np.abs(y01 - yhat_b)
+                win_abs = float(np.mean(abs_err_a < abs_err_b))
 
-                    entry["pairs"][f"S4_vs_{other}"] = {
-                        "ΔMSE": self._paired_bootstrap_delta(y_s, s4_yhat, o_yhat, self._mse),
-                        "ΔECE": self._paired_bootstrap_delta(y_s, s4_p, o_p, ece_p_fn),
-                        "ΔAURC": self._paired_bootstrap_delta(y_s, s4_yhat, o_yhat, self._aurc),
-                    }
+                cal_err_a = np.abs(p_a - y01)
+                cal_err_b = np.abs(p_b - y01)
+                win_cal = float(np.mean(cal_err_a < cal_err_b))
 
-                slice_report[f"slice.{col}.{val}"] = entry
+                pairwise[f"{a}_vs_{b}"] = {
+                    "win_rates": {
+                        "frac_examples_abs_error_A_better": win_abs,
+                        "frac_examples_calibration_error_A_better": win_cal,
+                    },
+                    "bootstrap_deltas_A_minus_B": {
+                        "ΔMSE": self._paired_bootstrap_delta(y01, yhat_a, yhat_b, self._mse),
+                        "ΔMAE": self._paired_bootstrap_delta(y01, yhat_a, yhat_b, self._mae),
+                        "ΔPearson": self._paired_bootstrap_delta(y01, yhat_a, yhat_b, lambda yy, aa: self._pearson(yy, aa)),
+                        "ΔSpearman": self._paired_bootstrap_delta(y01, yhat_a, yhat_b, lambda yy, aa: self._spearman(yy, aa)),
+                        "ΔAURC": self._paired_bootstrap_delta(y01, yhat_a, yhat_b, self._aurc),
+                        "ΔECE": self._paired_bootstrap_delta(y01, p_a, p_b, ece_p_fn),
+                        "ΔBrier": self._paired_bootstrap_delta(y01, p_a, p_b, brier_p_fn),
+                        "ΔNLL": self._paired_bootstrap_delta(y01, p_a, p_b, nll_p_fn),
+                    },
+                }
 
-        # Faithfulness severity indices (optional)
+        # Optional faithfulness severity
         faithfulness = {}
-        for sys_name, path in self.system_faithfulness_predictions.items():
-            if not os.path.exists(path):
-                continue
-            fdf = pd.read_parquet(path).sort_values("qa_row_id").reset_index(drop=True)
-            # infer prefix "s2", "s3", "s4" based on columns present
-            # we’ll pick the first *_pred_base_raw column
-            base_cols = [c for c in fdf.columns if c.endswith("_pred_base_raw")]
-            if not base_cols:
-                faithfulness[sys_name] = {"available": False}
-                continue
-            prefix = base_cols[0].replace("_pred_base_raw", "")
-            faithfulness[sys_name] = self._faithfulness_severity(y01, fdf, prefix)
+        if self.system_faithfulness_predictions:
+            # Align by qa_row_id intersection ids (from systems) via the reference ids
+            ref_ids = systems[next(iter(systems))]["qa_row_id"].to_numpy(dtype=np.int64)
+            ref_ids_df = pd.DataFrame({"qa_row_id": ref_ids})
+
+            for sys_name, path in self.system_faithfulness_predictions.items():
+                if not os.path.exists(path):
+                    continue
+                fdf = pd.read_parquet(path)
+                if "qa_row_id" not in fdf.columns:
+                    faithfulness[sys_name] = {"available": False}
+                    continue
+                fdf = fdf.copy()
+                fdf["qa_row_id"] = pd.to_numeric(fdf["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
+                fdf = fdf.merge(ref_ids_df, on="qa_row_id", how="inner").sort_values("qa_row_id").reset_index(drop=True)
+
+                base_cols = [c for c in fdf.columns if c.endswith("_pred_base_raw")]
+                if not base_cols:
+                    faithfulness[sys_name] = {"available": False}
+                    continue
+
+                prefix = base_cols[0].replace("_pred_base_raw", "")
+                # y01 must align with fdf rows now
+                y01_f = y01[: len(fdf)]
+                faithfulness[sys_name] = self._faithfulness_severity(y01_f, fdf, prefix)
 
         final = {
-            "test_parquet": self.test_parquet,
-            "n_test": int(len(base_df)),
+            "n_eval": int(meta["n_eval"]),
+            "alignment_mode": meta["eval_id_source"],
+            "dropped_counts": meta["dropped_counts"],
             "per_system_metrics": per_system,
-            "pairwise_vs_S4": pairwise_vs_s4,
-            "slice_robustness_bootstrap": slice_report,
-            "retrieval_quality_vs_error": retrieval_quality,
+            "pairwise_all_pairs": pairwise,
             "faithfulness_severity": faithfulness,
             "params": {
                 "ece_bins": int(self.ece_bins),
-                "recall_ks": list(self.recall_ks),
-                "mrr_k": int(self.mrr_k),
                 "n_boot": int(self.n_boot),
                 "seed": int(self.seed),
             },
@@ -3706,7 +3640,10 @@ class CrossSystemComparatorV2:
             json.dump(final, f, indent=2)
 
         print(f"Wrote: {self.out_path}")
+        print(f"n_eval={final['n_eval']} dropped={final['dropped_counts']}")
         return self.out_path
+
+
 
 
 
@@ -3717,6 +3654,77 @@ if __name__ == "__main__":
     with open(global_config_path, "r") as f:
         params = yaml.safe_load(f)
     base_path_evidenceData = params["Preprocessing"]["base_path_evidenceData"]
+
+
+
+    ''' S1 '''
+    s1 = S1Tier123CaseOnlyEvaluator(
+        cfg_path=global_config_path,
+        experiment_name=experiment_name,
+        base_path_evidenceData=base_path_evidenceData,
+        verifier_weights_path=verifier_weights_path,
+        device="cuda",
+        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+        out_dir=os.path.join(base_path_evidenceData, "tier123_results_s1_end2end"),
+        batch_size_verify=4,
+        ece_bins=15,
+        seed=13,
+        # optional:
+        # calib_max_steps=500,
+        # calib_lr=0.05,
+    )
+    s1.run()
+
+
+
+    ''' S3 '''
+    s3 = S3Tier123End2EndEvaluator(
+        cfg_path=global_config_path,
+        experiment_name=experiment_name,
+        base_path_evidenceData=base_path_evidenceData,
+        verifier_weights_path=verifier_weights_path,
+        device="cuda",
+        top_k=20,
+        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+        out_dir=os.path.join(base_path_evidenceData, "tier123_results_s3_end2end"),
+        batch_size_verify=4,
+        ece_bins=15,
+        seed=13,
+        bm25_k1=1.2,
+        bm25_b=0.75,
+        # optional speed knobs:
+        # faithfulness_max_eval=2000,
+        # faithfulness_random_trials=1,
+        # calib_max_steps=500,
+        # calib_lr=0.05,
+    )
+    s3.run()
+
+
+
+
+    ''' S2 '''
+    s2 = S2Tier123End2EndEvaluator(
+        cfg_path=global_config_path,
+        experiment_name=experiment_name,
+        base_path_evidenceData=base_path_evidenceData,
+        verifier_weights_path=verifier_weights_path,
+        device="cuda",
+        top_k=20,
+        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+        out_dir=os.path.join(base_path_evidenceData, "tier123_results_s2_end2end"),
+        batch_size_embed_chunks=128,
+        batch_size_retrieve=256,
+        batch_size_verify=4,
+        ece_bins=15,
+        seed=13,
+        # optional speed knobs
+        # faithfulness_max_eval=2000,
+        # faithfulness_random_trials=1,
+        # calib_max_steps=500,
+        # calib_lr=0.05,
+    )
+    s2.run()
 
 
 
@@ -3748,77 +3756,10 @@ if __name__ == "__main__":
 
 
 
-    ''' S2 '''
-    s2 = S2Tier123End2EndEvaluator(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        verifier_weights_path=verifier_weights_path,
-        device="cuda",
-        top_k=20,
-        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-        out_dir=os.path.join(base_path_evidenceData, "tier123_results_s2_end2end"),
-        batch_size_embed_chunks=128,
-        batch_size_retrieve=256,
-        batch_size_verify=4,
-        ece_bins=15,
-        seed=13,
-        # optional speed knobs
-        # faithfulness_max_eval=2000,
-        # faithfulness_random_trials=1,
-        # calib_max_steps=500,
-        # calib_lr=0.05,
-    )
-    s2.run()
-
-
-    ''' S3 '''
-    s3 = S3Tier123End2EndEvaluator(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        verifier_weights_path=verifier_weights_path,
-        device="cuda",
-        top_k=20,
-        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-        out_dir=os.path.join(base_path_evidenceData, "tier123_results_s3_end2end"),
-        batch_size_verify=4,
-        ece_bins=15,
-        seed=13,
-        bm25_k1=1.2,
-        bm25_b=0.75,
-        # optional speed knobs:
-        # faithfulness_max_eval=2000,
-        # faithfulness_random_trials=1,
-        # calib_max_steps=500,
-        # calib_lr=0.05,
-    )
-    s3.run()
-
-
-    ''' S1 '''
-    s1 = S1Tier123CaseOnlyEvaluator(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        verifier_weights_path=verifier_weights_path,
-        device="cuda",
-        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-        out_dir=os.path.join(base_path_evidenceData, "tier123_results_s1_end2end"),
-        batch_size_verify=4,
-        ece_bins=15,
-        seed=13,
-        # optional:
-        # calib_max_steps=500,
-        # calib_lr=0.05,
-    )
-    s1.run()
-
-
     ''' Cross comparison '''
     base = params["Preprocessing"]["base_path_evidenceData"]
 
-    comparator = CrossSystemComparatorV2(
+    comparator = CrossSystemComparatorPredOnly(
         system_test_predictions={
             "S1": os.path.join(base, "tier123_results_s1_end2end", "s1_test_predictions.parquet"),
             "S2": os.path.join(base, "tier123_results_s2_end2end", "s2_test_predictions.parquet"),
@@ -3830,8 +3771,7 @@ if __name__ == "__main__":
             "S3": os.path.join(base, "tier123_results_s3_end2end", "s3_tier2_faithfulness_predictions.parquet"),
             "S4": os.path.join(base, "tier123_results_s4_end2end", "s4_tier2_faithfulness_predictions.parquet"),
         },
-        test_parquet=os.path.join(base, "phase1_fixed_test_eval", "mimic_test_eval.parquet"),
-        out_path=os.path.join(base, "cross_system_results", "s1_s4_cross_system_comparison.json"),
+        out_path=os.path.join(base, "cross_system_results", "s1_s4_cross_system_comparison_predonly.json"),
         ece_bins=15,
         n_boot=2000,
         seed=13,
