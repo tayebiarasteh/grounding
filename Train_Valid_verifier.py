@@ -55,9 +55,9 @@ class TrainingVerifier:
             self.model_info = self.params["Network"]
             self.epoch = 0
             self.best_loss = float("inf")
-            self.setup_cuda()
             self.writer = SummaryWriter(log_dir=os.path.join(self.params["target_dir"], self.params["tb_logs_path"]))
 
+        self.setup_cuda()
         self.grad_clip = float(self.params["Network"]["grad_clip_norm"])
 
 
@@ -138,6 +138,8 @@ class TrainingVerifier:
         self.params["Network"] = self.model_info
         write_config(self.params, self.cfg_path, sort_keys=True)
 
+
+
     def load_checkpoint(self, model, optimiser, loss_function):
         checkpoint = torch.load(
             os.path.join(self.params["target_dir"], self.params["network_output_path"], self.params["checkpoint_name"]),
@@ -168,6 +170,9 @@ class TrainingVerifier:
             purge_step=self.epoch + 1,
         )
 
+
+
+
     def train_epoch(self, train_loader, valid_loader=None, num_epochs=1000):
         self.params = read_config(self.cfg_path)
         total_start_time = time.time()
@@ -180,8 +185,8 @@ class TrainingVerifier:
 
             for idx, batch in enumerate(tqdm(train_loader)):
                 # remove this sanity-limit in real training
-                if idx >= 20:
-                    break
+                # if idx >= 20:
+                #     break
 
                 self.model.train()
 
@@ -279,6 +284,9 @@ class TrainingVerifier:
                         total_time,
                     )
 
+
+
+
     def valid_epoch(self, valid_loader) -> Tuple[float, float, float]:
         self.model.eval()
 
@@ -289,10 +297,10 @@ class TrainingVerifier:
         targets_all = []
 
         with torch.no_grad():
-            for idx, batch in enumerate(valid_loader):
+            for idx, batch in enumerate(tqdm(valid_loader)):
                 # remove this sanity-limit in real validation
-                if idx >= 50:
-                    break
+                # if idx >= 50:
+                #     break
 
                 tok = self._tokenize(batch.inputs, self.max_len)
                 targets = batch.targets.to(self.device, non_blocking=True).float()
@@ -327,6 +335,10 @@ class TrainingVerifier:
             valid_pearson = 0.0
 
         return valid_loss, valid_mae, valid_pearson
+
+
+
+
 
     def savings_prints(
         self,
@@ -414,6 +426,10 @@ class TrainingVerifier:
 
         with open(os.path.join(self.params["target_dir"], self.params["stat_log_path"]) + "/Stats", "a") as f:
             f.write(msg)
+
+
+
+
 
     def calculate_tb_stats(self, valid_loss=None, valid_mae=None, valid_pearson=None):
         if valid_loss is not None:

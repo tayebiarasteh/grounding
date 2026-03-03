@@ -53,9 +53,9 @@ class Training:
             self.model_info = self.params['Network']
             self.epoch = 0
             self.best_loss = float('inf')
-            self.setup_cuda()
             self.writer = SummaryWriter(log_dir=os.path.join(self.params['target_dir'], self.params['tb_logs_path']))
 
+        self.setup_cuda()
         self.grad_clip = float(self.params["Network"]["grad_clip_norm"])
         self.tokenizer = AutoTokenizer.from_pretrained(self.params["retriever"]["model_name"], use_fast=True)
         self.max_q = int(self.params["retriever"]["max_query_tokens"])

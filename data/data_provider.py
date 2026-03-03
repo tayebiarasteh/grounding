@@ -17,6 +17,10 @@ import pandas as pd
 import pyarrow.parquet as pq
 import torch
 from torch.utils.data import Dataset
+import math
+import torch
+from torch.utils.data import Sampler
+from typing import Iterator, Optional
 
 
 from config.serde import read_config
@@ -468,6 +472,101 @@ class VerifierSupervisionDataset(Dataset):
             target = 0.0
 
         return {"qa_row_id": qa_row_id, "input_text": input_text, "target": target}
+
+
+
+
+
+class NonRepeatingChunkSampler(Sampler[int]):
+    """
+    Produces non-overlapping chunks of indices across rounds.
+    Each 'round' yields exactly chunk_size unique indices, until exhausted,
+    then reshuffles and continues.
+
+    Use with DataLoader(..., shuffle=False, sampler=..., drop_last=True/False).
+    """
+
+    def __init__(
+        self,
+        data_source,
+        chunk_size: int = 200_000,
+        seed: int = 13,
+        drop_last: bool = True,
+    ):
+        self.data_source = data_source
+        self.N = len(data_source)
+        self.chunk_size = int(chunk_size)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+
+        if self.chunk_size <= 0:
+            raise ValueError("chunk_size must be > 0")
+        if self.N <= 0:
+            raise ValueError("Dataset is empty")
+
+        # Create a single global permutation; we will consume it in chunks.
+        g = torch.Generator()
+        g.manual_seed(self.seed)
+        self._perm = torch.randperm(self.N, generator=g).tolist()
+        self._cursor = 0
+        self._round = 0
+
+    def set_round(self, round_idx: int) -> None:
+        """
+        Optional: force sampler to advance/align to a specific round.
+        Useful if you want reproducible resume behavior.
+        """
+        round_idx = int(round_idx)
+        if round_idx < 0:
+            round_idx = 0
+        self._round = round_idx
+        self._cursor = round_idx * self.chunk_size
+
+        # If cursor goes beyond N, wrap by reshuffling enough times
+        while self._cursor >= self.N:
+            self._reshuffle()
+            self._cursor = max(0, self._cursor - self.N)
+
+    def _reshuffle(self) -> None:
+        self._round += 1
+        g = torch.Generator()
+        # change seed each reshuffle deterministically
+        g.manual_seed(self.seed + self._round)
+        self._perm = torch.randperm(self.N, generator=g).tolist()
+        self._cursor = 0
+
+    def __iter__(self) -> Iterator[int]:
+        # If not enough for a full chunk, either return the remainder or reshuffle.
+        if self._cursor >= self.N:
+            self._reshuffle()
+
+        end = self._cursor + self.chunk_size
+        if end <= self.N:
+            out = self._perm[self._cursor:end]
+            self._cursor = end
+            return iter(out)
+
+        # crossing boundary
+        remainder = self._perm[self._cursor:self.N]
+        self._cursor = self.N
+
+        if self.drop_last:
+            # to guarantee exactly chunk_size every round, reshuffle and take a fresh full chunk next time
+            self._reshuffle()
+            return iter(remainder)  # NOTE: will be < chunk_size; DataLoader drop_last=True should drop it anyway
+        else:
+            # allow smaller last chunk
+            return iter(remainder)
+
+    def __len__(self) -> int:
+        # This is the number of samples yielded per "round"
+        if self.drop_last:
+            # We want exactly chunk_size in principle; DataLoader drop_last=True will ensure fixed batch count.
+            return min(self.chunk_size, self.N)
+        else:
+            return min(self.chunk_size, self.N)
+
+
 
 
 def verifier_collate_fn(batch: List[Dict]) -> VerifierBatch:
