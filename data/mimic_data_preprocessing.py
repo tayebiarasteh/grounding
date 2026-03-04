@@ -24,6 +24,7 @@ import random
 import numpy as np
 import os
 import yaml
+from collections import Counter
 
 
 import warnings
@@ -2413,10 +2414,152 @@ class RadiopaediaStep4CSupervisionBuilder:
 
 
 
+class _RunningStats:
+    def __init__(self) -> None:
+        self.n = 0
+        self.mean = 0.0
+        self.M2 = 0.0
+        self.min_v = float("inf")
+        self.max_v = float("-inf")
+
+    def update(self, x: np.ndarray) -> None:
+        if x.size == 0:
+            return
+        x = x.astype(np.float64, copy=False)
+        self.min_v = min(self.min_v, float(np.min(x)))
+        self.max_v = max(self.max_v, float(np.max(x)))
+
+        for v in x:
+            self.n += 1
+            delta = v - self.mean
+            self.mean += delta / self.n
+            delta2 = v - self.mean
+            self.M2 += delta * delta2
+
+    def as_dict(self) -> Dict[str, float]:
+        if self.n <= 0:
+            return {"min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0}
+        var = self.M2 / (self.n - 1) if self.n > 1 else 0.0
+        return {"min": float(self.min_v), "max": float(self.max_v), "mean": float(self.mean), "std": float(np.sqrt(var))}
+
+
+class EvidenceTextStore:
+    """
+    Minimal, deterministic chunk-id -> text lookup.
+
+    Assumptions:
+      - evidence parquet has either:
+          (A) explicit id column + text column, OR
+          (B) row index is the id (rare; not recommended)
+      - ids in Step 4C are stable and match this table.
+
+    You can use preload=True if M fits in RAM.
+    """
+    def __init__(
+        self,
+        evidence_parquet: str | Path,
+        *,
+        id_col: str = "chunk_id",
+        text_col: str = "chunk_text",
+        preload: bool = False,
+        cache_row_groups: int = 2,
+        evidence_id_base: int = 0,  # 0 if ids are 0..M-1, 1 if ids are 1..M
+    ) -> None:
+        self.evidence_path = Path(evidence_parquet)
+        if not self.evidence_path.exists():
+            raise FileNotFoundError(f"Evidence parquet not found: {self.evidence_path}")
+
+        self.id_col = str(id_col)
+        self.text_col = str(text_col)
+        self.preload = bool(preload)
+        self.cache_row_groups = int(cache_row_groups)
+        self.evidence_id_base = int(evidence_id_base)
+
+        self.pf = pq.ParquetFile(str(self.evidence_path))
+        schema_names = set(self.pf.schema.names)
+        if self.id_col not in schema_names or self.text_col not in schema_names:
+            raise ValueError(
+                f"Evidence parquet must contain columns '{self.id_col}' and '{self.text_col}'. "
+                f"Found: {sorted(schema_names)}"
+            )
+
+        self._map: Optional[Dict[int, str]] = None
+        self._rg_cache: Dict[int, Dict[str, List]] = {}
+        self._rg_cache_order: List[int] = []
+
+        if self.preload:
+            self._preload_all()
+
+    def _preload_all(self) -> None:
+        m: Dict[int, str] = {}
+        for b in self.pf.iter_batches(batch_size=100_000, columns=[self.id_col, self.text_col]):
+            t = pa.Table.from_batches([b])
+            ids = t[self.id_col].to_pylist()
+            txt = t[self.text_col].to_pylist()
+            for i, s in zip(ids, txt):
+                try:
+                    m[int(i)] = "" if s is None else str(s)
+                except Exception:
+                    continue
+        self._map = m
+
+    def _cache_put(self, rg: int, payload: Dict[str, List]) -> None:
+        self._rg_cache[rg] = payload
+        self._rg_cache_order.append(rg)
+        while len(self._rg_cache_order) > self.cache_row_groups:
+            old = self._rg_cache_order.pop(0)
+            self._rg_cache.pop(old, None)
+
+    def _get_rg_payload(self, rg: int) -> Dict[str, List]:
+        cached = self._rg_cache.get(rg)
+        if cached is not None:
+            return cached
+        t = self.pf.read_row_group(rg, columns=[self.id_col, self.text_col])
+        payload = {
+            self.id_col: t.column(self.id_col).to_pylist(),
+            self.text_col: t.column(self.text_col).to_pylist(),
+        }
+        self._cache_put(rg, payload)
+        return payload
+
+    def get(self, chunk_id: int) -> str:
+        # adjust if Step4C stores 1-based ids
+        chunk_id = int(chunk_id)
+        if self.evidence_id_base == 1:
+            chunk_id = chunk_id  # keep as-is (ids already 1..M)
+        elif self.evidence_id_base == 0:
+            chunk_id = chunk_id  # keep as-is (ids already 0..M-1)
+
+        if self._map is not None:
+            return self._map.get(chunk_id, "")
+
+        # streaming lookup: scan row groups (fast enough if cache_row_groups>0 and ids are clustered)
+        # NOTE: if ids are arbitrary, consider preload=True.
+        for rg in range(self.pf.num_row_groups):
+            payload = self._get_rg_payload(rg)
+            ids = payload[self.id_col]
+            try:
+                # linear search; acceptable for moderate rg size
+                for i, cid in enumerate(ids):
+                    if int(cid) == chunk_id:
+                        s = payload[self.text_col][i]
+                        return "" if s is None else str(s)
+            except Exception:
+                continue
+        return ""
+
+
 def create_fixed_mimic_test_eval_parquet(
-    verifier_materialized_parquet: str | Path,
+    verifier_supervision_parquet: str | Path,
     out_parquet: str | Path,
     *,
+    evidence_parquet: str | Path,
+    evidence_id_col: str = "chunk_id",
+    evidence_text_col: str = "chunk_text",
+    evidence_id_base: int = 0,  # set to 1 if your ids are 1..M
+    preload_evidence_texts: bool = False,
+    evidence_join_delim: str = "\n\n---\n\n",
+    max_evidence_chars: int = 20_000,
     split_value: str = "test",
     parquet_batch_rows: int = 50_000,
     parquet_compression: str = "zstd",
@@ -2426,33 +2569,59 @@ def create_fixed_mimic_test_eval_parquet(
     """
     Phase 1 — Freeze the evaluation object.
 
-    Reads Step 7 output:
-      step7_verifier_materialized_rstar/verifier_train_materialized.parquet
+    Reads Step 4C output:
+      step4c_supervision/verifier_supervision.parquet
 
-    Filters to split == "test" (split already fixed upstream via Step 4C map reused in Step 6C/7),
-    writes ONE immutable test artifact:
+    Materializes evidence_text on-the-fly from Radiopaedia chunk table (evidence_parquet),
+    using evidence_chunk_ids_json from Step 4C (protocol ids).
+
+    Writes ONE immutable test artifact:
       mimic_test_eval.parquet
 
     Output columns:
       qa_row_id, subject_id, split, qa_type, case_context, question, answer_target, claim_text,
       evidence_chunk_ids_json, evidence_text, soft_support_score,
       report_length_bucket, device_present, uncertainty_present, label_vs_extractive
-
-    Notes:
-      - Does NOT change any split.
-      - Does NOT touch retrieval; just freezes the test set.
-      - Streaming read/write (keeps memory stable).
     """
-    rng = np.random.RandomState(seed)  # deterministic if you ever add sampling later (currently unused)
+    _ = np.random.RandomState(seed)  # reserved for future deterministic sampling (unused)
 
-    in_path = Path(verifier_materialized_parquet)
+    in_path = Path(verifier_supervision_parquet)
     out_path = Path(out_parquet)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-
     if not in_path.exists():
-        raise FileNotFoundError(f"verifier_materialized_parquet not found: {in_path}")
+        raise FileNotFoundError(f"verifier_supervision_parquet not found: {in_path}")
 
-    # Heuristics consistent with your Step 3 device vocab and uncertainty cues
+    # Evidence store (Radiopaedia chunks)
+    ev_store = EvidenceTextStore(
+        evidence_parquet=evidence_parquet,
+        id_col=evidence_id_col,
+        text_col=evidence_text_col,
+        preload=preload_evidence_texts,
+        cache_row_groups=2,
+        evidence_id_base=evidence_id_base,
+    )
+
+    def _loads_json_list(s: str) -> List[int]:
+        try:
+            xs = json.loads(s)
+            return [int(x) for x in xs]
+        except Exception:
+            return []
+
+    def _truncate(s: str) -> str:
+        s = "" if s is None else str(s)
+        if max_evidence_chars > 0 and len(s) > max_evidence_chars:
+            return s[:max_evidence_chars]
+        return s
+
+    def materialize_evidence(ids_json: str) -> str:
+        ids = _loads_json_list(str(ids_json))
+        if not ids:
+            return ""
+        chunks = [ev_store.get(cid) for cid in ids]
+        return _truncate(evidence_join_delim.join([c for c in chunks if c]))
+
+    # Heuristics consistent with Step 3 vocab
     device_re = re.compile(
         r"\b("
         r"picc|peripherally inserted central catheter|central venous catheter|cvc|"
@@ -2473,9 +2642,7 @@ def create_fixed_mimic_test_eval_parquet(
         re.IGNORECASE,
     )
 
-    # Phase-1 buckets (simple + stable)
     def report_length_bucket(case_context: str) -> str:
-        # length by word count (robust, no tokenizer dependency)
         n = len(str(case_context).split())
         if n < 80:
             return "short"
@@ -2484,14 +2651,12 @@ def create_fixed_mimic_test_eval_parquet(
         return "long"
 
     def label_vs_extractive_flag(qa_type: str) -> str:
-        # "label" = derived from labels or structured yes/no templates
-        # "extractive" = span-based / descriptive answers from report text
         t = str(qa_type).strip().lower()
         if t in {"label_presence", "multi_label_conjunction", "device_presence"}:
             return "label"
         return "extractive"
 
-    # Input columns we require from Step 7
+    # Step 4C required input columns (NO evidence_text in file)
     required_in_cols = [
         "qa_row_id",
         "subject_id",
@@ -2502,13 +2667,15 @@ def create_fixed_mimic_test_eval_parquet(
         "answer_target",
         "claim_text",
         "evidence_chunk_ids_json",
-        "evidence_text",          # alias already created in Step 7
         "soft_support_score",
     ]
 
     pf = pq.ParquetFile(str(in_path))
+    schema_names = set(pf.schema.names)
+    for c in required_in_cols:
+        if c not in schema_names:
+            raise ValueError(f"Missing required column in Step 4C verifier supervision parquet: {c}")
 
-    # Output schema (frozen protocol)
     out_schema = pa.schema(
         [
             ("qa_row_id", pa.int64()),
@@ -2529,22 +2696,27 @@ def create_fixed_mimic_test_eval_parquet(
         ]
     )
 
-    writer = pq.ParquetWriter(
-        str(out_path),
-        schema=out_schema,
-        compression=parquet_compression,
-    )
+    writer = pq.ParquetWriter(str(out_path), schema=out_schema, compression=parquet_compression)
 
     total_rows = pf.metadata.num_rows if pf.metadata is not None else 0
     pbar = tqdm(total=total_rows, desc="Phase 1: freezing mimic_test_eval.parquet", unit="rows", miniters=1)
 
+    # Streaming summary (to store the “prints” into manifest)
+    subj_set: set[int] = set()
+    qa_type_ctr = Counter()
+    bucket_ctr = Counter()
+    device_ctr = Counter()
+    uncert_ctr = Counter()
+    label_ctr = Counter()
+    target_stats = _RunningStats()
+
     written = 0
     kept = 0
+
     try:
         for batch in pf.iter_batches(batch_size=parquet_batch_rows, columns=required_in_cols):
             df = batch.to_pandas()
 
-            # Coerce + filter split
             df["split"] = df["split"].astype(str)
             mask = df["split"] == split_value
             if not mask.any():
@@ -2554,22 +2726,16 @@ def create_fixed_mimic_test_eval_parquet(
 
             d = df.loc[mask].copy()
 
-            # Stable types
+            # Types
             d["qa_row_id"] = pd.to_numeric(d["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
             d["subject_id"] = pd.to_numeric(d["subject_id"], errors="coerce").fillna(-1).astype(np.int64)
             d["soft_support_score"] = pd.to_numeric(d["soft_support_score"], errors="coerce").fillna(0.0).astype(np.float32)
 
-            for c in [
-                "split",
-                "qa_type",
-                "case_context",
-                "question",
-                "answer_target",
-                "claim_text",
-                "evidence_chunk_ids_json",
-                "evidence_text",
-            ]:
+            for c in ["split", "qa_type", "case_context", "question", "answer_target", "claim_text", "evidence_chunk_ids_json"]:
                 d[c] = d[c].astype(str)
+
+            # Materialize evidence text from ids
+            d["evidence_text"] = d["evidence_chunk_ids_json"].map(materialize_evidence).astype(str)
 
             # Derived tags
             d["report_length_bucket"] = d["case_context"].map(report_length_bucket).astype(str)
@@ -2577,7 +2743,16 @@ def create_fixed_mimic_test_eval_parquet(
             d["uncertainty_present"] = d["case_context"].map(lambda x: 1 if uncertainty_re.search(str(x)) else 0).astype(np.int8)
             d["label_vs_extractive"] = d["qa_type"].map(label_vs_extractive_flag).astype(str)
 
-            # Ensure exact column order + schema compatibility
+            # Update streaming summary
+            subj_set.update(map(int, d["subject_id"].tolist()))
+            qa_type_ctr.update(d["qa_type"].tolist())
+            bucket_ctr.update(d["report_length_bucket"].tolist())
+            device_ctr.update(map(int, d["device_present"].tolist()))
+            uncert_ctr.update(map(int, d["uncertainty_present"].tolist()))
+            label_ctr.update(d["label_vs_extractive"].tolist())
+            target_stats.update(d["soft_support_score"].to_numpy())
+
+            # Column order
             d = d[
                 [
                     "qa_row_id",
@@ -2609,11 +2784,68 @@ def create_fixed_mimic_test_eval_parquet(
         pbar.close()
         writer.close()
 
+    # Build the exact “print block” info for manifest + printing
+    summary = {
+        "basic_info": {
+            "rows": int(kept),
+            "unique_subjects": int(len(subj_set)),
+            "qa_types": int(len(qa_type_ctr)),
+        },
+        "qa_type_distribution": dict(qa_type_ctr),
+        "report_length_bucket": dict(bucket_ctr),
+        "device_present": dict(device_ctr),
+        "uncertainty_present": dict(uncert_ctr),
+        "label_vs_extractive": dict(label_ctr),
+        "target_statistics_soft_support_score": target_stats.as_dict(),
+    }
+
+    print("==== BASIC INFO ====")
+    print("Rows:", summary["basic_info"]["rows"])
+    print("Unique subjects:", summary["basic_info"]["unique_subjects"])
+    print("QA types:", summary["basic_info"]["qa_types"])
+    print()
+
+    print("==== QA TYPE DISTRIBUTION ====")
+    print(pd.Series(summary["qa_type_distribution"]).sort_values(ascending=False))
+    print()
+
+    print("==== REPORT LENGTH BUCKET ====")
+    print(pd.Series(summary["report_length_bucket"]).sort_values(ascending=False))
+    print()
+
+    print("==== DEVICE PRESENT ====")
+    print(pd.Series(summary["device_present"]).sort_index())
+    print()
+
+    print("==== UNCERTAINTY PRESENT ====")
+    print(pd.Series(summary["uncertainty_present"]).sort_index())
+    print()
+
+    print("==== LABEL vs EXTRACTIVE ====")
+    print(pd.Series(summary["label_vs_extractive"]).sort_values(ascending=False))
+    print()
+
+    print("==== TARGET STATISTICS (soft_support_score) ====")
+    ts = summary["target_statistics_soft_support_score"]
+    print("Min:", ts["min"])
+    print("Max:", ts["max"])
+    print("Mean:", ts["mean"])
+    print("Std:", ts["std"])
+
     manifest = {
         "phase": "1",
         "input": str(in_path.resolve()),
         "output": str(out_path.resolve()),
         "filter": {"split_value": split_value},
+        "evidence_materialization": {
+            "evidence_parquet": str(Path(evidence_parquet).resolve()),
+            "evidence_id_col": evidence_id_col,
+            "evidence_text_col": evidence_text_col,
+            "evidence_id_base": int(evidence_id_base),
+            "preload_evidence_texts": bool(preload_evidence_texts),
+            "evidence_join_delim": evidence_join_delim,
+            "max_evidence_chars": int(max_evidence_chars),
+        },
         "params": {
             "parquet_batch_rows": int(parquet_batch_rows),
             "parquet_compression": str(parquet_compression),
@@ -2629,6 +2861,7 @@ def create_fixed_mimic_test_eval_parquet(
             "input_rows_seen": int(written),
             "rows_written": int(kept),
         },
+        "prints_saved": summary,  # <-- everything that used to be printed
     }
 
     if write_manifest_json:
@@ -2644,42 +2877,6 @@ def create_fixed_mimic_test_eval_parquet(
 
 
 
-
-
-def print_mimic_test_eval_stats(test_eval_parquet: str):
-    df = pd.read_parquet(test_eval_parquet)
-
-    print("==== BASIC INFO ====")
-    print("Rows:", len(df))
-    print("Unique subjects:", df["subject_id"].nunique())
-    print("QA types:", df["qa_type"].nunique())
-    print()
-
-    print("==== QA TYPE DISTRIBUTION ====")
-    print(df["qa_type"].value_counts())
-    print()
-
-    print("==== REPORT LENGTH BUCKET ====")
-    print(df["report_length_bucket"].value_counts())
-    print()
-
-    print("==== DEVICE PRESENT ====")
-    print(df["device_present"].value_counts())
-    print()
-
-    print("==== UNCERTAINTY PRESENT ====")
-    print(df["uncertainty_present"].value_counts())
-    print()
-
-    print("==== LABEL vs EXTRACTIVE ====")
-    print(df["label_vs_extractive"].value_counts())
-    print()
-
-    print("==== TARGET STATISTICS (soft_support_score) ====")
-    print("Min:", df["soft_support_score"].min())
-    print("Max:", df["soft_support_score"].max())
-    print("Mean:", df["soft_support_score"].mean())
-    print("Std:", df["soft_support_score"].std())
 
 
 
@@ -2699,77 +2896,77 @@ if __name__ == "__main__":
 
 
     ''' step 1 '''
-    # builder = MimicCaseContextBuilder(
-    #     master_csv=os.path.join(base_path_mimicData, "mimic_master_list_forReports.csv"),
-    #     reports_root=base_path_mimicData,
-    #     out_path="mimic_case_contexts.csv",
-    # )
-    # out_df = builder.build_case_context_table()
-    # print(out_df[["report_rel_path", "case_context"]].head(3))
-    # print("Rows:", len(out_df))
+    builder = MimicCaseContextBuilder(
+        master_csv=os.path.join(base_path_mimicData, "mimic_master_list_forReports.csv"),
+        reports_root=base_path_mimicData,
+        out_path="mimic_case_contexts.csv",
+    )
+    out_df = builder.build_case_context_table()
+    print(out_df[["report_rel_path", "case_context"]].head(3))
+    print("Rows:", len(out_df))
 
 
 
     ''' step 2 '''
-    # builder = MimicFactTableBuilder(
-    #     master_csv=os.path.join(base_path_mimicData, "mimic_master_list_forReports.csv"),
-    #     case_context_csv=os.path.join(base_path_mimicData, "mimic_case_contexts.csv"),
-    #     out_path="mimic_facts_long.csv",
-    # )
-    # facts_df = builder.build_fact_table()
-    # print(facts_df.head(10))
-    # print("n_facts:", len(facts_df))
+    builder = MimicFactTableBuilder(
+        master_csv=os.path.join(base_path_mimicData, "mimic_master_list_forReports.csv"),
+        case_context_csv=os.path.join(base_path_mimicData, "mimic_case_contexts.csv"),
+        out_path="mimic_facts_long.csv",
+    )
+    facts_df = builder.build_fact_table()
+    print(facts_df.head(10))
+    print("n_facts:", len(facts_df))
 
 
 
     ''' step 3 '''
-    # builder = MimicQATableBuilder(
-    #     facts_long_csv=os.path.join(base_path_mimicData, "mimic_facts_long.csv"),
-    #     out_path="mimic_qa_step3.csv",
-    # )
-    # qa_df = builder.build_qa_table()
-    # print("QA rows:", len(qa_df))
-    # print(qa_df[["qa_type", "question", "answer_target"]].head(10))
+    builder = MimicQATableBuilder(
+        facts_long_csv=os.path.join(base_path_mimicData, "mimic_facts_long.csv"),
+        out_path="mimic_qa_step3.csv",
+    )
+    qa_df = builder.build_qa_table()
+    print("QA rows:", len(qa_df))
+    print(qa_df[["qa_type", "question", "answer_target"]].head(10))
 
 
 
 
     ''' step 4a: RadiopaediaSnapshot_v1 (chunking only, no embeddings) '''
-    # builder = RadiopaediaSnapshotBuilder(
-    #     in_dir=os.path.join(base_path_mimicData, "articles_clean_txt"),  # folder with ~17k *.txt
-    #     out_dir=base_path_evidenceData,
-    #     snapshot_name=params['Preprocessing']['snapshot_name'],
-    #     tokenizer_name=params['Preprocessing']['tokenizer_name'],
-    #     target_tokens=200,
-    #     min_tokens=50,
-    #     write_csv=False,  # parquet is preferred
-    # )
-    # chunks_df = builder.run()
-    # print(chunks_df.head(10))
-    # print("n_chunks:", len(chunks_df))
-    # print("n_articles:", chunks_df["article_id"].nunique())
-    # print(chunks_df[["chunk_id", "article_id", "article_title", "chunk_token_count"]].head(10))
+    builder = RadiopaediaSnapshotBuilder(
+        in_dir=os.path.join(base_path_evidenceData, "articles_clean_txt"),  # folder with ~17k *.txt
+        out_dir=base_path_evidenceData,
+        snapshot_name=params['Preprocessing']['snapshot_name'],
+        tokenizer_name=params['Preprocessing']['tokenizer_name'],
+        target_tokens=200,
+        min_tokens=50,
+        write_csv=False,  # parquet is preferred
+    )
+    chunks_df = builder.run()
+    print(chunks_df.head(10))
+    print("n_chunks:", len(chunks_df))
+    print("n_articles:", chunks_df["article_id"].nunique())
+    print(chunks_df[["chunk_id", "article_id", "article_title", "chunk_token_count"]].head(10))
 
 
 
 
 
     ''' step 4b '''
-    # builder = RadiopaediaWeakEvidenceAligner(
-    #     qa_csv=os.path.join(base_path_mimicData, "mimic_qa_step3.csv"),
-    #     chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
-    #     out_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step4b.parquet"),
-    #     model_name=params['Preprocessing']['tokenizer_name'],
-    #     top_k=20,
-    #     alpha=0.85,
-    #     temperature=0.07,  # keep >0; deterministic with fixed seeds + eval()
-    #     seed=13,
-    #     cache_dir=os.path.join(base_path_evidenceData, "cache_step4b"),
-    #     device="cuda",
-    #     # device="cpu",
-    #     force_cpu_faiss=True,
-    # )
-    # builder.run()
+    builder = RadiopaediaWeakEvidenceAligner(
+        qa_csv=os.path.join(base_path_mimicData, "mimic_qa_step3.csv"),
+        chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
+        out_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step4b.parquet"),
+        model_name=params['Preprocessing']['tokenizer_name'],
+        top_k=20,
+        alpha=0.85,
+        temperature=0.07,  # keep >0; deterministic with fixed seeds + eval()
+        seed=13,
+        cache_dir=os.path.join(base_path_evidenceData, "cache_step4b"),
+        device="cuda",
+        # device="cpu",
+        force_cpu_faiss=True,
+    )
+    builder.run()
 
 
 
@@ -2792,29 +2989,17 @@ if __name__ == "__main__":
     builder.run()
 
 
+    ''' Creating the final mimic eval parquet from Step 4C '''
+    verifier_supervision_parquet = os.path.join(base_path_evidenceData, "step4c_supervision", "verifier_supervision.parquet")
+    radiopaedia_chunks_parquet = os.path.join(base_path_evidenceData, "chunks.parquet")
+    out_eval_parquet = os.path.join(base_path_evidenceData, "phase1_fixed_test_eval", "mimic_test_eval.parquet")
 
+    create_fixed_mimic_test_eval_parquet(verifier_supervision_parquet=verifier_supervision_parquet, out_parquet=out_eval_parquet,
+        evidence_parquet=radiopaedia_chunks_parquet, evidence_id_col="chunk_id", evidence_text_col="chunk_text",
+        evidence_id_base=0,  # change to 1 if ids start from 1
+        preload_evidence_texts=False,
+        split_value="test",
+        parquet_batch_rows=50_000,
+        parquet_compression="zstd",
+        seed=13, write_manifest_json=True)
 
-    ''' Creating the final mimic test parquet '''
-    # verifier_materialized_parquet = os.path.join(
-    #     base_path_evidenceData,
-    #     "step7_verifier_materialized_rstar",
-    #     "verifier_train_materialized.parquet")
-    #
-    # out_test_eval_parquet = os.path.join(
-    #     base_path_evidenceData,
-    #     # "phase1_fixed_test_eval", "mimic_test_eval.parquet")
-    #     "phase1_fixed_valid_eval", "mimic_valid_eval.parquet")
-    #
-    # create_fixed_mimic_test_eval_parquet(
-    #     verifier_materialized_parquet=verifier_materialized_parquet,
-    #     out_parquet=out_test_eval_parquet,
-    #     # split_value="test",
-    #     split_value="valid",
-    #     parquet_batch_rows=50_000,
-    #     parquet_compression="zstd",
-    #     seed=13,
-    #     write_manifest_json=True,
-    # )
-    #
-    # # print_mimic_test_eval_stats(test_eval_parquet=os.path.join(base_path_evidenceData, "phase1_fixed_test_eval", "mimic_test_eval.parquet"))
-    # print_mimic_test_eval_stats(test_eval_parquet=os.path.join(base_path_evidenceData, "phase1_fixed_valid_eval", "mimic_valid_eval.parquet"))

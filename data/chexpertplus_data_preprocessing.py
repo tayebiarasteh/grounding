@@ -26,6 +26,7 @@ import os
 import yaml
 import math
 from sklearn.model_selection import train_test_split
+from collections import Counter
 
 import warnings
 warnings.filterwarnings('ignore')
@@ -33,7 +34,7 @@ warnings.filterwarnings('ignore')
 
 
 
-def patient_split(csv_path, outpath, patient_col="deid_patient_id",
+def patient_split(csv_path, outpath, patient_col="subject_id",
                   train_frac=0.75, valid_frac=0.10, test_frac=0.15, seed=42):
     assert abs((train_frac + valid_frac + test_frac) - 1.0) < 1e-9
 
@@ -83,7 +84,7 @@ class ChexpertPlusCaseContextBuilder:
 
     Output:
       One row per unique report unit, with columns:
-        deid_patient_id, report_id, report, case_context, n_images
+        subject_id, report_id, report, case_context, n_images
 
     Notes:
       - If multiple rows share the same (patient, report text), we collapse them into one report unit.
@@ -99,7 +100,7 @@ class ChexpertPlusCaseContextBuilder:
         min_lines_fallback: int = 2,
         # columns
         report_col: str = "report",
-        patient_col: str = "deid_patient_id",
+        patient_col: str = "subject_id",
         image_col: str = "path_to_image",
         split_col: str = "split",
         # optional section columns (if present in the CSV)
@@ -385,13 +386,13 @@ class ChexpertPlusFactsAndQABuilder:
     CheXpert-Plus external dataset: combined Step 2 + Step 3 in one class.
 
     Key fixes vs your current version:
-      1) deid_patient_id is treated as STRING everywhere (never coerced to numeric).
+      1) subject_id is treated as STRING everywhere (never coerced to numeric).
       2) QA builder is robust to empty outputs (no KeyError on report_id).
-      3) facts_long stores deid_patient_id as string consistently (no mixed dtypes).
+      3) facts_long stores subject_id as string consistently (no mixed dtypes).
 
     Assumes:
-      - master_csv has columns: deid_patient_id, path_to_image, report
-      - case_context_csv has columns: report_id, deid_patient_id, case_context
+      - master_csv has columns: subject_id, path_to_image, report
+      - case_context_csv has columns: report_id, subject_id, case_context
     """
 
     def __init__(
@@ -402,7 +403,7 @@ class ChexpertPlusFactsAndQABuilder:
         out_qa_path: Optional[str] = None,
         # columns
         split_col: str = "split",
-        patient_col: str = "deid_patient_id",
+        patient_col: str = "subject_id",
         image_col: str = "path_to_image",
         report_col: str = "report",
         report_id_col: str = "report_id",
@@ -1429,135 +1430,154 @@ class ChexpertPlusFactsAndQABuilder:
 
 
 
+
 @dataclass(frozen=True)
-class WeakAlignmentRowChexpert:
+class RetrieverSupervisionRow:
     qa_row_id: int
-    report_id: str
-    deid_patient_id: str          # IMPORTANT: keep raw string, do NOT coerce to int
-    deid_patient_id_int64: int    # stable hash -> int64 (helper for downstream if needed)
+    subject_id: str
     split: str
+    report_rel_path: str
     qa_type: str
     claim_text: str
-    retrieved_chunk_ids_json: str
-    support_weights_json: str
-    embed_scores_json: str
-    lexical_scores_json: str
-    combined_scores_json: str
+    pos_chunk_ids_json: str
+    pos_weights_json: str
 
 
-class ChexpertPlusRStarWeakEvidenceAligner:
+@dataclass(frozen=True)
+class VerifierSupervisionRow:
+    qa_row_id: int
+    subject_id: str
+    split: str
+    report_rel_path: str
+    qa_type: str
+    case_context: str
+    question: str
+    answer_target: str
+    claim_text: str
+    evidence_chunk_ids_json: str
+    evidence_weights_json: str
+    soft_support_score: float
+
+
+class CheXpertRadiopaediaStep4ExternalTestBuilder:
     """
-    CheXpert-Plus external dataset: Step 6B-equivalent
+    Single Step-4 class for CheXpert external test evaluation.
 
-      - DO NOT coerce deid_patient_id to numeric. Many CheXpert ids are strings like "patient00001".
-      - Parquet writes deid_patient_id as STRING (and also writes a stable int64 hash column).
+    Input:
+      - chexpertplus_qa_step3.csv (already produced by Step 3)
+      - Radiopaedia chunks.parquet
 
-    Inputs:
-      - qa_csv: chexpertplus_qa_step3.csv
-          required: report_id, deid_patient_id, qa_type, claim_text, split
-      - chunks_parquet: chunks.parquet (for lexical scoring)
-      - faiss_index: faiss_Rstar.index
-      - chunk_ids_npy: chunk_ids.npy aligned with FAISS rows
-      - rstar_query_encoder_ckpt: query encoder weights
+    Output (same schema intent as MIMIC Step 4C):
+      - out_dir/retriever_supervision.parquet
+      - out_dir/verifier_supervision.parquet
+      - out_dir/manifest_step4_external_test.json
 
-    Output:
-      - out_parquet: one row per QA row with retrieved chunk ids + weights
-      - patient_split_map_chexpertplus.json next to out_parquet (string patient_id -> split) [read from CSV]
-      - manifest_step6b_chexpertplus.json next to out_parquet
+    Key rules:
+      - Drops train/valid immediately. Only keeps split == test_split_value.
+      - Assigns qa_row_id sequentially over ONLY test rows (0..N_test-1).
+      - Writes split="test" for all outputs.
+      - Reads CheXpert Step3 `report_id` but writes it into output `report_rel_path`.
+      - subject_id stays STRING everywhere.
     """
 
     def __init__(
         self,
         qa_csv: str | Path,
         chunks_parquet: str | Path,
-        faiss_index: str | Path,
-        chunk_ids_npy: str | Path,
-        out_parquet: str | Path,
-        # R* query encoder
+        out_dir: str | Path,
+        *,
+        split_col: str = "split",
+        test_split_value: str = "test",
+        # columns in qa_csv (CheXpert Step3)
+        subject_id_col: str = "subject_id",
+        report_path_col: str = "report_id",
+        qa_type_col: str = "qa_type",
+        claim_col: str = "claim_text",
+        case_context_col: str = "case_context",
+        question_col: str = "question",
+        answer_col: str = "answer_target",
+        # chunks parquet columns
+        chunk_id_col: str = "chunk_id",
+        chunk_text_col: str = "chunk_text",
+        # embedder
         model_name: str = "sentence-transformers/all-mpnet-base-v2",
-        rstar_query_encoder_ckpt: Optional[str | Path] = None,
-        # tokenization/encoding
         max_query_tokens: int = 128,
-        qa_batch_size: int = 256,
+        max_doc_tokens: int = 256,
         # retrieval
         top_k: int = 20,
+        qa_batch_size: int = 256,
+        doc_batch_size: int = 128,
         # scoring
         alpha: float = 0.85,
         temperature: float = 0.07,
-        # columns (CheXpert-Plus)
-        claim_col: str = "claim_text",
-        report_id_col: str = "report_id",
-        patient_col: str = "deid_patient_id",
-        qa_type_col: str = "qa_type",
-        split_col: str = "split",
-        chunk_id_col: str = "chunk_id",
-        chunk_text_col: str = "chunk_text",
-        # determinism/runtime
-        seed: int = 13,
-        device: str = "cuda",
-        tqdm_desc: str = "CheXpert Step 6B: R* weak evidence alignment",
+        min_weight: float = 0.0,
+        # caching
+        cache_dir: Optional[str | Path] = None,
+        faiss_index_name: str = "radiopaedia_flatip.index",
+        chunk_embeds_name: str = "radiopaedia_chunk_embeds.npy",
+        # streaming + writer
         qa_chunksize_rows: int = 50_000,
         parquet_compression: str = "zstd",
-        use_lexical: bool = True,
-        # split params (kept for API compatibility; not used to create splits)
-        split_seed: int = 13,
-        frac_train: float = 0.75,
-        frac_valid: float = 0.10,
-        frac_test: float = 0.15,
-        # IO knobs
-        write_patient_split_map_json: bool = True,
+        seed: int = 13,
+        device: str = "cuda",
+        force_cpu_faiss: bool = True,
+        # tqdm
+        tqdm_desc: str = "CheXpert Step 4 (external test only)",
+        prescan_total_test_rows: bool = True,   # set False to skip pre-scan
     ) -> None:
         self.qa_csv = Path(qa_csv)
         self.chunks_parquet = Path(chunks_parquet)
-        self.faiss_index_path = Path(faiss_index)
-        self.chunk_ids_npy = Path(chunk_ids_npy)
-        self.out_parquet = Path(out_parquet)
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
 
-        self.model_name = str(model_name)
-        self.rstar_query_encoder_ckpt = Path(rstar_query_encoder_ckpt) if rstar_query_encoder_ckpt else None
-
-        self.max_query_tokens = int(max_query_tokens)
-        self.qa_batch_size = int(qa_batch_size)
-
-        self.top_k = int(top_k)
-
-        self.alpha = float(alpha)
-        self.temperature = float(temperature)
-
-        self.claim_col = str(claim_col)
-        self.report_id_col = str(report_id_col)
-        self.patient_col = str(patient_col)
-        self.qa_type_col = str(qa_type_col)
         self.split_col = str(split_col)
+        self.test_split_value = str(test_split_value)
+
+        self.subject_id_col = str(subject_id_col)
+        self.report_path_col = str(report_path_col)
+        self.qa_type_col = str(qa_type_col)
+        self.claim_col = str(claim_col)
+        self.case_context_col = str(case_context_col)
+        self.question_col = str(question_col)
+        self.answer_col = str(answer_col)
 
         self.chunk_id_col = str(chunk_id_col)
         self.chunk_text_col = str(chunk_text_col)
 
-        self.seed = int(seed)
-        self.device = str(device)
-        self.tqdm_desc = str(tqdm_desc)
+        self.model_name = str(model_name)
+        self.max_query_tokens = int(max_query_tokens)
+        self.max_doc_tokens = int(max_doc_tokens)
+
+        self.top_k = int(top_k)
+        self.qa_batch_size = int(qa_batch_size)
+        self.doc_batch_size = int(doc_batch_size)
+
+        self.alpha = float(alpha)
+        self.temperature = float(temperature)
+        self.min_weight = float(min_weight)
+
+        self.cache_dir = Path(cache_dir) if cache_dir else (self.out_dir / "cache_step4_external")
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.faiss_index_path = self.cache_dir / faiss_index_name
+        self.chunk_embeds_path = self.cache_dir / chunk_embeds_name
+
         self.qa_chunksize_rows = int(qa_chunksize_rows)
         self.parquet_compression = str(parquet_compression)
-        self.use_lexical = bool(use_lexical)
 
-        self.split_seed = int(split_seed)
-        self.frac_train = float(frac_train)
-        self.frac_valid = float(frac_valid)
-        self.frac_test = float(frac_test)
+        self.seed = int(seed)
+        self.device = str(device)
+        self.force_cpu_faiss = bool(force_cpu_faiss)
 
-        self.write_patient_split_map_json = bool(write_patient_split_map_json)
+        self.tqdm_desc = str(tqdm_desc)
+        self.prescan_total_test_rows = bool(prescan_total_test_rows)
 
-        if not (0.0 < self.frac_train < 1.0 and 0.0 < self.frac_valid < 1.0 and 0.0 < self.frac_test < 1.0):
-            raise ValueError("Split fractions must be in (0,1).")
-        s = self.frac_train + self.frac_valid + self.frac_test
-        if abs(s - 1.0) > 1e-6:
-            raise ValueError(f"Split fractions must sum to 1. Got {s}")
+        self.retriever_out = self.out_dir / "retriever_supervision.parquet"
+        self.verifier_out = self.out_dir / "verifier_supervision.parquet"
+        self.manifest_out = self.out_dir / "manifest_step4_external_test.json"
 
         self._word_re = re.compile(r"[a-z0-9]+")
-        self._pa_schema: Optional[pa.Schema] = None
-
         self._tokenizer: Optional[AutoTokenizer] = None
-        self._query_model: Optional[AutoModel] = None
+        self._model: Optional[AutoModel] = None
 
         self._set_determinism()
 
@@ -1575,24 +1595,11 @@ class ChexpertPlusRStarWeakEvidenceAligner:
         except Exception:
             pass
 
-
-    def _safe_str(self, x) -> str:
-        if x is None:
-            return ""
-        s = str(x)
-        return "" if s.lower() == "nan" else s
-
-    def _patient_key(self, pid) -> str:
-        # canonical raw patient id string used everywhere (split map + parquet)
-        return self._safe_str(pid).strip()
-
-    def _patient_to_int64(self, pid_raw: str) -> int:
-        # stable hash -> signed positive int64 range (fits parquet int64)
-        if not pid_raw:
-            return -1
-        h = hashlib.md5(pid_raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
-        u = int(h, 16)
-        return int(u % (2**63 - 1))
+        if self.device != "cuda":
+            try:
+                torch.use_deterministic_algorithms(True)
+            except Exception:
+                pass
 
     def _normalize_text(self, s: str) -> str:
         if s is None:
@@ -1619,11 +1626,11 @@ class ChexpertPlusRStarWeakEvidenceAligner:
 
     def _softmax(self, x: np.ndarray) -> np.ndarray:
         x = x.astype(np.float32)
-        x = x - np.max(x) if len(x) else x
+        x = x - np.max(x)
         ex = np.exp(x)
         s = float(np.sum(ex))
-        if s <= 0 or len(x) == 0:
-            return np.ones_like(x, dtype=np.float32) / float(max(len(x), 1))
+        if s <= 0:
+            return np.ones_like(x, dtype=np.float32) / float(len(x))
         return ex / s
 
     def _weights_from_scores(self, combined: np.ndarray) -> np.ndarray:
@@ -1634,34 +1641,30 @@ class ChexpertPlusRStarWeakEvidenceAligner:
             return w
         return self._softmax(combined / float(self.temperature)).astype(np.float32)
 
-    def _get_tokenizer_and_query_model(self) -> Tuple[AutoTokenizer, AutoModel]:
-        if self._tokenizer is not None and self._query_model is not None:
-            return self._tokenizer, self._query_model
+    def _filter_and_truncate(self, ids: List[int], w: List[float]) -> Tuple[List[int], List[float]]:
+        ids = ids[: self.top_k]
+        w = w[: self.top_k]
+        if self.min_weight > 0:
+            keep = [(i, ww) for i, ww in zip(ids, w) if float(ww) >= self.min_weight]
+            ids = [int(i) for i, _ in keep]
+            w = [float(ww) for _, ww in keep]
+        return ids, w
+
+    def _get_tokenizer_and_model(self) -> Tuple[AutoTokenizer, AutoModel]:
+        if self._tokenizer is not None and self._model is not None:
+            return self._tokenizer, self._model
 
         tok = AutoTokenizer.from_pretrained(self.model_name, use_fast=True)
         model = AutoModel.from_pretrained(self.model_name, ignore_mismatched_sizes=True)
-
-        if self.rstar_query_encoder_ckpt is not None:
-            ckpt = torch.load(str(self.rstar_query_encoder_ckpt), map_location="cpu")
-            if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
-                ckpt = ckpt["model_state_dict"]
-            if isinstance(ckpt, dict) and "state_dict" in ckpt:
-                ckpt = ckpt["state_dict"]
-
-            missing, unexpected = model.load_state_dict(ckpt, strict=False)
-            if missing:
-                print(f"[WARN] Missing keys when loading R* query encoder: {len(missing)}")
-            if unexpected:
-                print(f"[WARN] Unexpected keys when loading R* query encoder: {len(unexpected)}")
-
         model.eval()
+
         if self.device == "cuda" and torch.cuda.is_available():
             model = model.to("cuda")
         else:
             model = model.to("cpu")
 
         self._tokenizer = tok
-        self._query_model = model
+        self._model = model
         return tok, model
 
     def _mean_pool(self, last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
@@ -1670,19 +1673,24 @@ class ChexpertPlusRStarWeakEvidenceAligner:
         denom = mask.sum(dim=1).clamp(min=1e-6)
         return summed / denom
 
-    def _encode_queries(self, texts: List[str], pbar: Optional["tqdm"] = None) -> np.ndarray:
-        tok, model = self._get_tokenizer_and_query_model()
-
+    def _encode_texts(
+        self,
+        texts: List[str],
+        max_len: int,
+        batch_size: int,
+        pbar: Optional["tqdm"] = None,
+    ) -> np.ndarray:
+        tok, model = self._get_tokenizer_and_model()
         embs: List[np.ndarray] = []
-        for i in range(0, len(texts), self.qa_batch_size):
-            batch = texts[i : i + self.qa_batch_size]
-            batch = [self._normalize_text(x) for x in batch]
+        n = len(texts)
 
+        for i in range(0, n, batch_size):
+            batch = [self._normalize_text(x) for x in texts[i : i + batch_size]]
             enc = tok(
                 batch,
                 padding=True,
                 truncation=True,
-                max_length=self.max_query_tokens,
+                max_length=max_len,
                 return_tensors="pt",
             )
             enc = {k: v.to(model.device) for k, v in enc.items()}
@@ -1696,464 +1704,77 @@ class ChexpertPlusRStarWeakEvidenceAligner:
             if pbar is not None:
                 pbar.update(len(batch))
 
-        if not embs:
-            return np.zeros((0, 768), dtype=np.float32)
-        return np.vstack(embs)
-
-    # evidence loading
+        return np.vstack(embs) if embs else np.zeros((0, 768), dtype=np.float32)
 
     def _load_chunks_table(self) -> pd.DataFrame:
         cols = [self.chunk_id_col, self.chunk_text_col]
         df = pd.read_parquet(self.chunks_parquet, columns=cols)
         df[self.chunk_id_col] = pd.to_numeric(df[self.chunk_id_col], errors="coerce")
         df = df[~df[self.chunk_id_col].isna()].copy()
-        df[self.chunk_id_col] = df[self.chunk_id_col].astype(np.int64)
+        df[self.chunk_id_col] = df[self.chunk_id_col].astype(int)
         df[self.chunk_text_col] = df[self.chunk_text_col].astype(str)
         df = df.sort_values(self.chunk_id_col).reset_index(drop=True)
         return df
 
-    def _load_faiss_and_ids(self) -> Tuple[faiss.Index, np.ndarray]:
-        if not self.faiss_index_path.exists():
-            raise FileNotFoundError(f"FAISS index not found: {self.faiss_index_path}")
-        if not self.chunk_ids_npy.exists():
-            raise FileNotFoundError(f"chunk_ids.npy not found: {self.chunk_ids_npy}")
+    def _build_or_load_chunk_embeddings(self, chunks_df: pd.DataFrame) -> np.ndarray:
+        if self.chunk_embeds_path.exists():
+            emb = np.load(self.chunk_embeds_path)
+            if emb.shape[0] != len(chunks_df):
+                raise ValueError(
+                    f"Loaded embeddings rows ({emb.shape[0]}) != num chunks ({len(chunks_df)}). "
+                    f"Delete {self.chunk_embeds_path} and rerun."
+                )
+            return emb.astype(np.float32)
 
-        index = faiss.read_index(str(self.faiss_index_path))
-        faiss_chunk_ids = np.load(str(self.chunk_ids_npy)).astype(np.int64)
-
-        if index.ntotal != len(faiss_chunk_ids):
-            raise RuntimeError(
-                f"FAISS index ntotal ({index.ntotal}) != len(chunk_ids.npy) ({len(faiss_chunk_ids)})."
+        texts = chunks_df[self.chunk_text_col].tolist()
+        chunk_pbar = tqdm(total=len(texts), desc="Embedding Radiopaedia chunks", unit="chunks", miniters=1)
+        try:
+            emb = self._encode_texts(
+                texts,
+                max_len=self.max_doc_tokens,
+                batch_size=self.doc_batch_size,
+                pbar=chunk_pbar,
             )
-        return index, faiss_chunk_ids
-
-    def _init_writer(self) -> pq.ParquetWriter:
-        self.out_parquet.parent.mkdir(parents=True, exist_ok=True)
-        self._pa_schema = pa.schema(
-            [
-                ("qa_row_id", pa.int64()),
-                ("report_id", pa.string()),
-                ("deid_patient_id", pa.string()),
-                ("deid_patient_id_int64", pa.int64()),
-                ("split", pa.string()),
-                ("qa_type", pa.string()),
-                ("claim_text", pa.string()),
-                ("retrieved_chunk_ids_json", pa.string()),
-                ("support_weights_json", pa.string()),
-                ("embed_scores_json", pa.string()),
-                ("lexical_scores_json", pa.string()),
-                ("combined_scores_json", pa.string()),
-            ]
-        )
-        return pq.ParquetWriter(str(self.out_parquet), schema=self._pa_schema, compression=self.parquet_compression)
-
-    def _coerce_batch_df_for_parquet(self, batch_df: pd.DataFrame) -> pd.DataFrame:
-        assert self._pa_schema is not None
-
-        batch_df["qa_row_id"] = pd.to_numeric(batch_df["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
-        batch_df["deid_patient_id"] = batch_df["deid_patient_id"].astype(str)
-        batch_df["deid_patient_id_int64"] = (
-            pd.to_numeric(batch_df["deid_patient_id_int64"], errors="coerce").fillna(-1).astype(np.int64)
-        )
-
-        for c in self._pa_schema.names:
-            if c in {"qa_row_id", "deid_patient_id_int64"}:
-                continue
-            batch_df[c] = batch_df[c].astype(str)
-
-        return batch_df
-
-    def run(self) -> None:
-        if not self.qa_csv.exists():
-            raise FileNotFoundError(f"QA CSV not found: {self.qa_csv}")
-        if not self.chunks_parquet.exists():
-            raise FileNotFoundError(f"chunks.parquet not found: {self.chunks_parquet}")
-
-        # Load lexical texts
-        chunks_df = self._load_chunks_table()
-        chunk_text_map: Dict[int, str] = {
-            int(cid): str(txt)
-            for cid, txt in zip(chunks_df[self.chunk_id_col].tolist(), chunks_df[self.chunk_text_col].tolist())
-        }
-
-        # Load FAISS + aligned chunk ids
-        index, faiss_chunk_ids = self._load_faiss_and_ids()
-
-        # Count csv rows for progress
-        total_rows = sum(1 for _ in open(self.qa_csv, "r", encoding="utf-8", errors="ignore")) - 1
-        pbar = tqdm(total=max(total_rows, 0), desc=self.tqdm_desc, unit="rows", miniters=1)
-
-        writer = self._init_writer()
-        assert self._pa_schema is not None
-
-        # Pass 1: read patient->split map from CSV column "split"
-        patient_to_split: Dict[str, str] = {}
-        for df0 in pd.read_csv(self.qa_csv, chunksize=self.qa_chunksize_rows):
-            for c in [self.patient_col, self.split_col]:
-                if c not in df0.columns:
-                    raise ValueError(f"QA CSV missing required column: {c}")
-
-            pid_list = df0[self.patient_col].tolist()
-            split_list = df0[self.split_col].tolist()
-
-            for pid_raw, sp in zip(pid_list, split_list):
-                pid = self._patient_key(pid_raw)
-                if not pid:
-                    continue
-                s = self._safe_str(sp).strip().lower()
-                if s not in {"train", "valid", "test"}:
-                    continue
-                prev = patient_to_split.get(pid)
-                if prev is None:
-                    patient_to_split[pid] = s
-                elif prev != s:
-                    raise ValueError(f"Conflicting split assignments for patient '{pid}': '{prev}' vs '{s}'")
-
-        if self.write_patient_split_map_json:
-            split_map_path = self.out_parquet.parent / "patient_split_map_chexpertplus.json"
-            split_map_path.write_text(json.dumps(patient_to_split, indent=2), encoding="utf-8")
-            print(f"Wrote: {split_map_path}")
-
-        # Pass 2: streaming alignment
-        pbar.reset(total=max(total_rows, 0))
-        qa_row_id = 0
-
-        try:
-            for df in pd.read_csv(self.qa_csv, chunksize=self.qa_chunksize_rows):
-                for c in [self.report_id_col, self.patient_col, self.qa_type_col, self.claim_col, self.split_col]:
-                    if c not in df.columns:
-                        raise ValueError(f"QA CSV missing required column: {c}")
-
-                df = df.copy()
-                df[self.report_id_col] = df[self.report_id_col].astype(str).str.strip()
-                df[self.qa_type_col] = df[self.qa_type_col].astype(str).str.strip()
-                df[self.claim_col] = df[self.claim_col].astype(str)
-
-                # patient raw string + split (read from CSV)
-                pid_raw_list = [self._patient_key(x) for x in df[self.patient_col].tolist()]
-                df[self.patient_col] = pid_raw_list
-
-                split_raw_list = [self._safe_str(x).strip().lower() for x in df[self.split_col].tolist()]
-                split_norm_list: List[str] = []
-                for pid, sp in zip(pid_raw_list, split_raw_list):
-                    if sp in {"train", "valid", "test"}:
-                        split_norm_list.append(sp)
-                    else:
-                        # fallback to patient map if row value is missing/invalid
-                        split_norm_list.append(patient_to_split.get(pid, "train"))
-
-                df[self.split_col] = split_norm_list
-                df["__pid_int64"] = [self._patient_to_int64(pid) for pid in pid_raw_list]
-
-                claims = df[self.claim_col].tolist()
-                q_emb = self._encode_queries(claims, pbar=pbar)
-
-                D, I = index.search(q_emb, self.top_k)  # (B,k)
-
-                out_rows: List[Dict[str, object]] = []
-                for i in range(len(df)):
-                    report_id = str(df.iloc[i][self.report_id_col]).strip()
-                    patient_id_raw = str(df.iloc[i][self.patient_col]).strip()
-                    patient_id_int64 = int(df.iloc[i]["__pid_int64"])
-                    split = str(df.iloc[i][self.split_col]).strip() or "train"
-                    qa_type = str(df.iloc[i][self.qa_type_col]).strip()
-                    claim_text = str(df.iloc[i][self.claim_col])
-                    claim_norm = self._normalize_text(claim_text)
-
-                    if not claim_norm:
-                        out_rows.append(
-                            asdict(
-                                WeakAlignmentRowChexpert(
-                                    qa_row_id=qa_row_id,
-                                    report_id=report_id,
-                                    deid_patient_id=patient_id_raw,
-                                    deid_patient_id_int64=patient_id_int64,
-                                    split=split,
-                                    qa_type=qa_type,
-                                    claim_text=claim_text,
-                                    retrieved_chunk_ids_json="[]",
-                                    support_weights_json="[]",
-                                    embed_scores_json="[]",
-                                    lexical_scores_json="[]",
-                                    combined_scores_json="[]",
-                                )
-                            )
-                        )
-                        qa_row_id += 1
-                        continue
-
-                    faiss_rows = I[i].tolist()
-                    embed_scores = D[i].astype(np.float32).tolist()
-
-                    retrieved_ids: List[int] = []
-                    retrieved_texts: List[str] = []
-                    valid_embed_scores: List[float] = []
-
-                    for row_idx, sc in zip(faiss_rows, embed_scores):
-                        if int(row_idx) < 0:
-                            continue
-                        cid = int(faiss_chunk_ids[int(row_idx)])
-                        retrieved_ids.append(cid)
-                        retrieved_texts.append(chunk_text_map.get(cid, ""))
-                        valid_embed_scores.append(float(sc))
-
-                    e = np.asarray(valid_embed_scores, dtype=np.float32)
-                    if self.use_lexical:
-                        l = np.asarray(
-                            [float(self._lexical_overlap(claim_norm, t)) for t in retrieved_texts],
-                            dtype=np.float32,
-                        )
-                    else:
-                        l = np.zeros_like(e, dtype=np.float32)
-
-                    combined = self.alpha * e + (1.0 - self.alpha) * l
-                    w = self._weights_from_scores(combined)
-
-                    out_rows.append(
-                        asdict(
-                            WeakAlignmentRowChexpert(
-                                qa_row_id=qa_row_id,
-                                report_id=report_id,
-                                deid_patient_id=patient_id_raw,
-                                deid_patient_id_int64=patient_id_int64,
-                                split=split,
-                                qa_type=qa_type,
-                                claim_text=claim_text,
-                                retrieved_chunk_ids_json=json.dumps(retrieved_ids),
-                                support_weights_json=json.dumps([float(x) for x in w.tolist()]),
-                                embed_scores_json=json.dumps([float(x) for x in e.tolist()]),
-                                lexical_scores_json=json.dumps([float(x) for x in l.tolist()]),
-                                combined_scores_json=json.dumps([float(x) for x in combined.tolist()]),
-                            )
-                        )
-                    )
-                    qa_row_id += 1
-
-                batch_df = pd.DataFrame(out_rows)
-                batch_df = self._coerce_batch_df_for_parquet(batch_df)
-                table = pa.Table.from_pandas(batch_df, schema=self._pa_schema, preserve_index=False)
-                writer.write_table(table)
-
         finally:
-            pbar.close()
-            writer.close()
+            chunk_pbar.close()
 
-        manifest = {
-            "step": "6B_chexpertplus",
-            "qa_csv": str(self.qa_csv.resolve()),
-            "chunks_parquet": str(self.chunks_parquet.resolve()),
-            "faiss_index": str(self.faiss_index_path.resolve()),
-            "chunk_ids_npy": str(self.chunk_ids_npy.resolve()),
-            "out_parquet": str(self.out_parquet.resolve()),
-            "query_encoder": {
-                "model_name": self.model_name,
-                "checkpoint": str(self.rstar_query_encoder_ckpt) if self.rstar_query_encoder_ckpt else None,
-            },
-            "split": {
-                "patient_wise": True,
-                "seed": self.split_seed,
-                "frac_train": self.frac_train,
-                "frac_valid": self.frac_valid,
-                "frac_test": self.frac_test,
-                "patient_split_map_json": str((self.out_parquet.parent / "patient_split_map_chexpertplus.json").resolve())
-                if self.write_patient_split_map_json
-                else None,
-            },
-            "outputs": {
-                "patient_id_columns": ["deid_patient_id (string)", "deid_patient_id_int64 (stable hash int64)"]
-            },
-            "params": {
-                "max_query_tokens": self.max_query_tokens,
-                "top_k": self.top_k,
-                "alpha": self.alpha,
-                "temperature": self.temperature,
-                "seed": self.seed,
-                "device": self.device,
-                "qa_chunksize_rows": self.qa_chunksize_rows,
-                "qa_batch_size": self.qa_batch_size,
-                "use_lexical": self.use_lexical,
-            },
-        }
+        np.save(self.chunk_embeds_path, emb)
+        return emb
 
-        manifest_path = self.out_parquet.parent / "manifest_step6b_chexpertplus.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    def _build_or_load_faiss_index(self, chunk_embeds: np.ndarray) -> faiss.Index:
+        if self.faiss_index_path.exists():
+            idx = faiss.read_index(str(self.faiss_index_path))
+            return idx
 
-        print(f"Wrote: {self.out_parquet}")
-        print(f"Wrote: {manifest_path}")
+        dim = int(chunk_embeds.shape[1])
+        index = faiss.IndexFlatIP(dim)
+        index.add(chunk_embeds)
+        faiss.write_index(index, str(self.faiss_index_path))
+        return index
 
-
-
-
-@dataclass(frozen=True)
-class RetrieverSupervisionRowChexpert:
-    qa_row_id: int
-    deid_patient_id: int
-    split: str
-    report_id: str
-    qa_type: str
-    claim_text: str
-    pos_chunk_ids_json: str
-    pos_weights_json: str
-
-
-@dataclass(frozen=True)
-class VerifierSupervisionRowChexpert:
-    qa_row_id: int
-    deid_patient_id: int
-    split: str
-    report_id: str
-    qa_type: str
-    case_context: str
-    question: str
-    answer_target: str
-    claim_text: str
-    evidence_chunk_ids_json: str
-    evidence_weights_json: str
-    soft_support_score: float
-
-
-class ChexpertPlusStep6CSupervisionBuilder:
-    """
-    CheXpert-Plus Step 6C-equivalent.
-
-    Reads:
-      - QA CSV (Step 3 output)
-      - weak_alignment parquet (Step 6B output)
-
-    Joins ONLY by qa_row_id order (streaming), and optionally checks (report_id, patient_id) consistency.
-    """
-
-    def __init__(
-        self,
-        qa_csv: str | Path,
-        weak_alignment_parquet: str | Path,
-        out_dir: str | Path,
-        # columns in qa_csv
-        patient_col: str = "deid_patient_id",
-        report_id_col: str = "report_id",
-        qa_type_col: str = "qa_type",
-        claim_col: str = "claim_text",
-        case_context_col: str = "case_context",
-        question_col: str = "question",
-        answer_col: str = "answer_target",
-        # streaming
-        qa_chunksize_rows: int = 50_000,
-        parquet_batch_rows: int = 50_000,
-        # supervision shaping
-        top_k: Optional[int] = None,
-        min_weight: float = 0.0,
-        # optional filtering
-        allowed_splits: Optional[List[str]] = None,
-        # progress
-        tqdm_desc: str = "CheXpert Step 6C: building supervision from R* alignments",
-        parquet_compression: str = "zstd",
-        # safety
-        strict_key_check: bool = True,
-    ) -> None:
-        self.qa_csv = Path(qa_csv)
-        self.weak_alignment_parquet = Path(weak_alignment_parquet)
-        self.out_dir = Path(out_dir)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
-
-        self.patient_col = str(patient_col)
-        self.report_id_col = str(report_id_col)
-        self.qa_type_col = str(qa_type_col)
-        self.claim_col = str(claim_col)
-        self.case_context_col = str(case_context_col)
-        self.question_col = str(question_col)
-        self.answer_col = str(answer_col)
-
-        self.qa_chunksize_rows = int(qa_chunksize_rows)
-        self.parquet_batch_rows = int(parquet_batch_rows)
-
-        self.top_k = int(top_k) if top_k is not None else None
-        self.min_weight = float(min_weight)
-
-        self.allowed_splits = allowed_splits[:] if allowed_splits is not None else None
-
-        self.tqdm_desc = str(tqdm_desc)
-        self.parquet_compression = str(parquet_compression)
-        self.strict_key_check = bool(strict_key_check)
-
-        self.retriever_out = self.out_dir / "retriever_supervision.parquet"
-        self.verifier_out = self.out_dir / "verifier_supervision.parquet"
-        self.manifest_out = self.out_dir / "manifest_step6c_chexpertplus.json"
-
-        self._retr_schema: Optional[pa.Schema] = None
-        self._ver_schema: Optional[pa.Schema] = None
-
-
-    def _safe_str(self, x) -> str:
-        if x is None:
-            return ""
-        s = str(x)
-        return "" if s.lower() == "nan" else s
-
-    def _loads_json_list(self, s: str) -> List:
-        try:
-            return json.loads(s)
-        except Exception:
-            return []
-
-    def _patient_to_int64(self, pid) -> int:
-        """
-        Deterministic int64 for patient id:
-          - numeric -> int
-          - otherwise -> md5 hash -> int64 in [0, 2^63-2]
-        """
-        s = self._safe_str(pid).strip()
-        if not s:
-            return -1
-        try:
-            v = int(float(s))
-            return int(v)
-        except Exception:
-            pass
-        h = hashlib.md5(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
-        u = int(h, 16)
-        return int(u % (2**63 - 1))
-
-    def _filter_and_truncate(self, ids: List[int], w: List[float]) -> Tuple[List[int], List[float]]:
-        if self.top_k is not None:
-            ids = ids[: self.top_k]
-            w = w[: self.top_k]
-        if self.min_weight > 0:
-            keep = [(i, ww) for i, ww in zip(ids, w) if float(ww) >= self.min_weight]
-            ids = [int(i) for i, _ in keep]
-            w = [float(ww) for _, ww in keep]
-        return ids, w
-
-    def _soft_support_from_combined(self, combined_scores: List[float]) -> float:
-        if not combined_scores:
-            return 0.0
-        try:
-            return float(np.max(np.asarray(combined_scores, dtype=np.float32)))
-        except Exception:
-            return 0.0
-
-
-    def _init_retriever_writer(self) -> pq.ParquetWriter:
-        self._retr_schema = pa.schema(
+    def _init_retriever_writer(self) -> Tuple[pq.ParquetWriter, pa.Schema]:
+        schema = pa.schema(
             [
                 ("qa_row_id", pa.int64()),
-                ("deid_patient_id", pa.int64()),
+                ("subject_id", pa.string()),   # FIX: string
                 ("split", pa.string()),
-                ("report_id", pa.string()),
+                ("report_rel_path", pa.string()),
                 ("qa_type", pa.string()),
                 ("claim_text", pa.string()),
                 ("pos_chunk_ids_json", pa.string()),
                 ("pos_weights_json", pa.string()),
             ]
         )
-        return pq.ParquetWriter(str(self.retriever_out), schema=self._retr_schema, compression=self.parquet_compression)
+        w = pq.ParquetWriter(str(self.retriever_out), schema=schema, compression=self.parquet_compression)
+        return w, schema
 
-    def _init_verifier_writer(self) -> pq.ParquetWriter:
-        self._ver_schema = pa.schema(
+    def _init_verifier_writer(self) -> Tuple[pq.ParquetWriter, pa.Schema]:
+        schema = pa.schema(
             [
                 ("qa_row_id", pa.int64()),
-                ("deid_patient_id", pa.int64()),
+                ("subject_id", pa.string()),   # FIX: string
                 ("split", pa.string()),
-                ("report_id", pa.string()),
+                ("report_rel_path", pa.string()),
                 ("qa_type", pa.string()),
                 ("case_context", pa.string()),
                 ("question", pa.string()),
@@ -2164,7 +1785,8 @@ class ChexpertPlusStep6CSupervisionBuilder:
                 ("soft_support_score", pa.float32()),
             ]
         )
-        return pq.ParquetWriter(str(self.verifier_out), schema=self._ver_schema, compression=self.parquet_compression)
+        w = pq.ParquetWriter(str(self.verifier_out), schema=schema, compression=self.parquet_compression)
+        return w, schema
 
     def _to_table(self, df: pd.DataFrame, schema: pa.Schema) -> pa.Table:
         for c in schema.names:
@@ -2172,52 +1794,56 @@ class ChexpertPlusStep6CSupervisionBuilder:
                 df[c] = None
 
         df["qa_row_id"] = pd.to_numeric(df["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
-        df["deid_patient_id"] = pd.to_numeric(df["deid_patient_id"], errors="coerce").fillna(-1).astype(np.int64)
 
-        for c in schema.names:
-            if c in {"qa_row_id", "deid_patient_id", "soft_support_score"}:
-                continue
-            df[c] = df[c].astype(str)
+        # subject_id MUST remain string
+        if "subject_id" in df.columns:
+            df["subject_id"] = df["subject_id"].astype(str)
 
         if "soft_support_score" in df.columns:
             df["soft_support_score"] = pd.to_numeric(df["soft_support_score"], errors="coerce").fillna(0.0).astype(
                 np.float32
             )
 
+        for c in schema.names:
+            if schema.field(c).type == pa.string() and c in df.columns:
+                df[c] = df[c].astype(str)
+
         return pa.Table.from_pandas(df, schema=schema, preserve_index=False)
 
+    def _estimate_total_test_rows(self) -> int:
+        if not self.prescan_total_test_rows:
+            return 0
+        total = 0
+        usecols = [self.split_col]
+        try:
+            for df in pd.read_csv(self.qa_csv, usecols=usecols, chunksize=200_000):
+                df[self.split_col] = df[self.split_col].astype(str)
+                total += int((df[self.split_col] == self.test_split_value).sum())
+        except Exception:
+            return 0
+        return int(total)
 
     def run(self) -> None:
         if not self.qa_csv.exists():
             raise FileNotFoundError(f"QA CSV not found: {self.qa_csv}")
-        if not self.weak_alignment_parquet.exists():
-            raise FileNotFoundError(f"Weak alignment parquet not found: {self.weak_alignment_parquet}")
+        if not self.chunks_parquet.exists():
+            raise FileNotFoundError(f"chunks.parquet not found: {self.chunks_parquet}")
 
-        total_rows = sum(1 for _ in open(self.qa_csv, "r", encoding="utf-8", errors="ignore")) - 1
-        pbar = tqdm(total=max(total_rows, 0), desc=self.tqdm_desc, unit="rows", miniters=1)
+        # Load chunks + index once
+        chunks_df = self._load_chunks_table()
+        chunk_ids = chunks_df[self.chunk_id_col].to_numpy(dtype=np.int64)
+        chunk_texts = chunks_df[self.chunk_text_col].tolist()
 
-        retr_writer = self._init_retriever_writer()
-        ver_writer = self._init_verifier_writer()
-        assert self._retr_schema is not None
-        assert self._ver_schema is not None
+        chunk_embeds = self._build_or_load_chunk_embeddings(chunks_df)
+        index = self._build_or_load_faiss_index(chunk_embeds)
 
-        pf = pq.ParquetFile(str(self.weak_alignment_parquet))
+        retr_writer, retr_schema = self._init_retriever_writer()
+        ver_writer, ver_schema = self._init_verifier_writer()
 
-        align_cols = [
-            "qa_row_id",
-            "report_id",
-            "deid_patient_id",
-            "split",
-            "qa_type",
-            "claim_text",
-            "retrieved_chunk_ids_json",
-            "support_weights_json",
-            "combined_scores_json",
-        ]
-
-        needed_qa_cols = [
-            self.patient_col,
-            self.report_id_col,
+        needed_cols = [
+            self.split_col,
+            self.subject_id_col,
+            self.report_path_col,
             self.qa_type_col,
             self.claim_col,
             self.case_context_col,
@@ -2225,620 +1851,396 @@ class ChexpertPlusStep6CSupervisionBuilder:
             self.answer_col,
         ]
 
-        qa_reader = pd.read_csv(self.qa_csv, chunksize=self.qa_chunksize_rows)
+        qa_row_id = 0
+        kept_total = 0
 
-        qa_row_id_expected = 0
-        align_row_id_expected = 0
+        total_test = self._estimate_total_test_rows()
+        main_pbar = tqdm(
+            total=total_test if total_test > 0 else None,
+            desc=self.tqdm_desc,
+            unit="rows",
+            miniters=1,
+        )
 
-        align_iter = pf.iter_batches(batch_size=self.parquet_batch_rows, columns=align_cols)
-
-        written_rows = 0
-        dropped_by_split = 0
-        empty_chunks = 0
+        # A second pbar that shows embedding throughput (helps you see GPU progress)
+        embed_pbar = tqdm(
+            total=total_test if total_test > 0 else None,
+            desc="Embedding claims (test only)",
+            unit="claims",
+            miniters=1,
+            leave=False,
+        )
 
         try:
-            for qa_chunk in qa_reader:
-                for c in needed_qa_cols:
-                    if c not in qa_chunk.columns:
-                        raise ValueError(f"QA CSV missing required column: {c}")
+            for df in pd.read_csv(self.qa_csv, chunksize=self.qa_chunksize_rows):
+                for c in needed_cols:
+                    if c not in df.columns:
+                        raise ValueError(f"CheXpert Step3 CSV missing required column: {c}")
 
-                qa_chunk = qa_chunk.copy()
-
-                qa_chunk["__pid_raw"] = qa_chunk[self.patient_col].astype(str)
-                qa_chunk["__pid_int"] = qa_chunk["__pid_raw"].map(self._patient_to_int64).astype(np.int64)
-
-                # keep rows that have non-empty patient id
-                mask_ok = qa_chunk["__pid_raw"].map(lambda x: bool(self._safe_str(x).strip()))
-                qa_chunk = qa_chunk[mask_ok].copy()
-
-                qa_chunk[self.report_id_col] = qa_chunk[self.report_id_col].astype(str).str.strip()
-                qa_chunk[self.qa_type_col] = qa_chunk[self.qa_type_col].astype(str)
-                qa_chunk[self.claim_col] = qa_chunk[self.claim_col].astype(str)
-                qa_chunk[self.case_context_col] = qa_chunk[self.case_context_col].astype(str)
-                qa_chunk[self.question_col] = qa_chunk[self.question_col].astype(str)
-                qa_chunk[self.answer_col] = qa_chunk[self.answer_col].astype(str)
-
-                n = len(qa_chunk)
-                if n == 0:
-                    empty_chunks += 1
+                # keep test only
+                df[self.split_col] = df[self.split_col].astype(str)
+                df = df[df[self.split_col] == self.test_split_value]
+                if len(df) == 0:
                     continue
 
-                # Pull exactly n alignment rows
-                align_rows: List[pd.DataFrame] = []
-                need = n
-                while need > 0:
-                    batch = next(align_iter, None)
-                    if batch is None:
-                        raise RuntimeError(f"Alignment parquet ended early. Still needed {need} rows.")
-                    align_rows.append(batch.to_pandas())
-                    need -= len(align_rows[-1])
+                # keep subject_id as string (no dropping by numeric coercion)
+                df[self.subject_id_col] = df[self.subject_id_col].astype(str)
+                df = df[df[self.subject_id_col].str.strip() != ""].copy()
+                if len(df) == 0:
+                    continue
 
-                align_df = pd.concat(align_rows, ignore_index=True)
-                if len(align_df) > n:
-                    align_df = align_df.iloc[:n].copy()
+                # other cols as string
+                for c in [
+                    self.report_path_col,
+                    self.qa_type_col,
+                    self.claim_col,
+                    self.case_context_col,
+                    self.question_col,
+                    self.answer_col,
+                ]:
+                    df[c] = df[c].astype(str)
 
-                first_id = int(align_df.iloc[0]["qa_row_id"])
-                if first_id != align_row_id_expected:
-                    raise RuntimeError(
-                        f"Alignment qa_row_id mismatch: expected {align_row_id_expected}, got {first_id}."
-                    )
+                claims = df[self.claim_col].tolist()
+
+                # embed with progress
+                q_emb = self._encode_texts(
+                    claims,
+                    max_len=self.max_query_tokens,
+                    batch_size=self.qa_batch_size,
+                    pbar=embed_pbar,
+                )
+                D, I = index.search(q_emb, self.top_k)
 
                 retr_rows: List[Dict[str, object]] = []
                 ver_rows: List[Dict[str, object]] = []
 
-                for i in range(n):
-                    qa_row_id = qa_row_id_expected
-                    al_row = align_df.iloc[i]
+                for i in range(len(df)):
+                    claim_text = df.iloc[i][self.claim_col]
+                    claim_norm = self._normalize_text(claim_text)
 
-                    split = self._safe_str(al_row.get("split", "train")).strip() or "train"
-                    if self.allowed_splits is not None and split not in self.allowed_splits:
-                        dropped_by_split += 1
-                        qa_row_id_expected += 1
-                        align_row_id_expected += 1
-                        continue
+                    subject_id = str(df.iloc[i][self.subject_id_col])  # FIX: keep string
+                    report_rel_path = str(df.iloc[i][self.report_path_col])  # report_id -> report_rel_path
+                    qa_type = str(df.iloc[i][self.qa_type_col])
+                    case_context = str(df.iloc[i][self.case_context_col])
+                    question = str(df.iloc[i][self.question_col])
+                    answer_target = str(df.iloc[i][self.answer_col])
 
-                    report_id_qa = self._safe_str(qa_chunk.iloc[i][self.report_id_col]).strip()
-                    pid_int_qa = int(qa_chunk.iloc[i]["__pid_int"])
+                    if not claim_norm:
+                        ids: List[int] = []
+                        w: List[float] = []
+                        combined_list: List[float] = []
+                    else:
+                        faiss_idxs = I[i].tolist()
+                        embed_scores = D[i].astype(np.float32).tolist()
 
-                    report_id_align = self._safe_str(al_row.get("report_id", "")).strip()
-                    pid_raw_align = self._safe_str(al_row.get("deid_patient_id", "")).strip()
-                    pid_int_align = self._patient_to_int64(pid_raw_align)
+                        retrieved_ids: List[int] = []
+                        retrieved_texts: List[str] = []
+                        valid_embed_scores: List[float] = []
 
-                    if self.strict_key_check:
-                        if report_id_align and report_id_qa and (report_id_align != report_id_qa):
-                            raise RuntimeError(
-                                f"report_id mismatch at qa_row_id={qa_row_id}: align='{report_id_align}' vs qa='{report_id_qa}'"
-                            )
-                        if pid_int_align != pid_int_qa:
-                            raise RuntimeError(
-                                f"patient_id mismatch at qa_row_id={qa_row_id}: "
-                                f"align_raw='{pid_raw_align}' align_int={pid_int_align} vs qa_int={pid_int_qa}"
-                            )
+                        for j, sc in zip(faiss_idxs, embed_scores):
+                            if j < 0:
+                                continue
+                            retrieved_ids.append(int(chunk_ids[j]))
+                            retrieved_texts.append(chunk_texts[j])
+                            valid_embed_scores.append(float(sc))
 
-                    ids = self._loads_json_list(self._safe_str(al_row.get("retrieved_chunk_ids_json", "[]")))
-                    w = self._loads_json_list(self._safe_str(al_row.get("support_weights_json", "[]")))
-                    combined = self._loads_json_list(self._safe_str(al_row.get("combined_scores_json", "[]")))
+                        lex_scores = [float(self._lexical_overlap(claim_norm, t)) for t in retrieved_texts]
+                        e = np.array(valid_embed_scores, dtype=np.float32)
+                        l = np.array(lex_scores, dtype=np.float32)
+                        combined = self.alpha * e + (1.0 - self.alpha) * l
 
-                    ids = [int(x) for x in ids if str(x).strip() != ""]
-                    w = [float(x) for x in w]
-                    combined = [float(x) for x in combined]
+                        w_arr = self._weights_from_scores(combined)
 
-                    ids, w = self._filter_and_truncate(ids, w)
-                    if len(w) != len(ids):
-                        m = min(len(w), len(ids))
-                        ids, w = ids[:m], w[:m]
+                        ids = retrieved_ids
+                        w = [float(x) for x in w_arr.tolist()]
+                        combined_list = [float(x) for x in combined.tolist()]
 
-                    qa_type = self._safe_str(qa_chunk.iloc[i][self.qa_type_col])
-                    claim_text = self._safe_str(qa_chunk.iloc[i][self.claim_col])
-                    case_context = self._safe_str(qa_chunk.iloc[i][self.case_context_col])
-                    question = self._safe_str(qa_chunk.iloc[i][self.question_col])
-                    answer_target = self._safe_str(qa_chunk.iloc[i][self.answer_col])
+                        ids, w = self._filter_and_truncate(ids, w)
+                        if len(ids) != len(w):
+                            m = min(len(ids), len(w))
+                            ids, w = ids[:m], w[:m]
+                            combined_list = combined_list[:m]
+
+                    soft_support = float(np.max(np.asarray(combined_list, dtype=np.float32))) if combined_list else 0.0
 
                     retr_rows.append(
                         asdict(
-                            RetrieverSupervisionRowChexpert(
+                            RetrieverSupervisionRow(
                                 qa_row_id=qa_row_id,
-                                deid_patient_id=pid_int_qa,
-                                split=split,
-                                report_id=report_id_qa,
+                                subject_id=subject_id,
+                                split="test",
+                                report_rel_path=report_rel_path,
                                 qa_type=qa_type,
                                 claim_text=claim_text,
                                 pos_chunk_ids_json=json.dumps(ids),
-                                pos_weights_json=json.dumps([float(x) for x in w]),
+                                pos_weights_json=json.dumps(w),
                             )
                         )
                     )
 
                     ver_rows.append(
                         asdict(
-                            VerifierSupervisionRowChexpert(
+                            VerifierSupervisionRow(
                                 qa_row_id=qa_row_id,
-                                deid_patient_id=pid_int_qa,
-                                split=split,
-                                report_id=report_id_qa,
+                                subject_id=subject_id,
+                                split="test",
+                                report_rel_path=report_rel_path,
                                 qa_type=qa_type,
                                 case_context=case_context,
                                 question=question,
                                 answer_target=answer_target,
                                 claim_text=claim_text,
                                 evidence_chunk_ids_json=json.dumps(ids),
-                                evidence_weights_json=json.dumps([float(x) for x in w]),
-                                soft_support_score=self._soft_support_from_combined(combined),
+                                evidence_weights_json=json.dumps(w),
+                                soft_support_score=float(soft_support),
                             )
                         )
                     )
 
-                    qa_row_id_expected += 1
-                    align_row_id_expected += 1
+                    qa_row_id += 1
+                    kept_total += 1
+                    main_pbar.update(1)
 
-                if retr_rows:
-                    retr_writer.write_table(self._to_table(pd.DataFrame(retr_rows), self._retr_schema))
-                    ver_writer.write_table(self._to_table(pd.DataFrame(ver_rows), self._ver_schema))
-                    written_rows += len(retr_rows)
+                retr_df = pd.DataFrame(retr_rows)
+                ver_df = pd.DataFrame(ver_rows)
 
-                pbar.update(n)
+                retr_writer.write_table(self._to_table(retr_df, retr_schema))
+                ver_writer.write_table(self._to_table(ver_df, ver_schema))
 
         finally:
-            pbar.close()
+            embed_pbar.close()
+            main_pbar.close()
             retr_writer.close()
             ver_writer.close()
 
         manifest = {
-            "step": "6C_chexpertplus",
+            "step": "4_external_test",
             "inputs": {
                 "qa_csv": str(self.qa_csv.resolve()),
-                "weak_alignment_parquet": str(self.weak_alignment_parquet.resolve()),
+                "chunks_parquet": str(self.chunks_parquet.resolve()),
             },
             "outputs": {
                 "retriever_supervision": str(self.retriever_out.resolve()),
                 "verifier_supervision": str(self.verifier_out.resolve()),
             },
-            "split": {
-                "source": "weak_alignment_parquet.split",
-                "allowed_splits": self.allowed_splits if self.allowed_splits is not None else ["train", "valid", "test"],
-            },
-            "patient_id": {
-                "qa_source_col": self.patient_col,
-                "align_source_col": "deid_patient_id",
-                "output_col": "deid_patient_id (int64)",
-                "mapping": "numeric->int, else md5 hash -> int64",
-                "strict_key_check": self.strict_key_check,
-            },
+            "filter": {"split_col": self.split_col, "test_split_value": self.test_split_value},
             "params": {
-                "qa_chunksize_rows": self.qa_chunksize_rows,
-                "parquet_batch_rows": self.parquet_batch_rows,
+                "bootstrap_embedder": self.model_name,
+                "max_query_tokens": self.max_query_tokens,
+                "max_doc_tokens": self.max_doc_tokens,
                 "top_k": self.top_k,
+                "alpha": self.alpha,
+                "temperature": self.temperature,
                 "min_weight": self.min_weight,
-                "soft_support_scalar": "max(combined_scores)",
-                "parquet_compression": self.parquet_compression,
+                "qa_chunksize_rows": self.qa_chunksize_rows,
+                "qa_batch_size": self.qa_batch_size,
+                "doc_batch_size": self.doc_batch_size,
+                "seed": self.seed,
+                "device": self.device,
+                "force_cpu_faiss": self.force_cpu_faiss,
+            },
+            "cache": {
+                "chunk_embeds_npy": str(self.chunk_embeds_path.resolve()),
+                "faiss_index": str(self.faiss_index_path.resolve()),
             },
             "stats": {
-                "written_rows": int(written_rows),
-                "dropped_by_split": int(dropped_by_split),
-                "empty_qa_chunks": int(empty_chunks),
+                "rows_written_test_only": int(kept_total),
+                "estimated_total_test_rows": int(total_test),
             },
         }
         self.manifest_out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-        print(f"Wrote: {self.retriever_out}")
-        print(f"Wrote: {self.verifier_out}")
+        print(f"Wrote: {self.retriever_out}  (rows={kept_total:,})")
+        print(f"Wrote: {self.verifier_out}   (rows={kept_total:,})")
         print(f"Wrote: {self.manifest_out}")
-        print(f"Rows written: {written_rows:,} | Dropped by split filter: {dropped_by_split:,} | Empty QA chunks: {empty_chunks:,}")
+        print(f"Cache: {self.chunk_embeds_path}  |  {self.faiss_index_path}")
 
 
 
 
 
+class _RunningStats:
+    def __init__(self) -> None:
+        self.n = 0
+        self.mean = 0.0
+        self.M2 = 0.0
+        self.min_v = float("inf")
+        self.max_v = float("-inf")
+
+    def update(self, x: np.ndarray) -> None:
+        if x.size == 0:
+            return
+        x = x.astype(np.float64, copy=False)
+        self.min_v = min(self.min_v, float(np.min(x)))
+        self.max_v = max(self.max_v, float(np.max(x)))
+
+        for v in x:
+            self.n += 1
+            delta = v - self.mean
+            self.mean += delta / self.n
+            delta2 = v - self.mean
+            self.M2 += delta * delta2
+
+    def as_dict(self) -> Dict[str, float]:
+        if self.n <= 0:
+            return {"min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0}
+        var = self.M2 / (self.n - 1) if self.n > 1 else 0.0
+        return {"min": float(self.min_v), "max": float(self.max_v), "mean": float(self.mean), "std": float(np.sqrt(var))}
 
 
-@dataclass(frozen=True)
-class VerifierMaterializedRowChexpert:
-    qa_row_id: int
-    deid_patient_id: int
-    split: str
-    report_id: str
-    qa_type: str
-    case_context: str
-    question: str
-    answer_target: str
-    claim_text: str
-
-    evidence_chunk_ids_json: str
-    evidence_weights_json: str
-
-    evidence_texts_json: str
-    evidence_text_concat: str
-    evidence_text: str  # alias of evidence_text_concat
-
-    soft_support_score: float
-
-
-class ChexpertPlusStep7VerifierMaterializer:
-    """
-    CheXpert-Plus: Step 7 — materialize verifier training/eval examples (materialize evidence text)
-
-    Inputs:
-      - step6c_supervision_rstar_chexpertplus/verifier_supervision.parquet (from CheXpert Step 6C)
-      - chunks.parquet (frozen evidence snapshot)
-
-    Output (in out_dir):
-      - verifier_train_materialized.parquet
-      - manifest_step7_chexpertplus.json
-
-    Notes:
-      - Does NOT change split. Uses split already present in verifier_supervision.
-      - Builds chunk_id -> chunk_text lookup from chunks.parquet (in memory).
-      - Streams verifier_supervision parquet (stable memory).
-      - Writes evidence_text (alias of evidence_text_concat) for dataset compatibility.
-    """
-
+class EvidenceTextStore:
     def __init__(
         self,
-        verifier_supervision_parquet: str | Path,
-        chunks_parquet: str | Path,
-        out_dir: str | Path,
-        # column names in chunks.parquet
-        chunk_id_col: str = "chunk_id",
-        chunk_text_col: str = "chunk_text",
-        # how to build evidence string
-        max_evidence_chunks: Optional[int] = None,
-        min_evidence_weight: float = 0.0,
-        evidence_sep: str = "\n\n---\n\n",
-        # streaming
-        parquet_batch_rows: int = 50_000,
-        # progress
-        tqdm_desc: str = "CheXpert Step 7: materializing verifier evidence text",
-        parquet_compression: str = "zstd",
-        # column names in verifier_supervision.parquet (CheXpert Step 6C)
-        qa_row_id_col: str = "qa_row_id",
-        patient_col: str = "deid_patient_id",
-        split_col: str = "split",
-        report_id_col: str = "report_id",
-        qa_type_col: str = "qa_type",
-        case_context_col: str = "case_context",
-        question_col: str = "question",
-        answer_col: str = "answer_target",
-        claim_col: str = "claim_text",
-        evidence_ids_col: str = "evidence_chunk_ids_json",
-        evidence_w_col: str = "evidence_weights_json",
-        soft_support_col: str = "soft_support_score",
+        evidence_parquet: str | Path,
+        *,
+        id_col: str = "chunk_id",
+        text_col: str = "chunk_text",
+        preload: bool = False,
+        cache_row_groups: int = 2,
+        evidence_id_base: int = 0,
     ) -> None:
-        self.verifier_supervision_parquet = Path(verifier_supervision_parquet)
-        self.chunks_parquet = Path(chunks_parquet)
-        self.out_dir = Path(out_dir)
-        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self.evidence_path = Path(evidence_parquet)
+        if not self.evidence_path.exists():
+            raise FileNotFoundError(f"Evidence parquet not found: {self.evidence_path}")
 
-        self.chunk_id_col = str(chunk_id_col)
-        self.chunk_text_col = str(chunk_text_col)
+        self.id_col = str(id_col)
+        self.text_col = str(text_col)
+        self.preload = bool(preload)
+        self.cache_row_groups = int(cache_row_groups)
+        self.evidence_id_base = int(evidence_id_base)
 
-        self.max_evidence_chunks = int(max_evidence_chunks) if max_evidence_chunks is not None else None
-        self.min_evidence_weight = float(min_evidence_weight)
-        self.evidence_sep = str(evidence_sep)
+        self.pf = pq.ParquetFile(str(self.evidence_path))
+        schema_names = set(self.pf.schema.names)
+        if self.id_col not in schema_names or self.text_col not in schema_names:
+            raise ValueError(
+                f"Evidence parquet must contain columns '{self.id_col}' and '{self.text_col}'. "
+                f"Found: {sorted(schema_names)}"
+            )
 
-        self.parquet_batch_rows = int(parquet_batch_rows)
-        self.tqdm_desc = str(tqdm_desc)
-        self.parquet_compression = str(parquet_compression)
+        self._map: Optional[Dict[int, str]] = None
+        self._rg_cache: Dict[int, Dict[str, List]] = {}
+        self._rg_cache_order: List[int] = []
 
-        self.qa_row_id_col = str(qa_row_id_col)
-        self.patient_col = str(patient_col)
-        self.split_col = str(split_col)
-        self.report_id_col = str(report_id_col)
-        self.qa_type_col = str(qa_type_col)
-        self.case_context_col = str(case_context_col)
-        self.question_col = str(question_col)
-        self.answer_col = str(answer_col)
-        self.claim_col = str(claim_col)
-        self.evidence_ids_col = str(evidence_ids_col)
-        self.evidence_w_col = str(evidence_w_col)
-        self.soft_support_col = str(soft_support_col)
+        if self.preload:
+            self._preload_all()
 
-        self.out_parquet = self.out_dir / "verifier_train_materialized.parquet"
-        self.manifest_out = self.out_dir / "manifest_step7_chexpertplus.json"
+    def _preload_all(self) -> None:
+        m: Dict[int, str] = {}
+        for b in self.pf.iter_batches(batch_size=100_000, columns=[self.id_col, self.text_col]):
+            t = pa.Table.from_batches([b])
+            ids = t[self.id_col].to_pylist()
+            txt = t[self.text_col].to_pylist()
+            for i, s in zip(ids, txt):
+                try:
+                    m[int(i)] = "" if s is None else str(s)
+                except Exception:
+                    continue
+        self._map = m
 
-        self._schema: Optional[pa.Schema] = None
-        self._chunk_map: Optional[Dict[int, str]] = None
+    def _cache_put(self, rg: int, payload: Dict[str, List]) -> None:
+        self._rg_cache[rg] = payload
+        self._rg_cache_order.append(rg)
+        while len(self._rg_cache_order) > self.cache_row_groups:
+            old = self._rg_cache_order.pop(0)
+            self._rg_cache.pop(old, None)
 
-    def _safe_str(self, x) -> str:
-        if x is None:
-            return ""
-        s = str(x)
-        return "" if s.lower() == "nan" else s
+    def _get_rg_payload(self, rg: int) -> Dict[str, List]:
+        cached = self._rg_cache.get(rg)
+        if cached is not None:
+            return cached
+        t = self.pf.read_row_group(rg, columns=[self.id_col, self.text_col])
+        payload = {
+            self.id_col: t.column(self.id_col).to_pylist(),
+            self.text_col: t.column(self.text_col).to_pylist(),
+        }
+        self._cache_put(rg, payload)
+        return payload
 
-    def _loads_json_list(self, s: str) -> List:
+    def get(self, chunk_id: int) -> str:
+        chunk_id = int(chunk_id)
+        if self._map is not None:
+            return self._map.get(chunk_id, "")
+
+        for rg in range(self.pf.num_row_groups):
+            payload = self._get_rg_payload(rg)
+            ids = payload[self.id_col]
+            try:
+                for i, cid in enumerate(ids):
+                    if int(cid) == chunk_id:
+                        s = payload[self.text_col][i]
+                        return "" if s is None else str(s)
+            except Exception:
+                continue
+        return ""
+
+
+def create_fixed_chexpert_test_eval_parquet(
+    verifier_supervision_parquet: str | Path,
+    out_parquet: str | Path,
+    *,
+    evidence_parquet: str | Path,
+    evidence_id_col: str = "chunk_id",
+    evidence_text_col: str = "chunk_text",
+    evidence_id_base: int = 0,
+    preload_evidence_texts: bool = False,
+    evidence_join_delim: str = "\n\n---\n\n",
+    max_evidence_chars: int = 20_000,
+    split_value: str = "test",
+    parquet_batch_rows: int = 50_000,
+    parquet_compression: str = "zstd",
+    seed: int = 13,
+    write_manifest_json: bool = True,
+) -> Dict[str, object]:
+    """
+    Same as create_fixed_mimic_test_eval_parquet, but for CheXpert Step4 outputs.
+
+    Reads:
+      chexpert_step4c/verifier_supervision.parquet
+
+    Writes:
+      chexpert_test_eval.parquet
+
+    Output columns (same as MIMIC):
+      qa_row_id, subject_id, split, qa_type, case_context, question, answer_target, claim_text,
+      evidence_chunk_ids_json, evidence_text, soft_support_score,
+      report_length_bucket, device_present, uncertainty_present, label_vs_extractive
+    """
+    _ = np.random.RandomState(seed)
+
+    in_path = Path(verifier_supervision_parquet)
+    out_path = Path(out_parquet)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not in_path.exists():
+        raise FileNotFoundError(f"verifier_supervision_parquet not found: {in_path}")
+
+    ev_store = EvidenceTextStore(
+        evidence_parquet=evidence_parquet,
+        id_col=evidence_id_col,
+        text_col=evidence_text_col,
+        preload=preload_evidence_texts,
+        cache_row_groups=2,
+        evidence_id_base=evidence_id_base,
+    )
+
+    def _loads_json_list(s: str) -> List[int]:
         try:
-            return json.loads(s)
+            xs = json.loads(s)
+            return [int(x) for x in xs]
         except Exception:
             return []
 
-    def _normalize_text(self, s: str) -> str:
-        if s is None:
+    def _truncate(s: str) -> str:
+        s = "" if s is None else str(s)
+        if max_evidence_chars > 0 and len(s) > max_evidence_chars:
+            return s[:max_evidence_chars]
+        return s
+
+    def materialize_evidence(ids_json: str) -> str:
+        ids = _loads_json_list(str(ids_json))
+        if not ids:
             return ""
-        x = str(s)
-        if x.lower() == "nan":
-            return ""
-        return " ".join(x.split()).strip()
-
-    def _filter_and_truncate(self, ids: List[int], w: List[float]) -> Tuple[List[int], List[float]]:
-        if self.max_evidence_chunks is not None:
-            ids = ids[: self.max_evidence_chunks]
-            w = w[: self.max_evidence_chunks]
-
-        if self.min_evidence_weight > 0:
-            keep = [(i, ww) for i, ww in zip(ids, w) if float(ww) >= self.min_evidence_weight]
-            ids = [int(i) for i, _ in keep]
-            w = [float(ww) for _, ww in keep]
-
-        return ids, w
-
-    def _load_chunk_map(self) -> Dict[int, str]:
-        if not self.chunks_parquet.exists():
-            raise FileNotFoundError(f"chunks.parquet not found: {self.chunks_parquet}")
-
-        cols = [self.chunk_id_col, self.chunk_text_col]
-        df = pd.read_parquet(self.chunks_parquet, columns=cols)
-
-        df[self.chunk_id_col] = pd.to_numeric(df[self.chunk_id_col], errors="coerce")
-        df = df[~df[self.chunk_id_col].isna()].copy()
-        df[self.chunk_id_col] = df[self.chunk_id_col].astype(np.int64)
-
-        df[self.chunk_text_col] = df[self.chunk_text_col].astype(str).map(self._normalize_text)
-
-        chunk_map: Dict[int, str] = {}
-        for cid, txt in zip(df[self.chunk_id_col].tolist(), df[self.chunk_text_col].tolist()):
-            chunk_map[int(cid)] = txt
-
-        if not chunk_map:
-            raise RuntimeError("chunk_map is empty after loading chunks.parquet.")
-        return chunk_map
-
-    def _init_writer(self) -> pq.ParquetWriter:
-        self._schema = pa.schema(
-            [
-                ("qa_row_id", pa.int64()),
-                ("deid_patient_id", pa.int64()),
-                ("split", pa.string()),
-                ("report_id", pa.string()),
-                ("qa_type", pa.string()),
-                ("case_context", pa.string()),
-                ("question", pa.string()),
-                ("answer_target", pa.string()),
-                ("claim_text", pa.string()),
-                ("evidence_chunk_ids_json", pa.string()),
-                ("evidence_weights_json", pa.string()),
-                ("evidence_texts_json", pa.string()),
-                ("evidence_text_concat", pa.string()),
-                ("evidence_text", pa.string()),
-                ("soft_support_score", pa.float32()),
-            ]
-        )
-        return pq.ParquetWriter(
-            str(self.out_parquet),
-            schema=self._schema,
-            compression=self.parquet_compression,
-        )
-
-    def _coerce_df(self, df: pd.DataFrame) -> pd.DataFrame:
-        assert self._schema is not None
-
-        for c in self._schema.names:
-            if c not in df.columns:
-                df[c] = None
-
-        df["qa_row_id"] = pd.to_numeric(df["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
-        df["deid_patient_id"] = pd.to_numeric(df["deid_patient_id"], errors="coerce").fillna(-1).astype(np.int64)
-
-        for c in [
-            "split",
-            "report_id",
-            "qa_type",
-            "case_context",
-            "question",
-            "answer_target",
-            "claim_text",
-            "evidence_chunk_ids_json",
-            "evidence_weights_json",
-            "evidence_texts_json",
-            "evidence_text_concat",
-            "evidence_text",
-        ]:
-            df[c] = df[c].astype(str)
-
-        df["soft_support_score"] = pd.to_numeric(df["soft_support_score"], errors="coerce").fillna(0.0).astype(
-            np.float32
-        )
-        return df
-
-    def run(self) -> None:
-        if not self.verifier_supervision_parquet.exists():
-            raise FileNotFoundError(f"verifier_supervision.parquet not found: {self.verifier_supervision_parquet}")
-
-        self._chunk_map = self._load_chunk_map()
-        assert self._chunk_map is not None
-
-        pf = pq.ParquetFile(str(self.verifier_supervision_parquet))
-
-        in_cols = [
-            self.qa_row_id_col,
-            self.patient_col,
-            self.split_col,
-            self.report_id_col,
-            self.qa_type_col,
-            self.case_context_col,
-            self.question_col,
-            self.answer_col,
-            self.claim_col,
-            self.evidence_ids_col,
-            self.evidence_w_col,
-            self.soft_support_col,
-        ]
-
-        writer = self._init_writer()
-        assert self._schema is not None
-
-        total_rows = pf.metadata.num_rows if pf.metadata is not None else 0
-        pbar = tqdm(total=total_rows, desc=self.tqdm_desc, unit="rows", miniters=1)
-
-        written = 0
-        try:
-            for batch in pf.iter_batches(batch_size=self.parquet_batch_rows, columns=in_cols):
-                b = batch
-
-                qa_row_ids = b.column(b.schema.get_field_index(self.qa_row_id_col)).to_pylist()
-                patient_ids = b.column(b.schema.get_field_index(self.patient_col)).to_pylist()
-                splits = b.column(b.schema.get_field_index(self.split_col)).to_pylist()
-                report_ids = b.column(b.schema.get_field_index(self.report_id_col)).to_pylist()
-                qa_types = b.column(b.schema.get_field_index(self.qa_type_col)).to_pylist()
-                case_contexts = b.column(b.schema.get_field_index(self.case_context_col)).to_pylist()
-                questions = b.column(b.schema.get_field_index(self.question_col)).to_pylist()
-                answer_targets = b.column(b.schema.get_field_index(self.answer_col)).to_pylist()
-                claim_texts = b.column(b.schema.get_field_index(self.claim_col)).to_pylist()
-                ids_jsons = b.column(b.schema.get_field_index(self.evidence_ids_col)).to_pylist()
-                w_jsons = b.column(b.schema.get_field_index(self.evidence_w_col)).to_pylist()
-                scores = b.column(b.schema.get_field_index(self.soft_support_col)).to_pylist()
-
-                out_rows: List[Dict[str, object]] = []
-                n = len(qa_row_ids)
-
-                for i in range(n):
-                    qa_row_id = int(qa_row_ids[i]) if qa_row_ids[i] is not None else -1
-                    patient_id = int(patient_ids[i]) if patient_ids[i] is not None else -1
-                    split = self._safe_str(splits[i])
-
-                    report_id = self._safe_str(report_ids[i])
-                    qa_type = self._safe_str(qa_types[i])
-                    case_context = self._safe_str(case_contexts[i])
-                    question = self._safe_str(questions[i])
-                    answer_target = self._safe_str(answer_targets[i])
-                    claim_text = self._safe_str(claim_texts[i])
-
-                    ids = self._loads_json_list(self._safe_str(ids_jsons[i]))
-                    w = self._loads_json_list(self._safe_str(w_jsons[i]))
-
-                    ids = [int(x) for x in ids if str(x).strip() != ""]
-                    w = [float(x) for x in w]
-
-                    if len(ids) != len(w):
-                        m = min(len(ids), len(w))
-                        ids, w = ids[:m], w[:m]
-
-                    ids, w = self._filter_and_truncate(ids, w)
-                    if len(ids) != len(w):
-                        m = min(len(ids), len(w))
-                        ids, w = ids[:m], w[:m]
-
-                    texts: List[str] = []
-                    for cid in ids:
-                        txt = self._chunk_map.get(int(cid), "")
-                        texts.append(self._normalize_text(txt))
-
-                    evidence_concat = self.evidence_sep.join([t for t in texts if t.strip() != ""])
-                    evidence_text = evidence_concat
-
-                    try:
-                        soft_support_score = float(scores[i]) if scores[i] is not None else 0.0
-                    except Exception:
-                        soft_support_score = 0.0
-
-                    out_rows.append(
-                        asdict(
-                            VerifierMaterializedRowChexpert(
-                                qa_row_id=qa_row_id,
-                                deid_patient_id=patient_id,
-                                split=split,
-                                report_id=report_id,
-                                qa_type=qa_type,
-                                case_context=case_context,
-                                question=question,
-                                answer_target=answer_target,
-                                claim_text=claim_text,
-                                evidence_chunk_ids_json=json.dumps(ids),
-                                evidence_weights_json=json.dumps([float(x) for x in w]),
-                                evidence_texts_json=json.dumps(texts),
-                                evidence_text_concat=evidence_concat,
-                                evidence_text=evidence_text,
-                                soft_support_score=soft_support_score,
-                            )
-                        )
-                    )
-
-                out_df = pd.DataFrame(out_rows)
-                out_df = self._coerce_df(out_df)
-                table = pa.Table.from_pandas(out_df, schema=self._schema, preserve_index=False)
-                writer.write_table(table)
-
-                written += len(out_df)
-                pbar.update(len(out_df))
-
-        finally:
-            pbar.close()
-            writer.close()
-
-        manifest = {
-            "step": "7_chexpertplus",
-            "inputs": {
-                "verifier_supervision_parquet": str(self.verifier_supervision_parquet.resolve()),
-                "chunks_parquet": str(self.chunks_parquet.resolve()),
-            },
-            "outputs": {
-                "verifier_train_materialized": str(self.out_parquet.resolve()),
-                "manifest_step7": str(self.manifest_out.resolve()),
-            },
-            "params": {
-                "max_evidence_chunks": self.max_evidence_chunks,
-                "min_evidence_weight": self.min_evidence_weight,
-                "evidence_sep": self.evidence_sep,
-                "parquet_batch_rows": self.parquet_batch_rows,
-                "parquet_compression": self.parquet_compression,
-                "evidence_text_column": "evidence_text (alias of evidence_text_concat)",
-            },
-            "stats": {
-                "rows_written": int(written),
-                "num_chunks_in_map": int(len(self._chunk_map)),
-            },
-        }
-        self.manifest_out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-
-        print(f"Wrote: {self.out_parquet}  (rows={written:,})")
-        print(f"Wrote: {self.manifest_out}")
-
-
-
-
-
-
-
-
-def create_fixed_chexpertplus_test_eval_parquet(verifier_materialized_parquet: str | Path, out_parquet: str | Path, *,
-    split_value: str = "test", parquet_batch_rows: int = 50_000, parquet_compression: str = "zstd",
-    seed: int = 13, write_manifest_json: bool = True) -> Dict[str, object]:
-    """
-    Phase 1 — Freeze the CheXpert-Plus evaluation object.
-
-    Reads CheXpert Step 7 output:
-      step7_verifier_materialized_rstar_chexpertplus/verifier_train_materialized.parquet
-
-    Filters to split == "test" (split fixed upstream in CheXpert Step 6B and carried through 6C/7),
-    writes ONE immutable test artifact:
-      chexpertplus_test_eval.parquet
-
-    Output columns:
-      qa_row_id, deid_patient_id, split, qa_type, case_context, question, answer_target, claim_text,
-      evidence_chunk_ids_json, evidence_text, soft_support_score,
-      report_length_bucket, device_present, uncertainty_present, label_vs_extractive
-
-    Notes:
-      - Does NOT change any split.
-      - Does NOT touch retrieval; just freezes the test set.
-      - Streaming read/write (keeps memory stable).
-    """
-    _ = np.random.RandomState(seed)  # deterministic if you ever add sampling later (currently unused)
-
-    in_path = Path(verifier_materialized_parquet)
-    out_path = Path(out_parquet)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    if not in_path.exists():
-        raise FileNotFoundError(f"verifier_materialized_parquet not found: {in_path}")
+        chunks = [ev_store.get(cid) for cid in ids]
+        return _truncate(evidence_join_delim.join([c for c in chunks if c]))
 
     device_re = re.compile(
         r"\b("
@@ -2876,7 +2278,7 @@ def create_fixed_chexpertplus_test_eval_parquet(verifier_materialized_parquet: s
 
     required_in_cols = [
         "qa_row_id",
-        "deid_patient_id",
+        "subject_id",
         "split",
         "qa_type",
         "case_context",
@@ -2884,16 +2286,20 @@ def create_fixed_chexpertplus_test_eval_parquet(verifier_materialized_parquet: s
         "answer_target",
         "claim_text",
         "evidence_chunk_ids_json",
-        "evidence_text",
         "soft_support_score",
     ]
 
     pf = pq.ParquetFile(str(in_path))
+    schema_names = set(pf.schema.names)
+    for c in required_in_cols:
+        if c not in schema_names:
+            raise ValueError(f"Missing required column in CheXpert Step4 verifier supervision parquet: {c}")
 
+    # IMPORTANT: keep SAME column set as mimic; subject_id type here is string because CheXpert uses string ids.
     out_schema = pa.schema(
         [
             ("qa_row_id", pa.int64()),
-            ("deid_patient_id", pa.int64()),
+            ("subject_id", pa.string()),  # CheXpert: string ids
             ("split", pa.string()),
             ("qa_type", pa.string()),
             ("case_context", pa.string()),
@@ -2910,17 +2316,22 @@ def create_fixed_chexpertplus_test_eval_parquet(verifier_materialized_parquet: s
         ]
     )
 
-    writer = pq.ParquetWriter(
-        str(out_path),
-        schema=out_schema,
-        compression=parquet_compression,
-    )
+    writer = pq.ParquetWriter(str(out_path), schema=out_schema, compression=parquet_compression)
 
     total_rows = pf.metadata.num_rows if pf.metadata is not None else 0
-    pbar = tqdm(total=total_rows, desc="Phase 1: freezing chexpertplus_test_eval.parquet", unit="rows", miniters=1)
+    pbar = tqdm(total=total_rows, desc="Phase 1: freezing chexpert_test_eval.parquet", unit="rows", miniters=1)
+
+    subj_set: set[str] = set()
+    qa_type_ctr = Counter()
+    bucket_ctr = Counter()
+    device_ctr = Counter()
+    uncert_ctr = Counter()
+    label_ctr = Counter()
+    target_stats = _RunningStats()
 
     written = 0
     kept = 0
+
     try:
         for batch in pf.iter_batches(batch_size=parquet_batch_rows, columns=required_in_cols):
             df = batch.to_pandas()
@@ -2935,34 +2346,31 @@ def create_fixed_chexpertplus_test_eval_parquet(verifier_materialized_parquet: s
             d = df.loc[mask].copy()
 
             d["qa_row_id"] = pd.to_numeric(d["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
-            d["deid_patient_id"] = pd.to_numeric(d["deid_patient_id"], errors="coerce").fillna(-1).astype(np.int64)
-            d["soft_support_score"] = pd.to_numeric(d["soft_support_score"], errors="coerce").fillna(0.0).astype(
-                np.float32
-            )
+            d["subject_id"] = d["subject_id"].astype(str)
+            d["soft_support_score"] = pd.to_numeric(d["soft_support_score"], errors="coerce").fillna(0.0).astype(np.float32)
 
-            for c in [
-                "split",
-                "qa_type",
-                "case_context",
-                "question",
-                "answer_target",
-                "claim_text",
-                "evidence_chunk_ids_json",
-                "evidence_text",
-            ]:
+            for c in ["split", "qa_type", "case_context", "question", "answer_target", "claim_text", "evidence_chunk_ids_json"]:
                 d[c] = d[c].astype(str)
+
+            d["evidence_text"] = d["evidence_chunk_ids_json"].map(materialize_evidence).astype(str)
 
             d["report_length_bucket"] = d["case_context"].map(report_length_bucket).astype(str)
             d["device_present"] = d["case_context"].map(lambda x: 1 if device_re.search(str(x)) else 0).astype(np.int8)
-            d["uncertainty_present"] = d["case_context"].map(lambda x: 1 if uncertainty_re.search(str(x)) else 0).astype(
-                np.int8
-            )
+            d["uncertainty_present"] = d["case_context"].map(lambda x: 1 if uncertainty_re.search(str(x)) else 0).astype(np.int8)
             d["label_vs_extractive"] = d["qa_type"].map(label_vs_extractive_flag).astype(str)
+
+            subj_set.update(d["subject_id"].tolist())
+            qa_type_ctr.update(d["qa_type"].tolist())
+            bucket_ctr.update(d["report_length_bucket"].tolist())
+            device_ctr.update(map(int, d["device_present"].tolist()))
+            uncert_ctr.update(map(int, d["uncertainty_present"].tolist()))
+            label_ctr.update(d["label_vs_extractive"].tolist())
+            target_stats.update(d["soft_support_score"].to_numpy())
 
             d = d[
                 [
                     "qa_row_id",
-                    "deid_patient_id",
+                    "subject_id",
                     "split",
                     "qa_type",
                     "case_context",
@@ -2990,12 +2398,67 @@ def create_fixed_chexpertplus_test_eval_parquet(verifier_materialized_parquet: s
         pbar.close()
         writer.close()
 
+    summary = {
+        "basic_info": {
+            "rows": int(kept),
+            "unique_subjects": int(len(subj_set)),
+            "qa_types": int(len(qa_type_ctr)),
+        },
+        "qa_type_distribution": dict(qa_type_ctr),
+        "report_length_bucket": dict(bucket_ctr),
+        "device_present": dict(device_ctr),
+        "uncertainty_present": dict(uncert_ctr),
+        "label_vs_extractive": dict(label_ctr),
+        "target_statistics_soft_support_score": target_stats.as_dict(),
+    }
+
+    print("==== BASIC INFO ====")
+    print("Rows:", summary["basic_info"]["rows"])
+    print("Unique subjects:", summary["basic_info"]["unique_subjects"])
+    print("QA types:", summary["basic_info"]["qa_types"])
+    print()
+
+    print("==== QA TYPE DISTRIBUTION ====")
+    print(pd.Series(summary["qa_type_distribution"]).sort_values(ascending=False))
+    print()
+
+    print("==== REPORT LENGTH BUCKET ====")
+    print(pd.Series(summary["report_length_bucket"]).sort_values(ascending=False))
+    print()
+
+    print("==== DEVICE PRESENT ====")
+    print(pd.Series(summary["device_present"]).sort_index())
+    print()
+
+    print("==== UNCERTAINTY PRESENT ====")
+    print(pd.Series(summary["uncertainty_present"]).sort_index())
+    print()
+
+    print("==== LABEL vs EXTRACTIVE ====")
+    print(pd.Series(summary["label_vs_extractive"]).sort_values(ascending=False))
+    print()
+
+    print("==== TARGET STATISTICS (soft_support_score) ====")
+    ts = summary["target_statistics_soft_support_score"]
+    print("Min:", ts["min"])
+    print("Max:", ts["max"])
+    print("Mean:", ts["mean"])
+    print("Std:", ts["std"])
+
     manifest = {
         "phase": "1",
-        "dataset": "chexpertplus",
         "input": str(in_path.resolve()),
         "output": str(out_path.resolve()),
         "filter": {"split_value": split_value},
+        "evidence_materialization": {
+            "evidence_parquet": str(Path(evidence_parquet).resolve()),
+            "evidence_id_col": evidence_id_col,
+            "evidence_text_col": evidence_text_col,
+            "evidence_id_base": int(evidence_id_base),
+            "preload_evidence_texts": bool(preload_evidence_texts),
+            "evidence_join_delim": evidence_join_delim,
+            "max_evidence_chars": int(max_evidence_chars),
+        },
         "params": {
             "parquet_batch_rows": int(parquet_batch_rows),
             "parquet_compression": str(parquet_compression),
@@ -3011,80 +2474,18 @@ def create_fixed_chexpertplus_test_eval_parquet(verifier_materialized_parquet: s
             "input_rows_seen": int(written),
             "rows_written": int(kept),
         },
+        "prints_saved": summary,
     }
 
     if write_manifest_json:
-        manifest_path = out_path.parent / "manifest_phase1_test_eval_chexpertplus.json"
+        manifest_path = out_path.parent / "manifest_phase1_test_eval.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     print(f"Wrote: {out_path}  (rows={kept:,})")
     if write_manifest_json:
-        print(f"Wrote: {out_path.parent / 'manifest_phase1_test_eval_chexpertplus.json'}")
+        print(f"Wrote: {out_path.parent / 'manifest_phase1_test_eval.json'}")
 
     return manifest
-
-
-
-
-
-
-def print_test_eval_stats(test_eval_parquet: str):
-    df = pd.read_parquet(test_eval_parquet)
-
-    # pick the id column that exists
-    if "subject_id" in df.columns:
-        id_col = "subject_id"
-        id_name = "subjects"
-    elif "deid_patient_id" in df.columns:
-        id_col = "deid_patient_id"
-        id_name = "patients"
-    else:
-        id_col = None
-        id_name = "ids"
-
-    print("==== BASIC INFO ====")
-    print("Rows:", len(df))
-    if id_col is not None:
-        print(f"Unique {id_name}:", df[id_col].nunique())
-    else:
-        print("Unique ids: N/A (no subject_id or deid_patient_id column found)")
-    print("QA types:", df["qa_type"].nunique() if "qa_type" in df.columns else "N/A")
-    print()
-
-    def vc(col):
-        if col not in df.columns:
-            print(f"(missing column: {col})\n")
-            return
-        print(df[col].value_counts(dropna=False))
-        print()
-
-    print("==== QA TYPE DISTRIBUTION ====")
-    vc("qa_type")
-
-    print("==== REPORT LENGTH BUCKET ====")
-    vc("report_length_bucket")
-
-    print("==== DEVICE PRESENT ====")
-    vc("device_present")
-
-    print("==== UNCERTAINTY PRESENT ====")
-    vc("uncertainty_present")
-
-    print("==== LABEL vs EXTRACTIVE ====")
-    vc("label_vs_extractive")
-
-    print("==== TARGET STATISTICS (soft_support_score) ====")
-    if "soft_support_score" in df.columns:
-        s = pd.to_numeric(df["soft_support_score"], errors="coerce")
-        print("Min:", float(s.min()))
-        print("Max:", float(s.max()))
-        print("Mean:", float(s.mean()))
-        print("Std:", float(s.std()))
-    else:
-        print("(missing column: soft_support_score)")
-
-
-
 
 
 
@@ -3104,12 +2505,12 @@ if __name__ == "__main__":
     #     out_path=os.path.join(base_path_chexpertData, "chexpertplus_case_contexts.csv"),
     # )
     # out_df = builder.build_case_context_table()
-    # print(out_df[["report_id", "deid_patient_id", "case_context"]].head(3))
+    # print(out_df[["report_id", "subject_id", "case_context"]].head(3))
     # print("Rows:", len(out_df))
-
-
-
-    ''' steps 2 & 3 '''
+    #
+    #
+    #
+    # ''' steps 2 & 3 '''
     # builder = ChexpertPlusFactsAndQABuilder(
     #     master_csv=os.path.join(base_path_chexpertData, "chexpert_plus_reports.csv"),
     #     case_context_csv=os.path.join(base_path_chexpertData, "chexpertplus_case_contexts.csv"),
@@ -3121,78 +2522,37 @@ if __name__ == "__main__":
 
 
 
-
-    ''' step 6B '''
-    builder = ChexpertPlusRStarWeakEvidenceAligner(
-        qa_csv=os.path.join(base_path_chexpertData, "chexpertplus_qa_step3.csv"),
-        chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
-        faiss_index=os.path.join(base_path_evidenceData, "step6_faiss_rstar", "faiss_Rstar.index"),
-        chunk_ids_npy=os.path.join(base_path_evidenceData, "step6_faiss_rstar", "chunk_ids.npy"),
-        out_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step6b_Rstar_chexpertplus.parquet"),
-        model_name=params["Preprocessing"]["tokenizer_name"],
-        rstar_query_encoder_ckpt=model_weights_path,
-        top_k=20,
-        alpha=0.85,
-        temperature=0.07,
-        seed=13,
-        device="cuda",
-        use_lexical=True,
-        # split
-        split_seed=13,
-        frac_train=0.75,
-        frac_valid=0.10,
-        frac_test=0.15,
-    )
-    builder.run()
+    ''' step 4C '''
+    # builder = CheXpertRadiopaediaStep4ExternalTestBuilder(
+    #     qa_csv=os.path.join(base_path_chexpertData, "chexpertplus_qa_step3.csv"),
+    #     chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
+    #     out_dir=os.path.join(base_path_evidenceData, "chexpert_step4c"),
+    #     top_k=20,
+    #     alpha=0.85,
+    #     temperature=0.07,
+    #     seed=13,
+    # )
+    # builder.run()
 
 
 
-
-    ''' step 6C '''
-    builder = ChexpertPlusStep6CSupervisionBuilder(
-        qa_csv=os.path.join(base_path_chexpertData, "chexpertplus_qa_step3.csv"),
-        weak_alignment_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step6b_Rstar_chexpertplus.parquet"),
-        out_dir=os.path.join(base_path_evidenceData, "step6c_supervision_rstar_chexpertplus"),
-        top_k=20,
-        min_weight=0.0,
-        qa_chunksize_rows=50_000,
-        parquet_batch_rows=50_000,
-        # allowed_splits=["train", "valid"],
-    )
-    builder.run()
+    ''' Creating the final mimic eval parquet from Step 4C '''
+    verifier_supervision_parquet = os.path.join(base_path_evidenceData, "chexpert_step4c", "verifier_supervision.parquet")
+    radiopaedia_chunks_parquet = os.path.join(base_path_evidenceData, "chunks.parquet")
+    out_eval_parquet = os.path.join(base_path_evidenceData, "phase1_fixed_test_eval_chexpertplus", "chexpertplus_test_eval.parquet")
 
 
-
-
-
-    ''' step 7 '''
-    builder = ChexpertPlusStep7VerifierMaterializer(
-        verifier_supervision_parquet=os.path.join(
-            base_path_evidenceData,
-            "step6c_supervision_rstar_chexpertplus/verifier_supervision.parquet",
-        ),
-        chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
-        out_dir=os.path.join(base_path_evidenceData, "step7_verifier_materialized_rstar_chexpertplus"),
-        max_evidence_chunks=20,
-        min_evidence_weight=0.0,
+    create_fixed_chexpert_test_eval_parquet(
+        verifier_supervision_parquet=verifier_supervision_parquet,
+        out_parquet=out_eval_parquet,
+        evidence_parquet=radiopaedia_chunks_parquet,
+        evidence_id_col="chunk_id",
+        evidence_text_col="chunk_text",
+        evidence_id_base=0,  # change to 1 if ids start from 1
+        preload_evidence_texts=False,
+        split_value="test",
         parquet_batch_rows=50_000,
         parquet_compression="zstd",
+        seed=13,
+        write_manifest_json=True,
     )
-    builder.run()
-
-
-
-
-
-    ''' Creating the final mimic test parquet '''
-    in_parquet = os.path.join(base_path_evidenceData, "step7_verifier_materialized_rstar_chexpertplus",
-        "verifier_train_materialized.parquet")
-
-    out_parquet = os.path.join(base_path_evidenceData, "phase1_fixed_test_eval_chexpertplus",
-        "chexpertplus_test_eval.parquet")
-
-    create_fixed_chexpertplus_test_eval_parquet(verifier_materialized_parquet=in_parquet,
-        out_parquet=out_parquet, split_value="test", parquet_batch_rows=50_000,
-        parquet_compression="zstd", seed=13, write_manifest_json=True)
-
-    print_test_eval_stats(test_eval_parquet=os.path.join(base_path_evidenceData, "phase1_fixed_test_eval_chexpertplus", "chexpertplus_test_eval.parquet"))

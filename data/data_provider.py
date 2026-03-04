@@ -93,7 +93,7 @@ class RetrieverSupervisionDataset(Dataset):
         self.chunks_store = chunks_store
         self.top_k = int(top_k)
         self.min_pos_weight = float(min_pos_weight)
-        self.base_path = self.params["paths"]["base_path"]
+        self.base_path = self.params["Preprocessing"]["base_path_evidenceData"]
 
         retriever_supervision_path = os.path.join(self.base_path, "step4c_supervision/retriever_supervision.parquet")
         df = pd.read_parquet(retriever_supervision_path)
@@ -228,63 +228,147 @@ def retriever_collate_fn(batch: List[Dict], top_k: int) -> Optional[RetrieverBat
 
 
 
-
 @dataclass(frozen=True)
 class VerifierBatch:
-    inputs: List[str]                 # B (full text fed to DeBERTa)
-    targets: torch.Tensor             # (B,) float32 soft_support_score
-    qa_row_ids: Optional[List[int]]   # for debugging / analysis
+    inputs: List[str]
+    targets: torch.Tensor
+    qa_row_ids: Optional[List[int]]
+
+
+class EvidenceTextStore:
+    """
+    Deterministic chunk_id -> chunk_text lookup.
+
+    Assumption (recommended / most common in your pipeline):
+      chunk_id is the *row index* in the evidence parquet (0-based).
+    If your chunk ids are 1-based, set id_base=1.
+
+    Two modes:
+      - preload=True: loads all texts to RAM once per worker (fastest at runtime).
+      - preload=False: row-group cached reads (lower RAM, slower).
+    """
+
+    def __init__(
+        self,
+        evidence_parquet_path: str,
+        text_col: str = "chunk_text",
+        id_base: int = 0,  # 0 if chunk ids are 0..M-1, 1 if 1..M
+        preload: bool = False,
+        cache_row_groups: int = 2,
+    ) -> None:
+        if not os.path.exists(evidence_parquet_path):
+            raise FileNotFoundError(f"Evidence parquet not found: {evidence_parquet_path}")
+
+        self.path = evidence_parquet_path
+        self.text_col = str(text_col)
+        self.id_base = int(id_base)
+        self.preload = bool(preload)
+        self.cache_row_groups = int(cache_row_groups)
+
+        self.pf = pq.ParquetFile(self.path)
+        if self.text_col not in set(self.pf.schema.names):
+            raise ValueError(f"Evidence parquet missing required text column: {self.text_col}")
+
+        # Row group metadata for O(1) mapping row_idx -> (rg, offset)
+        self._rg_num_rows = [self.pf.metadata.row_group(i).num_rows for i in range(self.pf.num_row_groups)]
+        self._rg_prefix = np.cumsum([0] + self._rg_num_rows).tolist()  # len = num_rgs + 1
+        self._total_rows = self._rg_prefix[-1]
+
+        self._rg_cache: Dict[int, List[str]] = {}
+        self._rg_cache_order: List[int] = []
+
+        self._texts: Optional[List[str]] = None
+        if self.preload:
+            # Load all chunk texts into RAM once (per worker/process).
+            # This is fast at training time but can be memory heavy.
+            self._texts = self.pf.read(columns=[self.text_col]).column(0).to_pylist()
+
+    def _cache_put(self, rg: int, texts: List[str]) -> None:
+        self._rg_cache[rg] = texts
+        self._rg_cache_order.append(rg)
+        while len(self._rg_cache_order) > self.cache_row_groups:
+            old = self._rg_cache_order.pop(0)
+            self._rg_cache.pop(old, None)
+
+    def _row_to_rg(self, row_idx: int) -> Tuple[int, int]:
+        # binary search over prefix sums
+        lo, hi = 0, len(self._rg_prefix) - 2
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if self._rg_prefix[mid] <= row_idx < self._rg_prefix[mid + 1]:
+                return mid, row_idx - self._rg_prefix[mid]
+            if row_idx < self._rg_prefix[mid]:
+                hi = mid - 1
+            else:
+                lo = mid + 1
+        raise IndexError(f"row_idx out of range: {row_idx}")
+
+    def get(self, chunk_id: int) -> str:
+        if chunk_id is None:
+            return ""
+        try:
+            row_idx = int(chunk_id) - self.id_base
+        except Exception:
+            return ""
+
+        if row_idx < 0 or row_idx >= self._total_rows:
+            return ""
+
+        if self._texts is not None:
+            x = self._texts[row_idx]
+            return "" if x is None or str(x).lower() == "nan" else str(x)
+
+        rg, off = self._row_to_rg(row_idx)
+        cached = self._rg_cache.get(rg)
+        if cached is None:
+            t = self.pf.read_row_group(rg, columns=[self.text_col])
+            cached = t.column(0).to_pylist()
+            self._cache_put(rg, cached)
+
+        x = cached[off]
+        return "" if x is None or str(x).lower() == "nan" else str(x)
 
 
 class VerifierSupervisionDataset(Dataset):
     """
-    Memory-safe, fast map-style Dataset for large materialized verifier parquet.
+    Reads Step 4C verifier_supervision.parquet and materializes evidence text on-the-fly
+    using a frozen evidence chunk store (Radiopaedia chunks).
 
-    Works with Step 7 output (updated):
-      - evidence_text exists (alias of evidence_text_concat)
-      - evidence_text_concat may also exist (kept for debugging)
-
-    Strategy:
-      1) Build an index of rows belonging to split_name WITHOUT converting to pandas:
-         stores (row_group_id, row_in_group) for each selected row.
-      2) In __getitem__, load the needed row-group (cached), fetch row fields, build input text.
-
-    Avoids:
-      - pd.read_parquet() loading the entire file into RAM
-      - huge Arrow->pandas string object blowups
-      - per-sample random disk reads (we read row groups, not single rows)
-
-    Notes:
-      - Each DataLoader worker has its own cache.
-      - Keep num_workers moderate (2-8). More workers means more caches.
+    This replaces the old Step 7 "materialized evidence_text" dependency.
     """
 
     def __init__(
         self,
         cfg_path: str,
         split_name: str,
-        # paths
-        materialized_relpath: str = "step7_verifier_materialized_rstar/verifier_train_materialized.parquet",
-        # columns
+        # Step 4C supervision parquet
+        supervision_relpath: str = "step4c_supervision/verifier_supervision.parquet",
+        # Evidence chunk table (must contain chunk_text column; chunk_id must map to row index)
+        evidence_parquet_relpath: str = "chunks.parquet",
+        evidence_text_col: str = "chunk_text",
+        evidence_id_base: int = 0,  # set to 1 if your chunk ids are 1..M
+        preload_evidence_texts: bool = False,
+        evidence_cache_row_groups: int = 2,
+        # columns in Step 4C verifier_supervision.parquet
         split_col: str = "split",
         qa_row_id_col: str = "qa_row_id",
         case_context_col: str = "case_context",
         question_col: str = "question",
         answer_col: str = "answer_target",
         claim_col: str = "claim_text",
-        evidence_text_col: str = "evidence_text",           # preferred (new Step 7)
-        evidence_text_fallback_col: str = "evidence_text_concat",  # fallback if older file
+        evidence_ids_col: str = "evidence_chunk_ids_json",
         target_col: str = "soft_support_score",
         # formatting
+        evidence_separator: str = "\n\n---\n\n",
         max_evidence_chars: int = 20_000,
         join_with_newlines: bool = True,
         # performance knobs
-        cache_row_groups: int = 2,   # how many row groups to keep in-memory per worker
+        cache_row_groups: int = 2,
         assume_split_is_string: bool = True,
     ) -> None:
         self.cfg_path = cfg_path
         self.params = read_config(cfg_path)
-        self.base_path = self.params["paths"]["base_path"]
+        self.base_path = self.params["Preprocessing"]["base_path_evidenceData"]
 
         self.split_name = str(split_name)
 
@@ -294,57 +378,53 @@ class VerifierSupervisionDataset(Dataset):
         self.question_col = str(question_col)
         self.answer_col = str(answer_col)
         self.claim_col = str(claim_col)
-        self.evidence_text_col = str(evidence_text_col)
-        self.evidence_text_fallback_col = str(evidence_text_fallback_col)
+        self.evidence_ids_col = str(evidence_ids_col)
         self.target_col = str(target_col)
 
+        self.evidence_separator = str(evidence_separator)
         self.max_evidence_chars = int(max_evidence_chars)
         self.join_with_newlines = bool(join_with_newlines)
 
         self.cache_row_groups = int(cache_row_groups)
         self.assume_split_is_string = bool(assume_split_is_string)
 
-        self.materialized_path = os.path.join(self.base_path, materialized_relpath)
-        if not os.path.exists(self.materialized_path):
-            raise FileNotFoundError(f"Materialized verifier parquet not found: {self.materialized_path}")
+        self.supervision_path = os.path.join(self.base_path, supervision_relpath)
+        if not os.path.exists(self.supervision_path):
+            raise FileNotFoundError(f"Verifier supervision parquet not found: {self.supervision_path}")
 
-        # Open parquet lazily
-        self.pf = pq.ParquetFile(self.materialized_path)
+        self.pf = pq.ParquetFile(self.supervision_path)
 
-        # Validate columns exist without loading data
         schema_names = set(self.pf.schema.names)
-        required_base = [
+        required = [
             self.split_col,
             self.case_context_col,
             self.question_col,
             self.answer_col,
             self.claim_col,
+            self.evidence_ids_col,
             self.target_col,
         ]
-        for c in required_base:
+        for c in required:
             if c not in schema_names:
-                raise ValueError(f"Missing required column in verifier materialized parquet: {c}")
-
-        # Evidence column selection:
-        # - prefer evidence_text (new Step 7)
-        # - fallback to evidence_text_concat (older Step 7)
-        if self.evidence_text_col in schema_names:
-            self._evidence_col_in_file = self.evidence_text_col
-        elif self.evidence_text_fallback_col in schema_names:
-            self._evidence_col_in_file = self.evidence_text_fallback_col
-        else:
-            raise ValueError(
-                f"Missing evidence text column. Expected '{self.evidence_text_col}' or "
-                f"fallback '{self.evidence_text_fallback_col}'."
-            )
+                raise ValueError(f"Missing required column in verifier_supervision.parquet: {c}")
 
         self.has_qa_row_id = self.qa_row_id_col in schema_names
 
-        # Build split index: list of (row_group_id, row_in_group)
+        # Evidence store
+        evidence_path = os.path.join(self.base_path, evidence_parquet_relpath)
+        self.evidence_store = EvidenceTextStore(
+            evidence_parquet_path=evidence_path,
+            text_col=evidence_text_col,
+            id_base=evidence_id_base,
+            preload=preload_evidence_texts,
+            cache_row_groups=evidence_cache_row_groups,
+        )
+
+        # Build split index (row-group + row offset)
         self._rg_row_index: List[Tuple[int, int]] = []
         self._build_split_index()
 
-        # Row-group cache (per-process/worker)
+        # Row-group cache for supervision parquet
         self._rg_cache: Dict[int, Dict[str, List]] = {}
         self._rg_cache_order: List[int] = []
 
@@ -352,20 +432,14 @@ class VerifierSupervisionDataset(Dataset):
         for rg in range(self.pf.num_row_groups):
             t = self.pf.read_row_group(rg, columns=[self.split_col])
             split_arr = t.column(0)
+            split_list = split_arr.to_pylist()
 
-            if self.assume_split_is_string:
-                split_list = split_arr.to_pylist()
-                for i, s in enumerate(split_list):
-                    if str(s) == self.split_name:
-                        self._rg_row_index.append((rg, i))
-            else:
-                split_list = [str(x) for x in split_arr.to_pylist()]
-                for i, s in enumerate(split_list):
-                    if s == self.split_name:
-                        self._rg_row_index.append((rg, i))
+            for i, s in enumerate(split_list):
+                if str(s) == self.split_name:
+                    self._rg_row_index.append((rg, i))
 
         if len(self._rg_row_index) == 0:
-            print(f"[WARN] No rows found for split='{self.split_name}' in {self.materialized_path}")
+            print(f"[WARN] No rows found for split='{self.split_name}' in {self.supervision_path}")
 
     def __len__(self) -> int:
         return len(self._rg_row_index)
@@ -376,11 +450,28 @@ class VerifierSupervisionDataset(Dataset):
         s = str(x)
         return "" if s.lower() == "nan" else s
 
+    def _loads_json_list(self, s: str) -> List:
+        try:
+            return json.loads(s)
+        except Exception:
+            return []
+
     def _truncate_evidence(self, s: str) -> str:
         s = self._safe_str(s)
         if self.max_evidence_chars > 0 and len(s) > self.max_evidence_chars:
             return s[: self.max_evidence_chars]
         return s
+
+    def _materialize_evidence(self, evidence_ids_json: str) -> str:
+        ids = self._loads_json_list(self._safe_str(evidence_ids_json))
+        out_chunks: List[str] = []
+        for cid in ids:
+            try:
+                out_chunks.append(self.evidence_store.get(int(cid)))
+            except Exception:
+                out_chunks.append("")
+        joined = self.evidence_separator.join([x for x in out_chunks if x])
+        return self._truncate_evidence(joined)
 
     def _build_input_text(
         self,
@@ -402,18 +493,16 @@ class VerifierSupervisionDataset(Dataset):
                 "CLAIM:",
                 self._safe_str(claim_text).strip(),
                 "EVIDENCE:",
-                self._truncate_evidence(evidence_text).strip(),
+                self._safe_str(evidence_text).strip(),
             ]
         )
 
     def _cache_put(self, rg: int, payload: Dict[str, List]) -> None:
         self._rg_cache[rg] = payload
         self._rg_cache_order.append(rg)
-
         while len(self._rg_cache_order) > self.cache_row_groups:
             old = self._rg_cache_order.pop(0)
-            if old in self._rg_cache:
-                del self._rg_cache[old]
+            self._rg_cache.pop(old, None)
 
     def _get_row_group_columns(self, rg: int) -> Dict[str, List]:
         cached = self._rg_cache.get(rg)
@@ -425,17 +514,14 @@ class VerifierSupervisionDataset(Dataset):
             self.question_col,
             self.answer_col,
             self.claim_col,
-            self._evidence_col_in_file,  # selected evidence column
+            self.evidence_ids_col,
             self.target_col,
         ]
         if self.has_qa_row_id:
             cols.append(self.qa_row_id_col)
 
         t = self.pf.read_row_group(rg, columns=cols)
-
-        payload: Dict[str, List] = {}
-        for c in cols:
-            payload[c] = t.column(c).to_pylist()
+        payload: Dict[str, List] = {c: t.column(c).to_pylist() for c in cols}
 
         self._cache_put(rg, payload)
         return payload
@@ -456,7 +542,9 @@ class VerifierSupervisionDataset(Dataset):
         question = payload[self.question_col][row_in_group]
         answer_target = payload[self.answer_col][row_in_group]
         claim_text = payload[self.claim_col][row_in_group]
-        evidence_text = payload[self._evidence_col_in_file][row_in_group]
+        evidence_ids_json = payload[self.evidence_ids_col][row_in_group]
+
+        evidence_text = self._materialize_evidence(evidence_ids_json)
 
         input_text = self._build_input_text(
             case_context=case_context,
@@ -474,22 +562,11 @@ class VerifierSupervisionDataset(Dataset):
         return {"qa_row_id": qa_row_id, "input_text": input_text, "target": target}
 
 
-
-
-
 class NonRepeatingChunkSampler(Sampler[int]):
-    """
-    Produces non-overlapping chunks of indices across rounds.
-    Each 'round' yields exactly chunk_size unique indices, until exhausted,
-    then reshuffles and continues.
-
-    Use with DataLoader(..., shuffle=False, sampler=..., drop_last=True/False).
-    """
-
     def __init__(
         self,
         data_source,
-        chunk_size: int = 200_000,
+        chunk_size: int = 100_000,
         seed: int = 13,
         drop_last: bool = True,
     ):
@@ -504,7 +581,6 @@ class NonRepeatingChunkSampler(Sampler[int]):
         if self.N <= 0:
             raise ValueError("Dataset is empty")
 
-        # Create a single global permutation; we will consume it in chunks.
         g = torch.Generator()
         g.manual_seed(self.seed)
         self._perm = torch.randperm(self.N, generator=g).tolist()
@@ -512,17 +588,11 @@ class NonRepeatingChunkSampler(Sampler[int]):
         self._round = 0
 
     def set_round(self, round_idx: int) -> None:
-        """
-        Optional: force sampler to advance/align to a specific round.
-        Useful if you want reproducible resume behavior.
-        """
         round_idx = int(round_idx)
         if round_idx < 0:
             round_idx = 0
         self._round = round_idx
         self._cursor = round_idx * self.chunk_size
-
-        # If cursor goes beyond N, wrap by reshuffling enough times
         while self._cursor >= self.N:
             self._reshuffle()
             self._cursor = max(0, self._cursor - self.N)
@@ -530,13 +600,11 @@ class NonRepeatingChunkSampler(Sampler[int]):
     def _reshuffle(self) -> None:
         self._round += 1
         g = torch.Generator()
-        # change seed each reshuffle deterministically
         g.manual_seed(self.seed + self._round)
         self._perm = torch.randperm(self.N, generator=g).tolist()
         self._cursor = 0
 
     def __iter__(self) -> Iterator[int]:
-        # If not enough for a full chunk, either return the remainder or reshuffle.
         if self._cursor >= self.N:
             self._reshuffle()
 
@@ -546,27 +614,17 @@ class NonRepeatingChunkSampler(Sampler[int]):
             self._cursor = end
             return iter(out)
 
-        # crossing boundary
         remainder = self._perm[self._cursor:self.N]
         self._cursor = self.N
 
         if self.drop_last:
-            # to guarantee exactly chunk_size every round, reshuffle and take a fresh full chunk next time
             self._reshuffle()
-            return iter(remainder)  # NOTE: will be < chunk_size; DataLoader drop_last=True should drop it anyway
+            return iter(remainder)
         else:
-            # allow smaller last chunk
             return iter(remainder)
 
     def __len__(self) -> int:
-        # This is the number of samples yielded per "round"
-        if self.drop_last:
-            # We want exactly chunk_size in principle; DataLoader drop_last=True will ensure fixed batch count.
-            return min(self.chunk_size, self.N)
-        else:
-            return min(self.chunk_size, self.N)
-
-
+        return min(self.chunk_size, self.N)
 
 
 def verifier_collate_fn(batch: List[Dict]) -> VerifierBatch:
