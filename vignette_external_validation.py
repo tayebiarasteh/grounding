@@ -3017,13 +3017,16 @@ class VignetteS2Tier123End2EndEvaluator:
         df = pd.DataFrame(rows)
 
         # round ALL numeric values to 3 decimals
-        df["Value"] = pd.to_numeric(df["Value"], errors="ignore")
-        df["Value"] = df["Value"].apply(lambda x: round(float(x), 3) if isinstance(x, (int, float)) else x)
+        try:
+            df["Value"] = pd.to_numeric(df["Value"], errors="ignore")
+            df["Value"] = df["Value"].apply(lambda x: round(float(x), 3) if isinstance(x, (int, float)) else x)
 
-        df.to_csv(out_csv, index=False)
+            df.to_csv(out_csv, index=False)
+        except:
+            df.to_csv(out_csv, index=False)
+
         print(f"Saved: {out_csv}")
         print(df.head(20).to_string(index=False))
-
 
 
         return summary_path
@@ -4228,53 +4231,53 @@ if __name__ == "__main__":
 
 
     ''' S4 Vignette '''
-    runner = VignetteS4Tier123End2EndEvaluator(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        model_weights_path=model_weights_path,
-        verifier_weights_path=verifier_weights_path,
-        vignette_paths=VignetteEvalPaths(
-            csv_4option=os.path.join(base_path_chexpertData, "Vignette_4option.csv"),
-            csv_5option=os.path.join(base_path_chexpertData, "Vignette_5option.csv"),
-        ),
-        device="cuda",
-        top_k=20,
-        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-        batch_size_retrieve=256,
-        batch_size_verify=4,
-        ece_bins=15,
-        seed=13,
-        faithfulness_random_trials=1,
-        out_dir=os.path.join(base_path_evidenceData, "external_validation", "Vignette", "tier123_results_s4_end2end"),
-    )
-    runner.run()
+    # runner = VignetteS4Tier123End2EndEvaluator(
+    #     cfg_path=global_config_path,
+    #     experiment_name=experiment_name,
+    #     base_path_evidenceData=base_path_evidenceData,
+    #     model_weights_path=model_weights_path,
+    #     verifier_weights_path=verifier_weights_path,
+    #     vignette_paths=VignetteEvalPaths(
+    #         csv_4option=os.path.join(base_path_chexpertData, "Vignette_4option.csv"),
+    #         csv_5option=os.path.join(base_path_chexpertData, "Vignette_5option.csv"),
+    #     ),
+    #     device="cuda",
+    #     top_k=20,
+    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+    #     batch_size_retrieve=256,
+    #     batch_size_verify=4,
+    #     ece_bins=15,
+    #     seed=13,
+    #     faithfulness_random_trials=1,
+    #     out_dir=os.path.join(base_path_evidenceData, "external_validation", "Vignette", "tier123_results_s4_end2end"),
+    # )
+    # runner.run()
 
 
 
     ''' S3 Vignette '''
-    s3 = VignetteS3Tier123End2EndEvaluator(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        verifier_weights_path=verifier_weights_path,
-        vignette_paths=VignetteEvalPaths(
-            csv_4option=os.path.join(base_path_chexpertData, "Vignette_4option.csv"),
-            csv_5option=os.path.join(base_path_chexpertData, "Vignette_5option.csv")),
-        device="cuda",
-        top_k=20,
-        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-        batch_size_verify=4,
-        ece_bins=15,
-        seed=13,
-        bm25_k1=1.2,
-        bm25_b=0.75,
-        # tier2 speed knobs
-        # faithfulness_max_eval_questions=100,
-        # faithfulness_random_trials=1,
-        out_dir=os.path.join(base_path_evidenceData, "external_validation", "Vignette", "tier123_results_s3_end2end"),
-    )
-    s3.run()
+    # s3 = VignetteS3Tier123End2EndEvaluator(
+    #     cfg_path=global_config_path,
+    #     experiment_name=experiment_name,
+    #     base_path_evidenceData=base_path_evidenceData,
+    #     verifier_weights_path=verifier_weights_path,
+    #     vignette_paths=VignetteEvalPaths(
+    #         csv_4option=os.path.join(base_path_chexpertData, "Vignette_4option.csv"),
+    #         csv_5option=os.path.join(base_path_chexpertData, "Vignette_5option.csv")),
+    #     device="cuda",
+    #     top_k=20,
+    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+    #     batch_size_verify=4,
+    #     ece_bins=15,
+    #     seed=13,
+    #     bm25_k1=1.2,
+    #     bm25_b=0.75,
+    #     # tier2 speed knobs
+    #     # faithfulness_max_eval_questions=100,
+    #     # faithfulness_random_trials=1,
+    #     out_dir=os.path.join(base_path_evidenceData, "external_validation", "Vignette", "tier123_results_s3_end2end"),
+    # )
+    # s3.run()
 
 
 
