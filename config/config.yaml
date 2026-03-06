@@ -2,13 +2,10 @@ retriever:
   model_name: sentence-transformers/all-mpnet-base-v2
   tied_encoders: true            # true = shared weights
   pooling: mean                  # mean pooling over last_hidden_state
-#  max_query_tokens: 128
-  max_query_tokens: 64
-#  max_doc_tokens: 256
-  max_doc_tokens: 128
+  max_query_tokens: 128
+  max_doc_tokens: 256
   temperature: 0.07              # tau in InfoNCE
-#  top_k_positives: 20            # K per query (must match step4c top_k)
-  top_k_positives: 8            # K per query (must match step4c top_k)
+  top_k_positives: 20            # K per query (must match step4c top_k)
   min_pos_weight: 0.0            # drop positives below this weight (usually 0.0)
 
 
@@ -20,31 +17,25 @@ Verifier:
   amp_dtype: bf16      # bf16 is fastest+stable on modern GPUs
   grad_scaler_mode: auto    # auto enables scaler only for fp16
   tf32: true
-  freeze_backbone: true
-  unfreeze_last_n_layers: 0
 
-
-
-paths:
-  base_path: /PATH/RadiopaediaSnapshot_29_01_2026
-  output_dir: /PATH/outputs_step5_retriever
 
 Network:
   seed: 13
-  num_epochs: 5
-  batch_size: 8
+  num_epochs: 20
+  batch_size: 4
 #  batch_size: 16
-#  lr: 2e-5
   lr: 1e-5
   weight_decay: 0.01
   grad_clip_norm: 1.0
 
 
 Preprocessing:
-  snapshot_name: RadiopaediaSnapshot_29_01_2026
   tokenizer_name: sentence-transformers/all-mpnet-base-v2
   base_path_mimicData: /PATH/Radiopaedia/Text_only
-  base_path_evidenceData: /PATH/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026
+  snapshot_name: RadiopaediaSnapshot_29_01_2026
+  base_path_evidenceData: /PATH/Radiopaedia/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026
+#  snapshot_name: RadiopaediaSnapshot_01_03_2026
+#  base_path_evidenceData: /PATHRadiopaedia/Text_only/Articles_Processed_March_2026/RadiopaediaSnapshot_01_03_2026
 
 runtime:
   use_amp: true # useful for speed

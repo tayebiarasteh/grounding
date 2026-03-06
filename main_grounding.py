@@ -61,7 +61,7 @@ def main_train_retriever(global_config_path="/PATH/config/config.yaml", valid=Fa
     cfg_path = params["cfg_path"]
     # login(token=params["hf_login"])
 
-    base_path = params["paths"]["base_path"]
+    base_path = params["Preprocessing"]["base_path_evidenceData"]
     chunks_path = os.path.join(base_path, "chunks.parquet")
     chunks_store = RadiopaediaChunksStore(chunks_path)
 
@@ -333,32 +333,37 @@ def main_evaluation(global_config_path, experiment_name, model_weights_path, ver
 
     comparator = CrossSystemComparatorPredOnlyTestOnly(
         system_test_predictions={
-            "S1": os.path.join(base, dataset + "_Results/S1", "s1_test_predictions.parquet"),
-            "S2": os.path.join(base, dataset + "_Results/S2", "s2_test_predictions.parquet"),
-            "S3": os.path.join(base, dataset + "_Results/S3", "s3_test_predictions.parquet"),
-            "S4": os.path.join(base, dataset + "_Results/S4", "s4_test_predictions.parquet"),
+            "S1": os.path.join(base, "MIMIC_Results/S1", "s1_test_predictions.parquet"),
+            "S2": os.path.join(base, "MIMIC_Results/S2", "s2_test_predictions.parquet"),
+            "S3": os.path.join(base, "MIMIC_Results/S3", "s3_test_predictions.parquet"),
+            "S4": os.path.join(base, "MIMIC_Results/S4", "s4_test_predictions.parquet"),
         },
         system_full_results_csvs={
-            "S1": os.path.join(base, dataset + "_Results/S1", "S1_full_results.csv"),
-            "S2": os.path.join(base, dataset + "_Results/S2", "S2_full_results.csv"),
-            "S3": os.path.join(base, dataset + "_Results/S3", "S3_full_results.csv"),
-            "S4": os.path.join(base, dataset + "_Results/S4", "S4_full_results.csv"),
+            "S1": os.path.join(base, "MIMIC_Results/S1", "S1_full_results.csv"),
+            "S2": os.path.join(base, "MIMIC_Results/S2", "S2_full_results.csv"),
+            "S3": os.path.join(base, "MIMIC_Results/S3", "S3_full_results.csv"),
+            "S4": os.path.join(base, "MIMIC_Results/S4", "S4_full_results.csv"),
         },
         system_faithfulness_predictions={
-            "S2": os.path.join(base, dataset + "_Results/S2", "s2_tier2_faithfulness_predictions.parquet"),
-            "S3": os.path.join(base, dataset + "_Results/S3", "s3_tier2_faithfulness_predictions.parquet"),
-            "S4": os.path.join(base, dataset + "_Results/S4", "s4_tier2_faithfulness_predictions.parquet"),
+            "S2": os.path.join(base, "MIMIC_Results/S2", "s2_tier2_faithfulness_predictions.parquet"),
+            "S3": os.path.join(base, "MIMIC_Results/S3", "s3_tier2_faithfulness_predictions.parquet"),
+            "S4": os.path.join(base, "MIMIC_Results/S4", "s4_tier2_faithfulness_predictions.parquet"),
         },
         out_path=os.path.join(
             base,
-            dataset + "_Results/cross_system_results",
+            "MIMIC_Results",
+            "cross_system_results",
             "s1_s4_cross_system_comparison.json",
         ),
         ece_bins=15,
-        n_boot=2000,
+        n_boot=1000,
         seed=13,
+        verbose=True,
+        use_unordered_pairs_only=True,
     )
+
     comparator.run()
+
 
 
 

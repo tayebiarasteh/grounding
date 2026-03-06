@@ -50,7 +50,7 @@ import json
 from pathlib import Path
 import pandas as pd
 from tqdm import tqdm
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Callable, Any
 import hashlib
 from transformers import AutoTokenizer, AutoModel
 from dataclasses import asdict, dataclass
@@ -80,14 +80,14 @@ warnings.filterwarnings('ignore')
 
 class S4Tier123End2EndEvaluatorTestOnly:
     """
-    S4 evaluator (MIMIC) test-only.
+    S4 evaluator
 
     Input:
       phase1_fixed_test_eval/mimic_test_eval.parquet
 
     Runtime behavior:
       - loads R* and V*
-      - builds evidence embeddings + FAISS index in-memory (no saving)
+      - builds evidence embeddings + FAISS index in-memory
       - retrieves for each claim_text
       - runs verifier
       - writes a single predictions parquet
@@ -118,7 +118,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
         faithfulness_random_trials: int = 1,
         faithfulness_max_eval: Optional[int] = None,
         # FAISS
-        faiss_index_factory: str = "Flat",  # IMPORTANT: "Flat" not "FlatIP"
+        faiss_index_factory: str = "Flat",
         # Evidence corpus
         chunks_parquet_rel: str = "chunks.parquet",  # under base_path_evidenceData
     ) -> None:
@@ -155,13 +155,11 @@ class S4Tier123End2EndEvaluatorTestOnly:
         # Evidence chunks
         self.chunks_parquet = os.path.join(self.base_path_evidenceData, chunks_parquet_rel)
 
-        # Output
         self.out_dir = out_dir or os.path.join(self.base_path_evidenceData, "tier123_results_s4_end2end_testonly")
         os.makedirs(self.out_dir, exist_ok=True)
 
         self._set_determinism()
 
-        # Loaded later
         self.params = open_experiment(self.experiment_name, self.cfg_path)
 
         self.retriever_tok = None
@@ -171,9 +169,9 @@ class S4Tier123End2EndEvaluatorTestOnly:
 
         # Built on the fly
         self.faiss_index = None
-        self.faiss_chunk_ids = None            # np.ndarray int64 aligned with FAISS vectors
-        self.all_chunk_ids_universe = None     # np.ndarray int64
-        self.chunk_map = None                  # Dict[int, str]
+        self.faiss_chunk_ids = None
+        self.all_chunk_ids_universe = None
+        self.chunk_map = None
 
     def _set_determinism(self) -> None:
         random.seed(self.seed)
@@ -188,7 +186,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
         except Exception:
             pass
 
-    # ===== Verifier wrapper =====
     class _DebertaRegressor(nn.Module):
         def __init__(self, model_name: str):
             super().__init__()
@@ -203,7 +200,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
             y = self.reg_head(cls).squeeze(-1)
             return y
 
-    # ===== Loading evidence text =====
     def _load_chunk_map(self) -> Dict[int, str]:
         if not os.path.exists(self.chunks_parquet):
             raise FileNotFoundError(self.chunks_parquet)
@@ -222,7 +218,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
             raise RuntimeError("chunk_map is empty after loading chunks.parquet.")
         return m
 
-    # ===== Load models =====
     def _load_retriever(self) -> None:
         model_name = self.params["retriever"]["model_name"]
         tied = bool(self.params["retriever"]["tied_encoders"])
@@ -250,7 +245,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
         if missing or unexpected:
             print(f"[WARN] Verifier load_state_dict strict=False. missing={len(missing)} unexpected={len(unexpected)}")
 
-    # ===== Utility =====
     def _loads_json_list(self, s: str) -> List:
         try:
             return json.loads(s)
@@ -260,7 +254,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
     def _normalize_claim(self, x: str) -> str:
         return " ".join(str(x).split()).strip().lower()
 
-    # ===== Build FAISS on the fly (FIXED) =====
+    # Build FAISS on the fly
     def _sanitize_faiss_factory(self, s: str) -> str:
         """
         Accept user configs like "FlatIP" and convert to FAISS-friendly factory strings.
@@ -334,7 +328,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
                     )
                     enc = {k: v.to(self.device) for k, v in enc.items()}
 
-                    # Your BiEncoder should expose encode_docs
                     d_emb = self.retriever_model.encode_docs(enc["input_ids"], enc["attention_mask"])
                     d_emb = torch.nn.functional.normalize(d_emb, p=2, dim=1).detach().cpu().numpy().astype(np.float32)
 
@@ -362,7 +355,8 @@ class S4Tier123End2EndEvaluatorTestOnly:
         index.add(X)
         self.faiss_index = index
 
-    # ===== Retrieval (R*) =====
+
+    # Retrieval (R*)
     def _tokenize_queries(self, texts: List[str]) -> Dict[str, torch.Tensor]:
         enc = self.retriever_tok(
             texts,
@@ -412,7 +406,8 @@ class S4Tier123End2EndEvaluatorTestOnly:
                 texts.append(t)
         return self.evidence_sep.join(texts)
 
-    # ===== Verifier inference =====
+
+    # Verifier inference
     def _build_verifier_inputs(self, question: str, case_context: str, evidence_text: str) -> str:
         q = " ".join(str(question).split()).strip()
         c = " ".join(str(case_context).split()).strip()
@@ -455,7 +450,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
             inputs.append(self._build_verifier_inputs(q, c, ev))
         return self._predict_support(inputs, desc=desc)
 
-    # ===== Metrics =====
+
     def _mse(self, y: np.ndarray, yhat: np.ndarray) -> float:
         return float(np.mean((y - yhat) ** 2))
 
@@ -543,7 +538,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
             "Brier": self._brier(y01, p),
         }
 
-    # ===== Tier2 retrieval =====
+    # Tier2 retrieval
     def _recall_at_k(self, retrieved: List[int], gold: List[int], k: int) -> float:
         if not gold:
             return 0.0
@@ -578,7 +573,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
         out[f"MRR@{k_mrr}"] = float(np.mean(vals_mrr)) if vals_mrr else 0.0
         return out
 
-    # ===== Tier2 faithfulness stress =====
+    # Tier2 faithfulness stress
     def _stress_random_ids(self, n: int) -> List[List[int]]:
         assert self.all_chunk_ids_universe is not None
         U = self.all_chunk_ids_universe
@@ -606,7 +601,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
             out.append(y)
         return out
 
-    # ===== Tier3 slices (already in phase1 parquet) =====
+    # Tier3 slices
     def _compute_slice_metrics(
         self,
         df_test: pd.DataFrame,
@@ -653,7 +648,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
 
         return out
 
-    # ===== End2End test run =====
+
     def _run_end2end_test(self, df_test: pd.DataFrame) -> Dict[str, object]:
         claim_texts = df_test["claim_text"].astype(str).tolist()
         topk_ids, _ = self._retrieve_topk_chunk_ids(claim_texts, desc="S4 Retrieval (R*) [test]")
@@ -670,7 +665,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
         y01 = np.clip(y, 0.0, 1.0)
         p = self._sigmoid(yhat)
 
-        # Write ONE predictions parquet
         out_df = df_test.copy()
         out_df["s4_retrieved_chunk_ids_json"] = [json.dumps(x) for x in topk_ids]
         out_df["s4_pred_support_raw"] = yhat.astype(np.float32)
@@ -780,15 +774,12 @@ class S4Tier123End2EndEvaluatorTestOnly:
                 random_state=self.seed
             ).reset_index(drop=True)
 
-        # Load models and text
         self.chunk_map = self._load_chunk_map()
         self._load_retriever()
         self._load_verifier()
 
-        # Build FAISS in memory (FIXED factory string handling)
         self._build_faiss_on_the_fly()
 
-        # Base test run
         pack = self._run_end2end_test(df_test)
         y01 = pack["y01"]
         yhat = pack["yhat"]
@@ -908,7 +899,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
             },
         }
 
-        # Save faithfulness predictions parquet (separate artifact is useful, but optional)
         faith_df = df_test.copy()
         faith_df["s4_retrieved_chunk_ids_json"] = [json.dumps(x) for x in topk_ids]
         faith_df["s4_pred_base_raw"] = yhat.astype(np.float32)
@@ -942,7 +932,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
                 indent=2,
             )
 
-        # Summary json
         summary = {
             "test": {
                 "tier1_report": tier1_path,
@@ -963,7 +952,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
         print(f"Wrote: {slice_path}")
         print(f"Wrote: {summary_path}")
 
-        # Single CSV
         self._write_csv_summary()
 
         return summary_path
@@ -979,7 +967,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
     Test-only, end-to-end:
       - Reads phase1_fixed_test_eval/mimic_test_eval.parquet
       - Off-the-shelf MPNet retriever (no finetuning)
-      - Embeds evidence on-the-fly (in memory) and builds FAISS in memory (no saving)
+      - Embeds evidence on-the-fly (in memory) and builds FAISS in memory
       - Runs tiers 1-3 on test
       - Writes one main predictions parquet + json reports + one csv summary
     """
@@ -1034,19 +1022,16 @@ class S2Tier123End2EndEvaluatorTestOnly:
 
         self.write_faithfulness_predictions_parquet = bool(write_faithfulness_predictions_parquet)
 
-        # Inputs
         self.test_parquet = os.path.join(
             self.base_path_evidenceData, input_test_data
         )
         self.chunks_parquet = os.path.join(self.base_path_evidenceData, chunks_parquet_rel)
 
-        # Output
         self.out_dir = out_dir or os.path.join(self.base_path_evidenceData, "tier123_results_s2_end2end_testonly")
         os.makedirs(self.out_dir, exist_ok=True)
 
         self._set_determinism()
 
-        # Loaded later
         self.params = open_experiment(self.experiment_name, self.cfg_path)
 
         # Retriever (MPNet)
@@ -1078,7 +1063,6 @@ class S2Tier123End2EndEvaluatorTestOnly:
         except Exception:
             pass
 
-    # ===== Verifier wrapper =====
     class _DebertaRegressor(nn.Module):
         def __init__(self, model_name: str):
             super().__init__()
@@ -1093,7 +1077,6 @@ class S2Tier123End2EndEvaluatorTestOnly:
             y = self.reg_head(cls).squeeze(-1)
             return y
 
-    # ===== Loading chunk map (for evidence materialization) =====
     def _load_chunk_map(self) -> Dict[int, str]:
         if not os.path.exists(self.chunks_parquet):
             raise FileNotFoundError(self.chunks_parquet)
@@ -1112,7 +1095,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
             raise RuntimeError("chunk_map is empty after loading chunks.parquet.")
         return m
 
-    # ===== Load off-the-shelf MPNet retriever =====
+    # Load off-the-shelf MPNet retriever
     def _load_offtheshelf_mpnet(self) -> None:
         model_name = self.params["retriever"]["model_name"]  # sentence-transformers/all-mpnet-base-v2
         self.max_query_tokens = int(self.params["retriever"]["max_query_tokens"])
@@ -1122,7 +1105,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
         self.retriever_model = AutoModel.from_pretrained(model_name).to(self.device)
         self.retriever_model.eval()
 
-    # ===== Build FAISS in memory on the fly =====
+    # Build FAISS in memory on the fly
     def _mean_pool(self, last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         mask = attention_mask.unsqueeze(-1).type_as(last_hidden)
         summed = (last_hidden * mask).sum(dim=1)
@@ -1221,7 +1204,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
         self.faiss_chunk_ids = chunk_ids_np
         self.all_chunk_ids_universe = chunk_ids_np.copy()
 
-    # ===== Load verifier =====
+    # Load verifier
     def _load_verifier(self) -> None:
         vname = self.params["Verifier"]["model_name"]
         self.verifier_tok = AutoTokenizer.from_pretrained(vname, use_fast=True)
@@ -1234,7 +1217,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
         if missing or unexpected:
             print(f"[WARN] Verifier load_state_dict strict=False. missing={len(missing)} unexpected={len(unexpected)}")
 
-    # ===== Retrieval =====
+    # Retrieval
     def _retrieve_topk_chunk_ids(self, claim_texts: List[str]) -> List[List[int]]:
         assert self.faiss_index is not None
         assert self.faiss_chunk_ids is not None
@@ -1802,7 +1785,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
     S3 — BM25 retrieval -> V*
     Test-only, end-to-end:
       - Reads phase1_fixed_test_eval/mimic_test_eval.parquet
-      - Builds BM25 index in memory on the fly (no saving)
+      - Builds BM25 index in memory on the fly
       - Runs tiers 1-3 on test
       - Writes one main predictions parquet + json reports + one csv summary
     """
@@ -1856,13 +1839,11 @@ class S3Tier123End2EndEvaluatorTestOnly:
 
         self.write_faithfulness_predictions_parquet = bool(write_faithfulness_predictions_parquet)
 
-        # Inputs
         self.test_parquet = os.path.join(
             self.base_path_evidenceData, input_test_data
         )
         self.chunks_parquet = os.path.join(self.base_path_evidenceData, chunks_parquet_rel)
 
-        # Output
         self.out_dir = out_dir or os.path.join(self.base_path_evidenceData, "tier123_results_s3_end2end_testonly")
         os.makedirs(self.out_dir, exist_ok=True)
 
@@ -1877,7 +1858,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
         # Evidence
         self.chunk_map = None  # Dict[int,str]
 
-        # BM25 runtime state (in-memory)
+        # BM25 runtime state
         self._bm25 = None
         self.all_chunk_ids_universe = None  # np.ndarray int64
 
@@ -1927,7 +1908,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
             raise RuntimeError("chunk_map is empty after loading chunks.parquet.")
         return m
 
-    # ===== Verifier =====
+    # Verifier
     def _load_verifier(self) -> None:
         vname = self.params["Verifier"]["model_name"]
         self.verifier_tok = AutoTokenizer.from_pretrained(vname, use_fast=True)
@@ -1940,7 +1921,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
         if missing or unexpected:
             print(f"[WARN] Verifier load_state_dict strict=False. missing={len(missing)} unexpected={len(unexpected)}")
 
-    # ===== BM25 (in memory, on the fly) =====
+    # BM25 (in memory, on the fly)
     def _tokenize_bm25(self, text: str) -> List[str]:
         t = " ".join(str(text).lower().split()).strip()
         out = []
@@ -2076,7 +2057,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
                 texts.append(t)
         return self.evidence_sep.join(texts)
 
-    # ===== Verifier inference =====
+    # Verifier inference
     def _build_verifier_inputs(self, question: str, case_context: str, evidence_text: str) -> str:
         q = " ".join(str(question).split()).strip()
         c = " ".join(str(case_context).split()).strip()
@@ -2110,7 +2091,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
         out = np.concatenate(preds, axis=0) if preds else np.zeros((0,), dtype=np.float32)
         return out.astype(np.float32)
 
-    # ===== Metrics =====
+
     def _sigmoid(self, x: np.ndarray) -> np.ndarray:
         return 1.0 / (1.0 + np.exp(-np.clip(x, -20, 20)))
 
@@ -2193,7 +2174,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
             "Brier": self._brier(y01, p),
         }
 
-    # ===== Tier2 retrieval metrics =====
+    # Tier2 retrieval metrics
     def _loads_json_list(self, s: str) -> List:
         try:
             return json.loads(s)
@@ -2234,7 +2215,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
         out[f"MRR@{k_mrr}"] = float(np.mean(vals_mrr)) if vals_mrr else 0.0
         return out
 
-    # ===== Tier2 faithfulness helpers =====
+    # Tier2 faithfulness helpers
     def _stress_random_ids(self, n: int) -> List[List[int]]:
         assert self.all_chunk_ids_universe is not None
         U = self.all_chunk_ids_universe
@@ -2272,7 +2253,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
             inputs.append(self._build_verifier_inputs(q, c, ev))
         return self._predict_support(inputs, desc=desc)
 
-    # ===== Tier3 slices =====
+    # Tier3 slices
     def _compute_slice_metrics(self, df_test: pd.DataFrame, y01: np.ndarray, yhat: np.ndarray, p: np.ndarray) -> Dict[str, object]:
         def pack(mask: np.ndarray) -> Dict[str, object]:
             if mask.sum() == 0:
@@ -2310,7 +2291,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
 
         return out
 
-    # ===== CSV summary =====
+
     def _write_csv_summary(self) -> str:
         tier1_path = os.path.join(self.out_dir, "s3_tier1_report.json")
         tier2_faith_path = os.path.join(self.out_dir, "s3_tier2_faithfulness_report.json")
@@ -2373,7 +2354,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
         print(f"Saved: {out_csv}")
         return out_csv
 
-    # ===== Run =====
+
     def run(self) -> str:
         if not os.path.exists(self.test_parquet):
             raise FileNotFoundError(self.test_parquet)
@@ -2392,7 +2373,6 @@ class S3Tier123End2EndEvaluatorTestOnly:
                 random_state=self.seed
             ).reset_index(drop=True)
 
-        # Load runtime components
         self.chunk_map = self._load_chunk_map()
         self._build_bm25_on_the_fly()
         self._load_verifier()
@@ -2413,7 +2393,6 @@ class S3Tier123End2EndEvaluatorTestOnly:
         y01 = np.clip(y, 0.0, 1.0)
         p = self._sigmoid(yhat)
 
-        # Write ONE main predictions parquet
         out_df = df_test.copy()
         out_df["s3_retrieved_chunk_ids_json"] = [json.dumps(x) for x in topk_test]
         out_df["s3_pred_support_raw"] = yhat.astype(np.float32)
@@ -2569,7 +2548,6 @@ class S3Tier123End2EndEvaluatorTestOnly:
                 indent=2,
             )
 
-        # Summary json
         summary = {
             "test": {
                 "tier1_report": tier1_path,
@@ -2593,7 +2571,6 @@ class S3Tier123End2EndEvaluatorTestOnly:
         print(f"Wrote: {slice_path}")
         print(f"Wrote: {summary_path}")
 
-        # Single CSV
         self._write_csv_summary()
 
         return summary_path
@@ -2612,7 +2589,7 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
     Test-only, end-to-end:
       - Reads phase1_fixed_test_eval/mimic_test_eval.parquet
       - Runs verifier on (Question + Case) only
-      - Tier1: regression + calibration-style metrics computed from sigmoid (no fitted calibration)
+      - Tier1: regression + calibration-style metrics computed from sigmoid
       - Tier3: distribution shift slices on test
       - Writes one predictions parquet + json reports + one csv summary
     """
@@ -2974,7 +2951,6 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
                 indent=2,
             )
 
-        # Summary
         summary = {
             "test": {
                 "tier1_report": tier1_path,
@@ -2991,7 +2967,6 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
         print(f"Wrote: {slice_path}")
         print(f"Wrote: {summary_path}")
 
-        # CSV summary
         self._write_csv_summary()
 
         return summary_path
@@ -3001,20 +2976,45 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
 
 
 
-
 class CrossSystemComparatorPredOnlyTestOnly:
     """
-    Evaluation set = intersection of qa_row_id across all provided systems.
+    Cross-system comparison on the TEST split only, using the intersection of qa_row_id
+    across all provided systems.
 
-    Inputs:
-      - system_test_predictions: { "S1": ".../s1_test_predictions.parquet", ... }
-      - system_full_results_csvs: { "S1": ".../S1_full_results.csv", ... }  (optional but needed for final mega-csv)
-      - system_faithfulness_predictions: optional { "S2": ".../s2_tier2_faithfulness_predictions.parquet", ... }
+    Inputs
+    ------
+    system_test_predictions:
+        {
+            "S1": ".../s1_test_predictions.parquet",
+            "S2": ".../s2_test_predictions.parquet",
+            ...
+        }
 
-    Outputs:
-      - out_path JSON with:
-          per_system_metrics, pairwise_all_pairs, faithfulness_severity, alignment meta
-      - ALL_systems_plus_cross_summary.csv in same folder as out_path
+    system_full_results_csvs:
+        Optional mapping used to build a final mega-csv:
+        {
+            "S1": ".../S1_full_results.csv",
+            ...
+        }
+
+    system_faithfulness_predictions:
+        Optional mapping:
+        {
+            "S2": ".../s2_tier2_faithfulness_predictions.parquet",
+            ...
+        }
+
+    Outputs
+    -------
+    out_path JSON with:
+      - per_system_metrics
+      - pairwise_all_pairs
+      - faithfulness_severity
+      - alignment metadata
+
+    and also:
+      - ALL_systems_plus_cross_summary.csv
+        written in the same directory as out_path
     """
 
     def __init__(
@@ -3027,6 +3027,8 @@ class CrossSystemComparatorPredOnlyTestOnly:
         ece_bins: int = 15,
         n_boot: int = 2000,
         seed: int = 13,
+        verbose: bool = True,
+        use_unordered_pairs_only: bool = True,
     ) -> None:
         self.system_test_predictions = dict(system_test_predictions)
         self.system_full_results_csvs = dict(system_full_results_csvs or {})
@@ -3036,81 +3038,131 @@ class CrossSystemComparatorPredOnlyTestOnly:
         self.ece_bins = int(ece_bins)
         self.n_boot = int(n_boot)
         self.seed = int(seed)
+        self.verbose = bool(verbose)
+        self.use_unordered_pairs_only = bool(use_unordered_pairs_only)
+
         self.rng = np.random.RandomState(self.seed)
 
-    # ---------- metrics ----------
+
+    def _log(self, msg: str) -> None:
+        if self.verbose:
+            print(msg, flush=True)
+
+
     def _sigmoid(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
         return 1.0 / (1.0 + np.exp(-np.clip(x, -20, 20)))
 
     def _rankdata(self, x: np.ndarray) -> np.ndarray:
-        return pd.Series(x).rank(method="average").to_numpy(dtype=np.float64)
+        return pd.Series(np.asarray(x)).rank(method="average").to_numpy(dtype=np.float64)
 
     def _pearson(self, a: np.ndarray, b: np.ndarray) -> float:
-        a = a.astype(np.float64)
-        b = b.astype(np.float64)
-        a = a - a.mean()
-        b = b - b.mean()
-        denom = np.sqrt((a * a).sum()) * np.sqrt((b * b).sum())
-        if denom <= 0:
+        a = np.asarray(a, dtype=np.float64)
+        b = np.asarray(b, dtype=np.float64)
+
+        a_centered = a - a.mean()
+        b_centered = b - b.mean()
+
+        denom = np.sqrt((a_centered * a_centered).sum()) * np.sqrt((b_centered * b_centered).sum())
+        if denom <= 0.0:
             return 0.0
-        return float((a * b).sum() / denom)
+        return float((a_centered * b_centered).sum() / denom)
 
     def _spearman(self, a: np.ndarray, b: np.ndarray) -> float:
         return self._pearson(self._rankdata(a), self._rankdata(b))
 
     def _mse(self, y: np.ndarray, yhat: np.ndarray) -> float:
-        return float(np.mean((y - yhat) ** 2))
+        d = np.asarray(y, dtype=np.float64) - np.asarray(yhat, dtype=np.float64)
+        return float(np.mean(d * d))
 
     def _mae(self, y: np.ndarray, yhat: np.ndarray) -> float:
-        return float(np.mean(np.abs(y - yhat)))
+        d = np.asarray(y, dtype=np.float64) - np.asarray(yhat, dtype=np.float64)
+        return float(np.mean(np.abs(d)))
 
     def _brier(self, y01: np.ndarray, p: np.ndarray) -> float:
-        return float(np.mean((p - y01) ** 2))
+        d = np.asarray(p, dtype=np.float64) - np.asarray(y01, dtype=np.float64)
+        return float(np.mean(d * d))
 
     def _nll_soft_bernoulli(self, y01: np.ndarray, p: np.ndarray) -> float:
+        y01 = np.asarray(y01, dtype=np.float64)
+        p = np.asarray(p, dtype=np.float64)
         eps = 1e-12
         p = np.clip(p, eps, 1.0 - eps)
         return float(np.mean(-(y01 * np.log(p) + (1.0 - y01) * np.log(1.0 - p))))
 
     def _ece(self, y01: np.ndarray, p: np.ndarray, bins: int) -> float:
+        y01 = np.asarray(y01, dtype=np.float64)
+        p = np.asarray(p, dtype=np.float64)
+
         edges = np.linspace(0.0, 1.0, bins + 1)
         ece = 0.0
         n = len(y01)
+
         for b in range(bins):
             lo, hi = edges[b], edges[b + 1]
-            mask = (p >= lo) & (p < hi) if b < bins - 1 else (p >= lo) & (p <= hi)
+            if b < bins - 1:
+                mask = (p >= lo) & (p < hi)
+            else:
+                mask = (p >= lo) & (p <= hi)
+
             m = int(mask.sum())
             if m == 0:
                 continue
+
             acc = float(y01[mask].mean())
             conf = float(p[mask].mean())
             ece += (m / n) * abs(acc - conf)
+
         return float(ece)
 
     def _aurc(self, y01: np.ndarray, yhat: np.ndarray) -> float:
+        """
+        Fast AURC implementation.
+        This replaces the O(n^2) prefix-recompute version with O(n log n).
+
+        Original logic:
+          sort by confidence descending
+          compute prefix MSE at every k
+          average all prefix MSE values
+        """
+        y01 = np.asarray(y01, dtype=np.float64)
+        yhat = np.asarray(yhat, dtype=np.float64)
+
         p = self._sigmoid(yhat)
         conf = np.maximum(p, 1.0 - p)
-        order = np.argsort(-conf)
-        y = y01[order]
-        yh = yhat[order]
-        csum = 0.0
-        for k in range(1, len(y) + 1):
-            csum += float(np.mean((y[:k] - yh[:k]) ** 2))
-        return float(csum / max(1, len(y)))
+        order = np.argsort(-conf, kind="stable")
 
-    def _paired_bootstrap_delta(self, y01: np.ndarray, a: np.ndarray, b: np.ndarray, fn) -> Dict[str, float]:
-        n = len(y01)
-        deltas = np.zeros((self.n_boot,), dtype=np.float64)
-        for t in range(self.n_boot):
-            idx = self.rng.randint(0, n, size=n)
+        sq_err = (y01[order] - yhat[order]) ** 2
+        prefix_sums = np.cumsum(sq_err, dtype=np.float64)
+        ks = np.arange(1, len(sq_err) + 1, dtype=np.float64)
+        prefix_mse = prefix_sums / ks
+        return float(prefix_mse.mean())
+
+
+    # Bootstrap
+    def _precompute_boot_indices(self, n: int) -> np.ndarray:
+        self._log(f"[bootstrap] precomputing {self.n_boot} resamples of length {n}")
+        return self.rng.randint(0, n, size=(self.n_boot, n), dtype=np.int64)
+
+    def _paired_bootstrap_delta_precomputed(
+        self,
+        y01: np.ndarray,
+        a: np.ndarray,
+        b: np.ndarray,
+        fn: Callable[[np.ndarray, np.ndarray], float],
+        boot_indices: np.ndarray,
+    ) -> Dict[str, float]:
+        deltas = np.empty((boot_indices.shape[0],), dtype=np.float64)
+
+        for t, idx in enumerate(boot_indices):
             deltas[t] = fn(y01[idx], a[idx]) - fn(y01[idx], b[idx])
+
         return {
             "mean_delta": float(deltas.mean()),
             "ci_low": float(np.percentile(deltas, 2.5)),
             "ci_high": float(np.percentile(deltas, 97.5)),
         }
 
-    # ---------- column inference ----------
     def _infer_cols(self, df: pd.DataFrame) -> Dict[str, Optional[str]]:
         cols = list(df.columns)
 
@@ -3120,13 +3172,18 @@ class CrossSystemComparatorPredOnlyTestOnly:
                 pred_raw = c
                 break
 
+        if pred_raw is None:
+            for c in cols:
+                if c.endswith("_pred_raw") or c.endswith("pred_raw"):
+                    pred_raw = c
+                    break
+
         pred_prob = None
         for c in cols:
             if ("pred_prob" in c) and ("sigmoid" in c):
                 pred_prob = c
                 break
 
-        # Support the new test-only naming if you used it (e.g. s1_pred_prob_sigmoid)
         if pred_prob is None:
             for c in cols:
                 if c.endswith("_pred_prob_sigmoid") or c.endswith("pred_prob_sigmoid"):
@@ -3135,11 +3192,12 @@ class CrossSystemComparatorPredOnlyTestOnly:
 
         return {"pred_raw": pred_raw, "pred_prob": pred_prob}
 
-    # ---------- load + align ----------
+
     def _load_and_align_systems(self):
         systems_raw: Dict[str, pd.DataFrame] = {}
 
         for sys_name, path in self.system_test_predictions.items():
+            self._log(f"[load] {sys_name}: {path}")
             if not os.path.exists(path):
                 raise FileNotFoundError(path)
 
@@ -3157,35 +3215,38 @@ class CrossSystemComparatorPredOnlyTestOnly:
 
             systems_raw[sys_name] = df
 
-        # intersection of ids
+        # Intersection of ids across all systems
         sys_ids = {k: set(v["qa_row_id"].tolist()) for k, v in systems_raw.items()}
         eval_ids = None
         for ids in sys_ids.values():
             eval_ids = set(ids) if eval_ids is None else (eval_ids & ids)
+
         eval_ids = np.array(sorted(list(eval_ids or [])), dtype=np.int64)
         if len(eval_ids) == 0:
             raise RuntimeError("No overlapping qa_row_id across provided systems.")
 
-        # filter + align
+        # Filter and align
         systems: Dict[str, pd.DataFrame] = {}
         dropped = {}
+
         for sys_name, df in systems_raw.items():
             df_f = df[df["qa_row_id"].isin(eval_ids)].copy()
             df_f = df_f.sort_values("qa_row_id").reset_index(drop=True)
             systems[sys_name] = df_f
             dropped[f"{sys_name}_dropped"] = int(len(df) - len(df_f))
 
-        # sanity: id order match
-        ref = next(iter(systems.values()))["qa_row_id"].to_numpy()
+        # Sanity check aligned id order
+        ref_ids = next(iter(systems.values()))["qa_row_id"].to_numpy()
         for sys_name, df in systems.items():
-            if not np.array_equal(df["qa_row_id"].to_numpy(), ref):
+            if not np.array_equal(df["qa_row_id"].to_numpy(), ref_ids):
                 raise RuntimeError(f"Internal alignment failure for {sys_name}")
 
-        # gold y: take from S4 if present else first system, then verify match across all
+        # Gold y: prefer S4 if present, else first system
         prefer = "S4" if "S4" in systems else list(systems.keys())[0]
         y = pd.to_numeric(systems[prefer]["soft_support_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
         y01 = np.clip(y, 0.0, 1.0)
 
+        # Verify identical target across all systems
         for sys_name, df in systems.items():
             y_other = pd.to_numeric(df["soft_support_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
             if not np.allclose(y_other, y, rtol=0.0, atol=1e-6):
@@ -3201,8 +3262,13 @@ class CrossSystemComparatorPredOnlyTestOnly:
         }
         return systems, y01, meta
 
-    # ---------- faithfulness severity ----------
-    def _faithfulness_severity(self, y01: np.ndarray, faith_df: pd.DataFrame, sys_prefix: str) -> Dict[str, object]:
+
+    def _faithfulness_severity(
+        self,
+        y01: np.ndarray,
+        faith_df: pd.DataFrame,
+        sys_prefix: str,
+    ) -> Dict[str, Any]:
         base_col = f"{sys_prefix}_pred_base_raw"
         if base_col not in faith_df.columns:
             return {"available": False}
@@ -3213,6 +3279,7 @@ class CrossSystemComparatorPredOnlyTestOnly:
         def summarize(pert_col: str) -> Dict[str, float]:
             if pert_col not in faith_df.columns:
                 return {}
+
             yhat_p = pd.to_numeric(faith_df[pert_col], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
             err_p = np.abs(y01 - yhat_p)
 
@@ -3220,6 +3287,7 @@ class CrossSystemComparatorPredOnlyTestOnly:
             mse_p = self._mse(y01, yhat_p)
             rel = float((mse_p - mse_base) / (mse_base + 1e-12))
             frac_worse = float(np.mean(err_p > base_err))
+
             return {
                 "mse_base": float(mse_base),
                 "mse_pert": float(mse_p),
@@ -3235,7 +3303,7 @@ class CrossSystemComparatorPredOnlyTestOnly:
         out["perturbations"]["random_evidence"] = summarize(f"{sys_prefix}_pred_random_avg_raw")
         return out
 
-    # ---------- mega csv ----------
+
     def _ensure_cols(self, df: pd.DataFrame) -> pd.DataFrame:
         needed = ["Tier", "Subgroup", "Metric", "Value"]
         missing = [c for c in needed if c not in df.columns]
@@ -3251,24 +3319,27 @@ class CrossSystemComparatorPredOnlyTestOnly:
         for sys_name in sorted(self.system_test_predictions.keys()):
             if sys_name not in self.system_full_results_csvs:
                 continue
+
             path = self.system_full_results_csvs[sys_name]
             if not os.path.exists(path):
                 raise FileNotFoundError(path)
+
             df = pd.read_csv(path)
             df = self._ensure_cols(df)
             df.insert(0, "Source", sys_name)
             dfs.append(df)
 
-        systems_df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(
-            columns=["Source", "Tier", "Subgroup", "Metric", "Value"]
-        )
+        if dfs:
+            systems_df = pd.concat(dfs, ignore_index=True)
+        else:
+            systems_df = pd.DataFrame(columns=["Source", "Tier", "Subgroup", "Metric", "Value"])
 
         with open(cross_json_path, "r", encoding="utf-8") as f:
             cross = json.load(f)
 
         cross_rows = []
 
-        # per-system metrics on intersection
+        # per-system metrics
         per_sys = cross.get("per_system_metrics", {})
         for sys_name, metrics in per_sys.items():
             if not isinstance(metrics, dict):
@@ -3277,7 +3348,7 @@ class CrossSystemComparatorPredOnlyTestOnly:
                 if isinstance(v, (int, float)):
                     cross_rows.append(["cross", "Cross_PerSystem", sys_name, k, v])
 
-        # pairwise win rates + delta stats
+        # pairwise
         pairwise = cross.get("pairwise_all_pairs", {})
         for pair_name, block in pairwise.items():
             win = (block or {}).get("win_rates", {}) or {}
@@ -3295,15 +3366,17 @@ class CrossSystemComparatorPredOnlyTestOnly:
                             ["cross", "Cross_Pairwise_Deltas", pair_name, f"{metric_name}.{stat_k}", stats[stat_k]]
                         )
 
-        # faithfulness severity
+        # faithfulness
         faith_sev = cross.get("faithfulness_severity", {}) or {}
         for sys_name, sys_block in faith_sev.items():
             if not isinstance(sys_block, dict) or not sys_block.get("available", False):
                 continue
+
             perts = sys_block.get("perturbations", {}) or {}
             for pert_name, pert_metrics in perts.items():
                 if not isinstance(pert_metrics, dict):
                     continue
+
                 subgroup = f"{sys_name}/{pert_name}"
                 for k, v in pert_metrics.items():
                     if isinstance(v, (int, float)):
@@ -3314,21 +3387,28 @@ class CrossSystemComparatorPredOnlyTestOnly:
         final_df = pd.concat([systems_df, cross_df], ignore_index=True)
         final_df["Value"] = pd.to_numeric(final_df["Value"], errors="coerce")
         final_df = final_df.sort_values(by=["Source", "Tier", "Subgroup", "Metric"], kind="stable").reset_index(drop=True)
-        final_df.to_csv(out_csv, index=False, float_format="%.3f")
-        print(f"Saved: {out_csv}")
+        final_df.to_csv(out_csv, index=False, float_format="%.6f")
+
+        self._log(f"[write] mega csv: {out_csv}")
         return out_csv
 
-    # ---------- main ----------
+
     def run(self) -> str:
         systems, y01, meta = self._load_and_align_systems()
+        n = len(y01)
+        self._log(f"[align] n_eval={n}")
+
+        boot_indices = self._precompute_boot_indices(n)
 
         per_system = {}
         series = {}
 
+        self._log("[metrics] per-system metrics")
         for sys_name, df in systems.items():
             cols = self._infer_cols(df)
+
             if cols["pred_raw"] is None:
-                raise RuntimeError(f"Could not infer pred_support_raw column for {sys_name}")
+                raise RuntimeError(f"Could not infer pred raw prediction column for {sys_name}")
 
             yhat = pd.to_numeric(df[cols["pred_raw"]], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
 
@@ -3348,64 +3428,88 @@ class CrossSystemComparatorPredOnlyTestOnly:
                 "NLL": self._nll_soft_bernoulli(y01, p),
                 "AURC": self._aurc(y01, yhat),
             }
-            series[sys_name] = {"yhat": yhat, "p": p}
 
-        # Pairwise for all ordered pairs A vs B
-        def ece_p_fn(yy, pp): return self._ece(yy, pp, self.ece_bins)
-        def brier_p_fn(yy, pp): return self._brier(yy, pp)
-        def nll_p_fn(yy, pp): return self._nll_soft_bernoulli(yy, pp)
+            series[sys_name] = {"yhat": yhat, "p": p}
+            self._log(f"  done: {sys_name}")
+
+        def ece_fn(yy: np.ndarray, pp: np.ndarray) -> float:
+            return self._ece(yy, pp, self.ece_bins)
+
+        def brier_fn(yy: np.ndarray, pp: np.ndarray) -> float:
+            return self._brier(yy, pp)
+
+        def nll_fn(yy: np.ndarray, pp: np.ndarray) -> float:
+            return self._nll_soft_bernoulli(yy, pp)
 
         pairwise = {}
         names = list(systems.keys())
-        for a in names:
-            for b in names:
-                if a == b:
-                    continue
 
-                yhat_a = series[a]["yhat"]
-                yhat_b = series[b]["yhat"]
-                p_a = series[a]["p"]
-                p_b = series[b]["p"]
+        self._log("[pairwise] bootstrap comparisons")
+        if self.use_unordered_pairs_only:
+            pair_iter = []
+            for i in range(len(names)):
+                for j in range(i + 1, len(names)):
+                    pair_iter.append((names[i], names[j]))
+        else:
+            pair_iter = []
+            for a in names:
+                for b in names:
+                    if a != b:
+                        pair_iter.append((a, b))
 
-                abs_err_a = np.abs(y01 - yhat_a)
-                abs_err_b = np.abs(y01 - yhat_b)
-                win_abs = float(np.mean(abs_err_a < abs_err_b))
+        for a, b in pair_iter:
+            self._log(f"  pair: {a} vs {b}")
 
-                cal_err_a = np.abs(p_a - y01)
-                cal_err_b = np.abs(p_b - y01)
-                win_cal = float(np.mean(cal_err_a < cal_err_b))
+            yhat_a = series[a]["yhat"]
+            yhat_b = series[b]["yhat"]
+            p_a = series[a]["p"]
+            p_b = series[b]["p"]
 
-                pairwise[f"{a}_vs_{b}"] = {
-                    "win_rates": {
-                        "frac_examples_abs_error_A_better": win_abs,
-                        "frac_examples_calibration_error_A_better": win_cal,
-                    },
-                    "bootstrap_deltas_A_minus_B": {
-                        "ΔMSE": self._paired_bootstrap_delta(y01, yhat_a, yhat_b, self._mse),
-                        "ΔMAE": self._paired_bootstrap_delta(y01, yhat_a, yhat_b, self._mae),
-                        "ΔPearson": self._paired_bootstrap_delta(y01, yhat_a, yhat_b, lambda yy, aa: self._pearson(yy, aa)),
-                        "ΔSpearman": self._paired_bootstrap_delta(y01, yhat_a, yhat_b, lambda yy, aa: self._spearman(yy, aa)),
-                        "ΔAURC": self._paired_bootstrap_delta(y01, yhat_a, yhat_b, self._aurc),
-                        "ΔECE": self._paired_bootstrap_delta(y01, p_a, p_b, ece_p_fn),
-                        "ΔBrier": self._paired_bootstrap_delta(y01, p_a, p_b, brier_p_fn),
-                        "ΔNLL": self._paired_bootstrap_delta(y01, p_a, p_b, nll_p_fn),
-                    },
-                }
+            abs_err_a = np.abs(y01 - yhat_a)
+            abs_err_b = np.abs(y01 - yhat_b)
+            win_abs = float(np.mean(abs_err_a < abs_err_b))
 
-        # Optional faithfulness severity
+            cal_err_a = np.abs(p_a - y01)
+            cal_err_b = np.abs(p_b - y01)
+            win_cal = float(np.mean(cal_err_a < cal_err_b))
+
+            pairwise[f"{a}_vs_{b}"] = {
+                "win_rates": {
+                    "frac_examples_abs_error_A_better": win_abs,
+                    "frac_examples_calibration_error_A_better": win_cal,
+                },
+                "bootstrap_deltas_A_minus_B": {
+                    "ΔMSE": self._paired_bootstrap_delta_precomputed(y01, yhat_a, yhat_b, self._mse, boot_indices),
+                    "ΔMAE": self._paired_bootstrap_delta_precomputed(y01, yhat_a, yhat_b, self._mae, boot_indices),
+                    "ΔPearson": self._paired_bootstrap_delta_precomputed(
+                        y01, yhat_a, yhat_b, lambda yy, aa: self._pearson(yy, aa), boot_indices
+                    ),
+                    "ΔSpearman": self._paired_bootstrap_delta_precomputed(
+                        y01, yhat_a, yhat_b, lambda yy, aa: self._spearman(yy, aa), boot_indices
+                    ),
+                    "ΔAURC": self._paired_bootstrap_delta_precomputed(y01, yhat_a, yhat_b, self._aurc, boot_indices),
+                    "ΔECE": self._paired_bootstrap_delta_precomputed(y01, p_a, p_b, ece_fn, boot_indices),
+                    "ΔBrier": self._paired_bootstrap_delta_precomputed(y01, p_a, p_b, brier_fn, boot_indices),
+                    "ΔNLL": self._paired_bootstrap_delta_precomputed(y01, p_a, p_b, nll_fn, boot_indices),
+                },
+            }
+
         faithfulness = {}
         if self.system_faithfulness_predictions:
+            self._log("[faithfulness] summaries")
             ref_ids = systems[next(iter(systems))]["qa_row_id"].to_numpy(dtype=np.int64)
             ref_ids_df = pd.DataFrame({"qa_row_id": ref_ids})
 
             for sys_name, path in self.system_faithfulness_predictions.items():
+                self._log(f"  system: {sys_name}")
+
                 if not os.path.exists(path):
-                    faithfulness[sys_name] = {"available": False}
+                    faithfulness[sys_name] = {"available": False, "reason": "file_not_found"}
                     continue
 
                 fdf = pd.read_parquet(path)
                 if "qa_row_id" not in fdf.columns:
-                    faithfulness[sys_name] = {"available": False}
+                    faithfulness[sys_name] = {"available": False, "reason": "missing_qa_row_id"}
                     continue
 
                 fdf = fdf.copy()
@@ -3414,13 +3518,16 @@ class CrossSystemComparatorPredOnlyTestOnly:
 
                 base_cols = [c for c in fdf.columns if c.endswith("_pred_base_raw")]
                 if not base_cols:
-                    faithfulness[sys_name] = {"available": False}
+                    faithfulness[sys_name] = {"available": False, "reason": "missing_base_prediction_column"}
                     continue
 
                 prefix = base_cols[0].replace("_pred_base_raw", "")
+
                 if len(fdf) != len(y01):
-                    # strict alignment safety
-                    faithfulness[sys_name] = {"available": False, "reason": "faithfulness file did not align to eval ids"}
+                    faithfulness[sys_name] = {
+                        "available": False,
+                        "reason": "faithfulness_file_did_not_align_to_eval_ids",
+                    }
                     continue
 
                 faithfulness[sys_name] = self._faithfulness_severity(y01, fdf, prefix)
@@ -3432,20 +3539,24 @@ class CrossSystemComparatorPredOnlyTestOnly:
             "per_system_metrics": per_system,
             "pairwise_all_pairs": pairwise,
             "faithfulness_severity": faithfulness,
-            "params": {"ece_bins": int(self.ece_bins), "n_boot": int(self.n_boot), "seed": int(self.seed)},
+            "params": {
+                "ece_bins": int(self.ece_bins),
+                "n_boot": int(self.n_boot),
+                "seed": int(self.seed),
+                "use_unordered_pairs_only": bool(self.use_unordered_pairs_only),
+            },
         }
 
         os.makedirs(os.path.dirname(self.out_path), exist_ok=True)
+
         with open(self.out_path, "w", encoding="utf-8") as f:
             json.dump(final, f, indent=2)
 
-        print(f"Wrote: {self.out_path}")
-        print(f"n_eval={final['n_eval']} dropped={final['dropped_counts']}")
+        self._log(f"[write] json: {self.out_path}")
+        self._log(f"[done] n_eval={final['n_eval']} dropped={final['dropped_counts']}")
 
-        # mega csv
         self._write_mega_csv(self.out_path)
         return self.out_path
-
 
 
 
@@ -3463,83 +3574,83 @@ if __name__ == "__main__":
 
 
     ''' S1 '''
-    s1 = S1Tier123CaseOnlyEvaluatorTestOnly(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        verifier_weights_path=verifier_weights_path,
-        device="cuda",
-        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-        out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S1"),
-        batch_size_verify=4,
-        ece_bins=15,
-        seed=13,
-        input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
-    )
-    s1.run()
-
-
-
-
-    ''' S2 '''
-    s2 = S2Tier123End2EndEvaluatorTestOnly(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        verifier_weights_path=verifier_weights_path,
-        device="cuda",
-        top_k=20,
-        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-        out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S2"),
-        batch_size_embed_chunks=128,
-        batch_size_retrieve=256,
-        batch_size_verify=4,
-        ece_bins=15,
-        input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
-        seed=13,
-    )
-    s2.run()
-
-
-
-    ''' S3 '''
-    s3 = S3Tier123End2EndEvaluatorTestOnly(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        verifier_weights_path=verifier_weights_path,
-        device="cuda",
-        top_k=20,
-        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-        out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S3"),
-        batch_size_verify=4,
-        ece_bins=15,
-        seed=13,
-        input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
-        bm25_k1=1.2,
-        bm25_b=0.75,
-    )
-    s3.run()
-
-
-    ''' S4 '''
-    runner = S4Tier123End2EndEvaluatorTestOnly(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        model_weights_path=model_weights_path,
-        verifier_weights_path=verifier_weights_path,
-        device="cuda",
-        top_k=20,
-        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-        out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S4"),
-        batch_size_retrieve=256,
-        batch_size_verify=4,
-        input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
-        batch_size_embed_docs=256,
-        ece_bins=15,
-    )
-    runner.run()
+    # s1 = S1Tier123CaseOnlyEvaluatorTestOnly(
+    #     cfg_path=global_config_path,
+    #     experiment_name=experiment_name,
+    #     base_path_evidenceData=base_path_evidenceData,
+    #     verifier_weights_path=verifier_weights_path,
+    #     device="cuda",
+    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+    #     out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S1"),
+    #     batch_size_verify=4,
+    #     ece_bins=15,
+    #     seed=13,
+    #     input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
+    # )
+    # s1.run()
+    #
+    #
+    #
+    #
+    # ''' S2 '''
+    # s2 = S2Tier123End2EndEvaluatorTestOnly(
+    #     cfg_path=global_config_path,
+    #     experiment_name=experiment_name,
+    #     base_path_evidenceData=base_path_evidenceData,
+    #     verifier_weights_path=verifier_weights_path,
+    #     device="cuda",
+    #     top_k=20,
+    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+    #     out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S2"),
+    #     batch_size_embed_chunks=128,
+    #     batch_size_retrieve=256,
+    #     batch_size_verify=4,
+    #     ece_bins=15,
+    #     input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
+    #     seed=13,
+    # )
+    # s2.run()
+    #
+    #
+    #
+    # ''' S3 '''
+    # s3 = S3Tier123End2EndEvaluatorTestOnly(
+    #     cfg_path=global_config_path,
+    #     experiment_name=experiment_name,
+    #     base_path_evidenceData=base_path_evidenceData,
+    #     verifier_weights_path=verifier_weights_path,
+    #     device="cuda",
+    #     top_k=20,
+    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+    #     out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S3"),
+    #     batch_size_verify=4,
+    #     ece_bins=15,
+    #     seed=13,
+    #     input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
+    #     bm25_k1=1.2,
+    #     bm25_b=0.75,
+    # )
+    # s3.run()
+    #
+    #
+    # ''' S4 '''
+    # runner = S4Tier123End2EndEvaluatorTestOnly(
+    #     cfg_path=global_config_path,
+    #     experiment_name=experiment_name,
+    #     base_path_evidenceData=base_path_evidenceData,
+    #     model_weights_path=model_weights_path,
+    #     verifier_weights_path=verifier_weights_path,
+    #     device="cuda",
+    #     top_k=20,
+    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+    #     out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S4"),
+    #     batch_size_retrieve=256,
+    #     batch_size_verify=4,
+    #     input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
+    #     batch_size_embed_docs=256,
+    #     ece_bins=15,
+    # )
+    # runner.run()
 
 
 
@@ -3566,12 +3677,16 @@ if __name__ == "__main__":
         },
         out_path=os.path.join(
             base,
-            "MIMIC_Results/cross_system_results",
+            "MIMIC_Results",
+            "cross_system_results",
             "s1_s4_cross_system_comparison.json",
         ),
         ece_bins=15,
-        n_boot=2000,
+        n_boot=1000,
         seed=13,
+        verbose=True,
+        use_unordered_pairs_only=True,
     )
+
     comparator.run()
 
