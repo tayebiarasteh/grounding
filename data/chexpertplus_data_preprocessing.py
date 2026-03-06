@@ -77,18 +77,31 @@ def patient_split(csv_path, outpath, patient_col="subject_id",
 
 
 
+
 class ChexpertPlusCaseContextBuilder:
     """
-    Step 1 (CheXpert-Plus):
-    Build report-level case_context from a single master CSV that already contains the report text.
+    Step 1 for CheXpert-Plus
 
-    Output:
-      One row per unique report unit, with columns:
-        subject_id, report_id, report, case_context, n_images
+    Goal:
+      Build one stable report-level case_context per report/study unit, using
+      MIMIC-like cleaning and section-aware reconstruction.
 
-    Notes:
-      - If multiple rows share the same (patient, report text), we collapse them into one report unit.
-      - If the CSV has "section_findings"/"section_impression" columns, we can prefer them; otherwise we use "report".
+    Output columns:
+      - subject_id
+      - report_id
+      - split (if available)
+      - n_images
+      - report
+      - case_context
+
+    Main fixes vs older version:
+      1) Reconstructs a real report-like raw text with explicit section headers.
+      2) Uses stable study/report identity:
+           preferred: subject_id + patient_report_date_order
+           fallback : subject_id + md5(normalized_report_text)
+      3) Avoids flattening sections before section parsing.
+      4) Removes CheXpert-Plus anonymization/footer artifacts.
+      5) Keeps cleaning behavior aligned with the MIMIC pipeline.
     """
 
     def __init__(
@@ -98,15 +111,23 @@ class ChexpertPlusCaseContextBuilder:
         encoding: str = "utf-8",
         tqdm_desc: str = "Building CheXpert-Plus case_context",
         min_lines_fallback: int = 2,
-        # columns
+        # core columns
         report_col: str = "report",
         patient_col: str = "subject_id",
         image_col: str = "path_to_image",
         split_col: str = "split",
-        # optional section columns (if present in the CSV)
+        report_order_col: str = "patient_report_date_order",
+        # optional section columns
         findings_col: str = "section_findings",
         impression_col: str = "section_impression",
         narrative_col: str = "section_narrative",
+        history_col: str = "section_history",
+        clinical_history_col: str = "section_clinical_history",
+        comparison_col: str = "section_comparison",
+        technique_col: str = "section_technique",
+        procedure_comments_col: str = "section_procedure_comments",
+        summary_col: str = "section_summary",
+        accession_col: str = "section_accession_number",
     ) -> None:
         self.master_csv = str(master_csv)
         self.out_path = out_path
@@ -118,29 +139,43 @@ class ChexpertPlusCaseContextBuilder:
         self.patient_col = str(patient_col)
         self.image_col = str(image_col)
         self.split_col = str(split_col)
+        self.report_order_col = str(report_order_col)
 
         self.findings_col = str(findings_col)
         self.impression_col = str(impression_col)
         self.narrative_col = str(narrative_col)
+        self.history_col = str(history_col)
+        self.clinical_history_col = str(clinical_history_col)
+        self.comparison_col = str(comparison_col)
+        self.technique_col = str(technique_col)
+        self.procedure_comments_col = str(procedure_comments_col)
+        self.summary_col = str(summary_col)
+        self.accession_col = str(accession_col)
 
-        # Headers + section markers (whole-line)
+        # Whole-line administrative headers
         self.header_re = re.compile(
             r"^\s*(FINAL REPORT|EXAMINATION|REASON FOR EXAMINATION|INDICATION|HISTORY|TECHNIQUE|COMPARISON|"
-            r"CLINICAL INDICATION|CLINICAL HISTORY|DATE|TIME|DICTATED BY|SIGNED|PROVIDER|ATTENDING|EXAM|STUDY)\s*[:\-]?\s*",
+            r"CLINICAL INDICATION|CLINICAL HISTORY|DATE|TIME|DICTATED BY|SIGNED|PROVIDER|ATTENDING|EXAM|STUDY|"
+            r"NARRATIVE|ACCESSION NUMBER|SUMMARY)\s*[:\-]?\s*$",
             re.IGNORECASE,
         )
-        self.section_hdr_re = re.compile(r"^\s*(FINDINGS|IMPRESSION|CONCLUSION|RESULTS?)\s*:\s*$", re.IGNORECASE)
 
-        # inline section tokens that must be stripped wherever they appear
+        # True section headers when they appear as their own line
+        self.section_hdr_re = re.compile(
+            r"^\s*(FINDINGS|IMPRESSION|CONCLUSION|RESULTS?)\s*:\s*$",
+            re.IGNORECASE,
+        )
+
+        # Inline section tokens that must be stripped from final kept text
         self.inline_section_token_re = re.compile(
-            r"\b(FINDINGS|IMPRESSION|CONCLUSION|RESULTS?)\s*:\s*",
+            r"\b(FINDINGS|IMPRESSION|CONCLUSION|RESULTS?|NARRATIVE|SUMMARY|ACCESSION NUMBER|HISTORY|COMPARISON|TECHNIQUE)\s*:\s*",
             re.IGNORECASE,
         )
 
-        # Acquisition/view boilerplate words (line-level heuristic; do not drop clinical content)
+        # Acquisition/view boilerplate
         self.acq_boilerplate_re = re.compile(
             r"\b(portable|pa\b|ap\b|lateral|upright|semi[-\s]?erect|frontal|"
-            r"views?|radiograph|radiographs|cxr|chest\s+x[-\s]?ray|film)\b",
+            r"views?|radiograph|radiographs|cxr|chest\s+x[-\s]?ray|film|1\s*view|2\s*views?)\b",
             re.IGNORECASE,
         )
 
@@ -151,14 +186,21 @@ class ChexpertPlusCaseContextBuilder:
             r"airspace|vascular congestion|cardiomediastinal|cardiac|cardiomegaly|hilar|mediastinum|"
             r"tube|line|catheter|picc|central venous|cvc|endotracheal|ett|nasogastric|ng tube|enteric|dobhoff|"
             r"chest tube|pigtail|swan[-\s]?ganz|pa catheter|sv[co]|cavoatrial|junction|right atrium|carina|"
-            r"hemidiaphragm|rib|nodule|mass|calcified lymph nodes)\b",
+            r"hemidiaphragm|rib|nodule|mass|calcified lymph nodes|tracheostomy|aeration|atelectatic)\b",
             re.IGNORECASE,
         )
 
-        # Lines to drop when they are purely admin/communication
+        # Pure communication/admin tail lines
         self.drop_tail_re = re.compile(
             r"\b(results were communicated|communicated to|discussed with|called to|by phone|phone|paged|notified)\b",
             re.IGNORECASE,
+        )
+
+        # CheXpert-Plus specific footer noise
+        self.footer_noise_re = re.compile(
+            r"(this report has been anonymized\..*?$|"
+            r"i have personally reviewed the images.*?$)",
+            re.IGNORECASE | re.DOTALL,
         )
 
         self.underscore_re = re.compile(r"_+")
@@ -169,58 +211,99 @@ class ChexpertPlusCaseContextBuilder:
         s = str(x)
         return "" if s.lower() == "nan" else s
 
-    def _compose_raw_report_text(self, row: pd.Series, has_findings: bool, has_impression: bool, has_narrative: bool) -> str:
+    def _normalize_for_hash(self, x: str) -> str:
+        x = self._safe_str(x)
+        x = x.replace("\r\n", "\n").replace("\r", "\n")
+        x = re.sub(r"\s+", " ", x).strip().lower()
+        return x
+
+    def _stable_text_hash(self, x: str) -> str:
+        return hashlib.md5(self._normalize_for_hash(x).encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+    def _build_report_id(self, row: pd.Series) -> str:
         """
-        Prefer structured sections if present and non-empty, else fall back to report.
+        Prefer a real study-level identifier:
+          subject_id + patient_report_date_order
+
+        Fallback:
+          subject_id + md5(normalized raw report text)
+        """
+        patient_id = self._safe_str(row.get(self.patient_col, "")).strip()
+
+        if self.report_order_col in row.index:
+            order_val = self._safe_str(row.get(self.report_order_col, "")).strip()
+            if order_val:
+                return f"{patient_id}::ord::{order_val}"
+
+        raw_report = self._safe_str(row.get(self.report_col, ""))
+        return f"{patient_id}::hash::{self._stable_text_hash(raw_report)}"
+
+    def _add_section(self, parts: List[str], header: str, text: str) -> None:
+        text = self._safe_str(text).strip()
+        if not text:
+            return
+        parts.append(f"{header}:")
+        parts.append(text)
+
+    def _compose_raw_report_text(self, row: pd.Series) -> str:
+        """
+        Reconstruct a report-like text object with explicit headers.
+        This is crucial so that downstream cleaning behaves like the MIMIC pipeline.
         """
         parts: List[str] = []
 
-        if has_findings:
-            f = self._safe_str(row.get(self.findings_col, "")).strip()
-            if f:
-                parts.append(f)
+        # Prefer explicit sections if they exist
+        self._add_section(parts, "NARRATIVE", row.get(self.narrative_col, ""))
+        self._add_section(parts, "CLINICAL HISTORY", row.get(self.clinical_history_col, ""))
+        self._add_section(parts, "HISTORY", row.get(self.history_col, ""))
+        self._add_section(parts, "COMPARISON", row.get(self.comparison_col, ""))
+        self._add_section(parts, "TECHNIQUE", row.get(self.technique_col, ""))
+        self._add_section(parts, "PROCEDURE COMMENTS", row.get(self.procedure_comments_col, ""))
+        self._add_section(parts, "FINDINGS", row.get(self.findings_col, ""))
+        self._add_section(parts, "IMPRESSION", row.get(self.impression_col, ""))
+        self._add_section(parts, "SUMMARY", row.get(self.summary_col, ""))
+        self._add_section(parts, "ACCESSION NUMBER", row.get(self.accession_col, ""))
 
-        if has_impression:
-            imp = self._safe_str(row.get(self.impression_col, "")).strip()
-            if imp:
-                parts.append(imp)
-
-        # If we got nothing from findings/impression, try narrative
-        if not parts and has_narrative:
-            nar = self._safe_str(row.get(self.narrative_col, "")).strip()
-            if nar:
-                parts.append(nar)
-
-        # Final fallback
+        # If section fields are empty, fall back to full raw report
         if not parts:
             rep = self._safe_str(row.get(self.report_col, "")).strip()
             if rep:
-                parts.append(rep)
+                return rep
 
-        return "\n".join([p for p in parts if p]).strip()
+        return "\n\n".join(parts).strip()
 
-    def clean_report_to_case_context(self, raw_text: str) -> str:
+    def _preclean_raw_report_text(self, raw_text: str) -> str:
         """
-        Same cleaning philosophy as MIMIC:
-          - Prefer FINDINGS+IMPRESSION when present in the text
-          - Keep clinically meaningful narrative
-          - Drop admin headers, timestamps/signatures, and communication lines
-          - Strip inline section tokens anywhere in kept lines
+        Remove known dataset footer noise before line-based cleaning.
         """
         if not raw_text:
             return ""
 
-        # Normalize
         text = raw_text.replace("\r\n", "\n").replace("\r", "\n")
+        text = self.footer_noise_re.sub("", text)
         text = self.underscore_re.sub(" ", text)
         text = re.sub(r"[ \t]+", " ", text)
-        text = re.sub(r"\n{3,}", "\n\n", text).strip()
-        if not text:
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip()
+
+    def clean_report_to_case_context(self, raw_text: str) -> str:
+        """
+        Same philosophy as MIMIC:
+
+        - Prefer FINDINGS + IMPRESSION when present
+        - Keep clinically meaningful narrative outside sections
+        - Drop admin headers, timestamps, signatures, communication lines
+        - Strip inline section tokens at the end
+        """
+        raw_text = self._preclean_raw_report_text(raw_text)
+        if not raw_text:
             return ""
 
-        lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+        lines = [ln.strip() for ln in raw_text.split("\n") if ln.strip()]
+        if not lines:
+            return ""
 
-        # Parse sections (FINDINGS/IMPRESSION/...) for the "prefer" logic
+        # Parse true sections
         sections: Dict[str, List[str]] = {}
         current: Optional[str] = None
         for ln in lines:
@@ -239,6 +322,10 @@ class ChexpertPlusCaseContextBuilder:
                 return True
             if re.search(r"\b\d{1,2}:\d{2}\b", s):
                 return True
+            if re.search(r"\baccession number\b", s, re.IGNORECASE):
+                return True
+            if re.search(r"\banonymized\b", s, re.IGNORECASE):
+                return True
             return False
 
         def strip_inline_section_tokens(s: str) -> str:
@@ -251,6 +338,10 @@ class ChexpertPlusCaseContextBuilder:
                 return False
             if self.drop_tail_re.search(s):
                 return False
+            if re.search(r"\bi have personally reviewed the images\b", s, re.IGNORECASE):
+                return False
+            if re.search(r"\bthis report has been anonymized\b", s, re.IGNORECASE):
+                return False
             if self.acq_boilerplate_re.search(s) and not self.clinical_keep_re.search(s):
                 return False
             return True
@@ -258,7 +349,7 @@ class ChexpertPlusCaseContextBuilder:
         findings_lines = sections.get("FINDINGS", [])
         impression_lines = sections.get("IMPRESSION", [])
 
-        # Base selection: FINDINGS + IMPRESSION if present, else all lines
+        # Base selection: prefer findings+impression if present, else all lines
         if findings_lines or impression_lines:
             base = []
             base.extend(findings_lines)
@@ -268,7 +359,7 @@ class ChexpertPlusCaseContextBuilder:
 
         base_kept = [ln for ln in base if keep_line(ln)]
 
-        # Add clinically-rich non-section lines
+        # Add clinically rich non-section lines
         base_set = set(base)
         extra: List[str] = []
         for ln in lines:
@@ -298,52 +389,56 @@ class ChexpertPlusCaseContextBuilder:
     def build_case_context_table(self) -> pd.DataFrame:
         df = pd.read_csv(self.master_csv, encoding=self.encoding)
 
-        required = {self.report_col, self.patient_col, self.image_col}
+        required = {self.patient_col, self.report_col, self.image_col}
         missing = required - set(df.columns)
         if missing:
             raise ValueError(f"Missing required columns in master CSV: {missing}")
 
-        has_findings = self.findings_col in df.columns
-        has_impression = self.impression_col in df.columns
-        has_narrative = self.narrative_col in df.columns
         has_split = self.split_col in df.columns
 
-        # report_id: stable within CSV.
-        # We use (patient_id + normalized report text) as the unit. This avoids needing an explicit report id column.
-        # If CheXpert-Plus guarantees a dedicated report id column later, swap this to that column.
-        work = df[[c for c in [self.patient_col, self.image_col, self.split_col] if c in df.columns] + [self.report_col] +
-                  ([self.findings_col] if has_findings else []) +
-                  ([self.impression_col] if has_impression else []) +
-                  ([self.narrative_col] if has_narrative else [])].copy()
+        # Keep only needed columns
+        keep_cols = [self.patient_col, self.report_col, self.image_col]
+        if has_split:
+            keep_cols.append(self.split_col)
+        if self.report_order_col in df.columns:
+            keep_cols.append(self.report_order_col)
 
-        # normalize report text lightly for grouping
-        def norm_group_text(x: str) -> str:
-            x = self._safe_str(x)
-            x = x.replace("\r\n", "\n").replace("\r", "\n")
-            x = re.sub(r"\s+", " ", x).strip().lower()
-            return x
+        optional_cols = [
+            self.narrative_col,
+            self.clinical_history_col,
+            self.history_col,
+            self.comparison_col,
+            self.technique_col,
+            self.procedure_comments_col,
+            self.findings_col,
+            self.impression_col,
+            self.summary_col,
+            self.accession_col,
+        ]
+        for c in optional_cols:
+            if c in df.columns:
+                keep_cols.append(c)
 
-        # build a per-row raw text (prefer sections)
+        work = df[keep_cols].copy()
+        work[self.patient_col] = work[self.patient_col].astype(str).str.strip()
+
+        # Stable report_id
+        report_ids: List[str] = []
         raw_texts: List[str] = []
-        for _, r in tqdm(work.iterrows(), total=len(work), desc="Composing raw report text", miniters=1):
-            raw_texts.append(self._compose_raw_report_text(r, has_findings, has_impression, has_narrative))
+
+        for _, row in tqdm(
+            work.iterrows(),
+            total=len(work),
+            desc="Composing report_id and raw report text",
+            miniters=1,
+        ):
+            report_ids.append(self._build_report_id(row))
+            raw_texts.append(self._compose_raw_report_text(row))
+
+        work["report_id"] = report_ids
         work["__raw_text"] = raw_texts
-        work["__raw_text_norm"] = work["__raw_text"].map(norm_group_text)
 
-        # group key
-        work["__patient_id_str"] = work[self.patient_col].astype(str).str.strip()
-        work["report_id"] = work["__patient_id_str"] + "::" + work["__raw_text_norm"].map(
-            lambda s: str(abs(hash(s)))  # deterministic within one Python run, not across runs
-        )
-
-        # IMPORTANT: Python's built-in hash is not stable across processes by default.
-        # Replace with md5 for cross-run stability.
-        import hashlib
-        work["report_id"] = work["__patient_id_str"] + "::" + work["__raw_text_norm"].map(
-            lambda s: hashlib.md5(s.encode("utf-8", errors="ignore")).hexdigest()[:16]
-        )
-
-        # collapse to one row per report_id
+        # Collapse to one row per report_id
         agg_cols = {
             self.patient_col: "first",
             "__raw_text": "first",
@@ -355,14 +450,18 @@ class ChexpertPlusCaseContextBuilder:
         uniq = work.groupby("report_id", as_index=False).agg(agg_cols)
         uniq = uniq.rename(columns={"__raw_text": self.report_col, self.image_col: "n_images"})
 
-        # build case_context
+        # Build case_context
         case_contexts: List[str] = []
-        for raw in tqdm(uniq[self.report_col].astype(str).tolist(), desc=self.tqdm_desc, total=len(uniq), miniters=1):
+        for raw in tqdm(
+            uniq[self.report_col].astype(str).tolist(),
+            desc=self.tqdm_desc,
+            total=len(uniq),
+            miniters=1,
+        ):
             case_contexts.append(self.clean_report_to_case_context(self._safe_str(raw)))
 
         uniq["case_context"] = case_contexts
 
-        # final column order
         out_cols = ["report_id", self.patient_col]
         if has_split:
             out_cols.append(self.split_col)
@@ -380,19 +479,25 @@ class ChexpertPlusCaseContextBuilder:
 
 
 
-
 class ChexpertPlusFactsAndQABuilder:
     """
-    CheXpert-Plus external dataset: combined Step 2 + Step 3 in one class.
+    CheXpert-Plus external dataset: Step 2 + Step 3
 
-    Key fixes vs your current version:
-      1) subject_id is treated as STRING everywhere (never coerced to numeric).
-      2) QA builder is robust to empty outputs (no KeyError on report_id).
-      3) facts_long stores subject_id as string consistently (no mixed dtypes).
+    IMPORTANT:
+      - CheXpert-Plus does NOT use MIMIC-style CheXpert label columns here.
+      - Therefore Step 2 is NOT "aggregate 14 labels into facts_long".
+      - Instead, Step 2 builds lightweight text-derived facts from case_context.
+      - Step 3 builds QA rows from those report-level text facts.
 
-    Assumes:
-      - master_csv has columns: subject_id, path_to_image, report
-      - case_context_csv has columns: report_id, subject_id, case_context
+    Inputs:
+      - master_csv: chexpert_plus_reports.csv
+      - case_context_csv: chexpertplus_case_contexts.csv
+
+    Outputs:
+      - facts_long: report-level text facts
+      - qa_step3: QA rows derived from case_context / text facts
+
+    subject_id is always treated as string.
     """
 
     def __init__(
@@ -407,18 +512,10 @@ class ChexpertPlusFactsAndQABuilder:
         image_col: str = "path_to_image",
         report_col: str = "report",
         report_id_col: str = "report_id",
-        # optional section columns (if present)
-        findings_col: str = "section_findings",
-        impression_col: str = "section_impression",
-        narrative_col: str = "section_narrative",
-        # Step 2 behavior
-        include_negative_labels: bool = True,
-        # Step 3 knobs
-        max_label_qas_per_report: int = 14,
-        max_conjunction_qas_per_report: int = 3,
+        report_order_col: str = "patient_report_date_order",
+        # step 3 knobs
         add_key_findings: bool = True,
         add_normality: bool = True,
-        add_multi_label_conjunction: bool = True,
         add_device_presence: bool = True,
         add_device_tip_location: bool = True,
         add_devices_locations: bool = False,
@@ -431,9 +528,7 @@ class ChexpertPlusFactsAndQABuilder:
         max_sentences_uncertainty: int = 2,
         max_device_presence_qas_per_report: int = 8,
         max_device_tip_qas_per_report: int = 6,
-        skip_labels: Optional[Set[str]] = None,
         device_negation_window_chars: int = 45,
-        # progress
         tqdm_desc_facts: str = "Building facts_long (CheXpert-Plus Step 2)",
         tqdm_desc_qa: str = "Building QA table (CheXpert-Plus Step 3)",
     ) -> None:
@@ -447,19 +542,10 @@ class ChexpertPlusFactsAndQABuilder:
         self.image_col = str(image_col)
         self.report_col = str(report_col)
         self.report_id_col = str(report_id_col)
-
-        self.findings_col = str(findings_col)
-        self.impression_col = str(impression_col)
-        self.narrative_col = str(narrative_col)
-
-        self.include_negative_labels = bool(include_negative_labels)
-
-        self.max_label_qas_per_report = int(max_label_qas_per_report)
-        self.max_conjunction_qas_per_report = int(max_conjunction_qas_per_report)
+        self.report_order_col = str(report_order_col)
 
         self.add_key_findings = bool(add_key_findings)
         self.add_normality = bool(add_normality)
-        self.add_multi_label_conjunction = bool(add_multi_label_conjunction)
         self.add_device_presence = bool(add_device_presence)
         self.add_device_tip_location = bool(add_device_tip_location)
         self.add_devices_locations = bool(add_devices_locations)
@@ -473,19 +559,11 @@ class ChexpertPlusFactsAndQABuilder:
         self.max_sentences_uncertainty = int(max_sentences_uncertainty)
         self.max_device_presence_qas_per_report = int(max_device_presence_qas_per_report)
         self.max_device_tip_qas_per_report = int(max_device_tip_qas_per_report)
-
-        base_skip = skip_labels or {"no_finding"}
-        self.skip_labels = {self._normalize_label_token(s) for s in base_skip}
-
         self.device_negation_window_chars = int(device_negation_window_chars)
 
         self.tqdm_desc_facts = str(tqdm_desc_facts)
         self.tqdm_desc_qa = str(tqdm_desc_qa)
 
-        # Step 2 label semantics
-        self.valid_fact_values = {0, 1, 3}
-
-        # Step 3 sentence splitting only on punctuation boundaries (no newline splitting)
         self.sent_split_re = re.compile(r"(?<=[\.\?\!])\s+")
 
         self.drop_sentence_re = re.compile(
@@ -602,17 +680,11 @@ class ChexpertPlusFactsAndQABuilder:
             re.IGNORECASE,
         )
 
-
     def _safe_str(self, x) -> str:
         if x is None:
             return ""
         s = str(x)
         return "" if s.lower() == "nan" else s
-
-    def _normalize_label_token(self, s: str) -> str:
-        s = str(s).strip().lower().replace("_", " ")
-        s = re.sub(r"\s+", " ", s)
-        return s
 
     def _normalize_text(self, t: str) -> str:
         if t is None or (isinstance(t, float) and pd.isna(t)):
@@ -633,235 +705,10 @@ class ChexpertPlusFactsAndQABuilder:
             return False
         return span_n in ctx_n
 
-
-
-    # Step 1 compatibility: report_id
-
-    def _normalize_group_text(self, x: str) -> str:
-        x = self._safe_str(x)
-        x = x.replace("\r\n", "\n").replace("\r", "\n")
-        x = re.sub(r"\s+", " ", x).strip().lower()
-        return x
-
-    def _compose_raw_report_text(
-        self, row: pd.Series, has_findings: bool, has_impression: bool, has_narrative: bool
-    ) -> str:
-        parts: List[str] = []
-
-        if has_findings:
-            f = self._safe_str(row.get(self.findings_col, "")).strip()
-            if f:
-                parts.append(f)
-
-        if has_impression:
-            imp = self._safe_str(row.get(self.impression_col, "")).strip()
-            if imp:
-                parts.append(imp)
-
-        if not parts and has_narrative:
-            nar = self._safe_str(row.get(self.narrative_col, "")).strip()
-            if nar:
-                parts.append(nar)
-
-        if not parts:
-            rep = self._safe_str(row.get(self.report_col, "")).strip()
-            if rep:
-                parts.append(rep)
-
-        return "\n".join([p for p in parts if p]).strip()
-
-    def _compute_report_id(self, patient_id: str, raw_text: str) -> str:
+    def _compute_report_id(self, patient_id: str, report_order) -> str:
         pid = str(patient_id).strip()
-        norm = self._normalize_group_text(raw_text)
-        h = hashlib.md5(norm.encode("utf-8", errors="ignore")).hexdigest()[:16]
-        return f"{pid}::{h}"
-
-    # Step 2: facts_long
-
-    def _detect_label_columns(self, df: pd.DataFrame) -> List[str]:
-        meta = {
-            self.patient_col,
-            self.image_col,
-            self.split_col,
-            self.report_col,
-            self.report_id_col,
-            self.findings_col,
-            self.impression_col,
-            self.narrative_col,
-        }
-        label_cols: List[str] = []
-        for c in df.columns:
-            if c in meta:
-                continue
-            if pd.api.types.is_numeric_dtype(df[c]):
-                label_cols.append(c)
-        if not label_cols:
-            raise ValueError("No numeric label columns found. Provide explicit label column names.")
-        return label_cols
-
-    def _aggregate_labels_per_report(self, df: pd.DataFrame, label_cols: List[str]) -> pd.DataFrame:
-        use_cols = [self.report_id_col, self.patient_col] + (
-            [self.split_col] if self.split_col in df.columns else []
-        ) + label_cols
-
-        work = df[use_cols].copy()
-
-        # patient_id always as string
-        work[self.patient_col] = work[self.patient_col].astype(str).str.strip()
-        work[self.report_id_col] = work[self.report_id_col].astype(str).str.strip()
-
-        for c in label_cols:
-            work[c] = pd.to_numeric(work[c], errors="coerce")
-
-        pri_map = {2: 0, 0: 1, 3: 2, 1: 3}
-        for c in label_cols:
-            work[c] = work[c].map(pri_map).fillna(0).astype("int8")
-
-        g = work.groupby(self.report_id_col, as_index=False)
-
-        out = g[[self.patient_col]].first()
-        if self.split_col in work.columns:
-            out[self.split_col] = g[self.split_col].first()[self.split_col]
-
-        max_pri = g[label_cols].max()
-        inv_pri = {0: 2, 1: 0, 2: 3, 3: 1}
-        for c in label_cols:
-            out[c] = max_pri[c].map(inv_pri).astype("int8")
-
-        out[self.report_id_col] = g[self.report_id_col].first()[self.report_id_col]
-        return out
-
-    def _build_facts_long(self) -> pd.DataFrame:
-        master = pd.read_csv(self.master_csv)
-        ctx = pd.read_csv(self.case_context_csv)
-
-        required_master = {self.patient_col, self.image_col, self.report_col}
-        missing_master = required_master - set(master.columns)
-        if missing_master:
-            raise ValueError(f"Master CSV missing required columns: {missing_master}")
-
-        required_ctx = {self.report_id_col, self.patient_col, "case_context"}
-        missing_ctx = required_ctx - set(ctx.columns)
-        if missing_ctx:
-            raise ValueError(f"Case-context CSV missing columns: {missing_ctx}")
-
-        # normalize ids in ctx for merge stability
-        ctx = ctx.copy()
-        ctx[self.patient_col] = ctx[self.patient_col].astype(str).str.strip()
-        ctx[self.report_id_col] = ctx[self.report_id_col].astype(str).str.strip()
-
-        has_findings = self.findings_col in master.columns
-        has_impression = self.impression_col in master.columns
-        has_narrative = self.narrative_col in master.columns
-
-        if self.report_id_col not in master.columns:
-            raw_texts: List[str] = []
-            for _, r in tqdm(
-                master.iterrows(),
-                total=len(master),
-                desc="Composing raw report text for report_id",
-                miniters=1,
-            ):
-                raw_texts.append(self._compose_raw_report_text(r, has_findings, has_impression, has_narrative))
-            master["__raw_text_for_id"] = raw_texts
-
-            master[self.patient_col] = master[self.patient_col].astype(str).str.strip()
-            master[self.report_id_col] = [
-                self._compute_report_id(pid, txt)
-                for pid, txt in zip(
-                    master[self.patient_col].tolist(),
-                    master["__raw_text_for_id"].tolist(),
-                )
-            ]
-            master = master.drop(columns=["__raw_text_for_id"])
-
-        # normalize ids in master
-        master = master.copy()
-        master[self.patient_col] = master[self.patient_col].astype(str).str.strip()
-        master[self.report_id_col] = master[self.report_id_col].astype(str).str.strip()
-
-        label_cols = self._detect_label_columns(master)
-        per_report = self._aggregate_labels_per_report(master, label_cols)
-
-        merged = per_report.merge(
-            ctx[[self.report_id_col, self.patient_col, "case_context"] + ([self.split_col] if self.split_col in ctx.columns else [])],
-            on=[self.report_id_col, self.patient_col],
-            how="inner",
-            suffixes=("", "_ctx"),
-        )
-
-        if self.split_col in merged.columns and f"{self.split_col}_ctx" in merged.columns:
-            merged[self.split_col] = merged[f"{self.split_col}_ctx"].fillna(merged[self.split_col])
-            merged = merged.drop(columns=[f"{self.split_col}_ctx"])
-
-        long_rows: List[Dict[str, object]] = []
-        for _, row in tqdm(merged.iterrows(), total=len(merged), desc=self.tqdm_desc_facts, miniters=1):
-            for lab in label_cols:
-                v = int(row[lab])
-                if v not in self.valid_fact_values:
-                    continue
-                if (v == 0) and (not self.include_negative_labels):
-                    continue
-                long_rows.append(
-                    {
-                        self.patient_col: str(row[self.patient_col]).strip(),
-                        self.split_col: row[self.split_col] if self.split_col in merged.columns else None,
-                        self.report_id_col: str(row[self.report_id_col]).strip(),
-                        "case_context": row["case_context"],
-                        "label_name": lab,
-                        "label_value": v,
-                    }
-                )
-
-        facts = pd.DataFrame(long_rows)
-
-        if self.out_facts_path:
-            outp = Path(self.out_facts_path)
-            outp.parent.mkdir(parents=True, exist_ok=True)
-            facts.to_csv(outp, index=False)
-
-        return facts
-
-
-    # Step 3: QA
-
-    def _label_value_to_answer(self, v: int) -> str:
-        if v == 1:
-            return "Yes."
-        if v == 0:
-            return "No."
-        if v == 3:
-            return "Uncertain."
-        raise ValueError(f"Unexpected label_value: {v}")
-
-    def _label_value_to_claim(self, label_phrase: str, v: int) -> str:
-        if v == 1:
-            return f"{label_phrase} is present"
-        if v == 0:
-            return f"{label_phrase} is absent"
-        if v == 3:
-            return f"{label_phrase} is uncertain"
-        raise ValueError(f"Unexpected label_value: {v}")
-
-    def _safe_int_label_value(self, x) -> Optional[int]:
-        try:
-            if pd.isna(x):
-                return None
-            return int(float(x))
-        except Exception:
-            return None
-
-    def _aggregate_label_values(self, values: List[int]) -> Optional[int]:
-        if not values:
-            return None
-        s = set(values)
-        if 1 in s:
-            return 1
-        if 3 in s:
-            return 3
-        if 0 in s:
-            return 0
-        return None
+        order = self._safe_str(report_order).strip()
+        return f"{pid}::{order}"
 
     def _split_sentences(self, text: str) -> List[str]:
         t = self._normalize_text(text)
@@ -981,30 +828,175 @@ class ChexpertPlusFactsAndQABuilder:
                 present.append(name)
         return present
 
+    def _build_facts_long(self) -> pd.DataFrame:
+        """
+        Step 2 for CheXpert-Plus:
+        build lightweight report-level text facts from case_context.
+        No label columns are used.
+        """
+        ctx = pd.read_csv(self.case_context_csv)
+
+        required_ctx = {self.report_id_col, self.patient_col, "case_context"}
+        missing_ctx = required_ctx - set(ctx.columns)
+        if missing_ctx:
+            raise ValueError(f"Case-context CSV missing columns: {missing_ctx}")
+
+        if self.split_col not in ctx.columns:
+            ctx[self.split_col] = None
+
+        ctx = ctx.copy()
+        ctx[self.patient_col] = ctx[self.patient_col].astype(str).str.strip()
+        ctx[self.report_id_col] = ctx[self.report_id_col].astype(str).str.strip()
+        ctx["case_context"] = ctx["case_context"].map(self._safe_str)
+
+        rows: List[Dict[str, object]] = []
+
+        for _, row in tqdm(ctx.iterrows(), total=len(ctx), desc=self.tqdm_desc_facts, miniters=1):
+            subject_id = str(row[self.patient_col]).strip()
+            report_id = str(row[self.report_id_col]).strip()
+            split = row[self.split_col]
+            case_context = self._normalize_text(row["case_context"])
+
+            if not case_context:
+                continue
+
+            norm_span = self._find_normality_spans(case_context)
+            key_span = self._extract_key_findings(case_context)
+            tmp_span = self._extract_temporal_change(case_context)
+            comp_span = self._extract_compositional_spans(case_context)
+            unc_span = self._extract_uncertainty_spans(case_context)
+
+            device_sents = self._extract_device_sentences(case_context)
+            tip_sents = self._extract_tip_location_spans(device_sents, case_context)
+            present_devices = self._detect_present_devices(device_sents)
+
+            if norm_span:
+                rows.append(
+                    {
+                        self.patient_col: subject_id,
+                        self.split_col: split,
+                        self.report_id_col: report_id,
+                        "case_context": case_context,
+                        "fact_type": "normality_statement",
+                        "fact_text": norm_span,
+                    }
+                )
+
+            if key_span:
+                rows.append(
+                    {
+                        self.patient_col: subject_id,
+                        self.split_col: split,
+                        self.report_id_col: report_id,
+                        "case_context": case_context,
+                        "fact_type": "key_findings",
+                        "fact_text": key_span,
+                    }
+                )
+
+            if tmp_span:
+                rows.append(
+                    {
+                        self.patient_col: subject_id,
+                        self.split_col: split,
+                        self.report_id_col: report_id,
+                        "case_context": case_context,
+                        "fact_type": "temporal_change",
+                        "fact_text": tmp_span,
+                    }
+                )
+
+            if comp_span:
+                rows.append(
+                    {
+                        self.patient_col: subject_id,
+                        self.split_col: split,
+                        self.report_id_col: report_id,
+                        "case_context": case_context,
+                        "fact_type": "compositional_finding",
+                        "fact_text": comp_span,
+                    }
+                )
+
+            if unc_span:
+                rows.append(
+                    {
+                        self.patient_col: subject_id,
+                        self.split_col: split,
+                        self.report_id_col: report_id,
+                        "case_context": case_context,
+                        "fact_type": "limitation_uncertainty",
+                        "fact_text": unc_span,
+                    }
+                )
+
+            for dev_name in present_devices:
+                rows.append(
+                    {
+                        self.patient_col: subject_id,
+                        self.split_col: split,
+                        self.report_id_col: report_id,
+                        "case_context": case_context,
+                        "fact_type": "device_presence",
+                        "fact_text": dev_name,
+                    }
+                )
+
+            for s in tip_sents:
+                rows.append(
+                    {
+                        self.patient_col: subject_id,
+                        self.split_col: split,
+                        self.report_id_col: report_id,
+                        "case_context": case_context,
+                        "fact_type": "device_tip_location",
+                        "fact_text": s,
+                    }
+                )
+
+        facts = pd.DataFrame(rows)
+        if facts.empty:
+            facts = pd.DataFrame(
+                columns=[
+                    self.patient_col,
+                    self.split_col,
+                    self.report_id_col,
+                    "case_context",
+                    "fact_type",
+                    "fact_text",
+                ]
+            )
+
+        if self.out_facts_path:
+            outp = Path(self.out_facts_path)
+            outp.parent.mkdir(parents=True, exist_ok=True)
+            facts.to_csv(outp, index=False)
+
+        return facts
+
     def _build_qa_from_facts_long(self, facts: pd.DataFrame) -> pd.DataFrame:
         required = {
             self.patient_col,
             self.report_id_col,
             "case_context",
-            "label_name",
-            "label_value",
+            "fact_type",
+            "fact_text",
         }
         missing = required - set(facts.columns)
         if missing:
             raise ValueError(f"facts_long is missing columns: {missing}")
 
         facts = facts.copy()
-
         if self.split_col not in facts.columns:
             facts[self.split_col] = None
 
-        # Harden types WITHOUT dropping non-numeric patient ids
         facts[self.report_id_col] = facts[self.report_id_col].astype(str).str.strip()
         facts[self.patient_col] = facts[self.patient_col].astype(str).str.strip()
+        facts["fact_type"] = facts["fact_type"].astype(str).str.strip()
+        facts["fact_text"] = facts["fact_text"].map(self._safe_str)
         facts = facts[facts[self.report_id_col] != ""].copy()
 
         groups = facts.groupby(self.report_id_col, sort=False)
-
         out_rows: List[Dict[str, object]] = []
 
         for report_id, g in tqdm(groups, desc=self.tqdm_desc_qa, total=groups.ngroups, miniters=1):
@@ -1014,82 +1006,13 @@ class ChexpertPlusFactsAndQABuilder:
             g0 = g.iloc[0]
             patient_id = str(g0[self.patient_col]).strip()
             split = g0[self.split_col] if self.split_col in g.columns else None
-
             case_context = self._normalize_text(g0["case_context"])
-            if case_context.lower() == "nan":
-                case_context = ""
 
-            # 1) label_presence (robust aggregation)
-            label_qas_added = 0
-            agg_map: Dict[str, Dict[str, object]] = {}
-
-            gg = g[["label_name", "label_value"]].copy()
-            gg = gg[~gg["label_name"].isna()]
-            gg["label_name"] = gg["label_name"].astype(str).str.strip()
-            gg = gg[gg["label_name"] != ""]
-
-            if not gg.empty:
-                gg["__lab_norm"] = gg["label_name"].map(self._normalize_label_token)
-                gg["__v"] = gg["label_value"].map(self._safe_int_label_value)
-                gg = gg[~gg["__v"].isna()]
-                gg["__v"] = gg["__v"].astype(int)
-                gg = gg[gg["__v"].isin([0, 1, 3])]
-
-                for _, r in gg.iterrows():
-                    lab_raw = str(r["label_name"]).strip()
-                    lab_norm = str(r["__lab_norm"]).strip()
-                    v = int(r["__v"])
-
-                    if not lab_norm:
-                        continue
-                    if lab_norm in self.skip_labels:
-                        continue
-                    if (v == 0) and (not self.include_negative_labels):
-                        continue
-
-                    if lab_norm not in agg_map:
-                        agg_map[lab_norm] = {"lab_raw": lab_raw, "values": [v]}
-                    else:
-                        agg_map[lab_norm]["values"].append(v)
-
-                for lab_norm in sorted(agg_map.keys()):
-                    v_agg = self._aggregate_label_values([int(x) for x in agg_map[lab_norm]["values"]])
-                    if v_agg is None:
-                        continue
-
-                    question = f"Is there {lab_norm}?"
-                    answer_target = self._label_value_to_answer(int(v_agg))
-                    claim_text = self._label_value_to_claim(lab_norm, int(v_agg))
-
-                    key = (report_id, "label_presence", question)
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-
-                    out_rows.append(
-                        {
-                            self.patient_col: patient_id,
-                            self.split_col: split,
-                            self.report_id_col: report_id,
-                            "qa_type": "label_presence",
-                            "case_context": case_context,
-                            "question": question,
-                            "answer_target": answer_target,
-                            "claim_text": claim_text,
-                            "supporting_span": "",
-                            "label_name": str(agg_map[lab_norm]["lab_raw"]),
-                            "label_value": int(v_agg),
-                        }
-                    )
-
-                    label_qas_added += 1
-                    if self.max_label_qas_per_report > 0 and label_qas_added >= self.max_label_qas_per_report:
-                        break
-
-            # 2) normality_statement
-            if self.add_normality and case_context:
-                norm_span = self._find_normality_spans(case_context)
-                if norm_span:
+            # normality_statement
+            if self.add_normality:
+                rows = g[g["fact_type"] == "normality_statement"]
+                if len(rows) > 0:
+                    norm_span = self._safe_str(rows.iloc[0]["fact_text"])
                     question = "Is the study described as showing an acute cardiopulmonary abnormality?"
                     if re.search(r"\bno acute\b", norm_span, re.IGNORECASE) and not self.hedge_re.search(norm_span):
                         answer_target = "No."
@@ -1117,91 +1040,11 @@ class ChexpertPlusFactsAndQABuilder:
                             }
                         )
 
-            # 3) multi_label_conjunction
-            if self.add_multi_label_conjunction and agg_map:
-                lab_to_v: Dict[str, int] = {}
-                for lab_norm, payload in agg_map.items():
-                    v_agg = self._aggregate_label_values([int(x) for x in payload["values"]])
-                    if v_agg is None:
-                        continue
-                    lab_to_v[lab_norm] = int(v_agg)
-
-                neg = sorted([l for l, v in lab_to_v.items() if v == 0])
-                pos = sorted([l for l, v in lab_to_v.items() if v == 1])
-
-                conj_added = 0
-
-                for i in range(len(neg)):
-                    for j in range(i + 1, len(neg)):
-                        a, b = neg[i], neg[j]
-                        question = f"Are {a} and {b} present?"
-                        answer_target = "No, neither is present."
-                        claim_text = f"{a} is absent; {b} is absent"
-
-                        key = (report_id, "multi_label_conjunction", f"{question}|{a}|{b}")
-                        if key in seen_keys:
-                            continue
-                        seen_keys.add(key)
-
-                        out_rows.append(
-                            {
-                                self.patient_col: patient_id,
-                                self.split_col: split,
-                                self.report_id_col: report_id,
-                                "qa_type": "multi_label_conjunction",
-                                "case_context": case_context,
-                                "question": question,
-                                "answer_target": answer_target,
-                                "claim_text": claim_text,
-                                "supporting_span": "",
-                                "label_name": f"{a}|{b}",
-                                "label_value": 0,
-                            }
-                        )
-                        conj_added += 1
-                        if conj_added >= self.max_conjunction_qas_per_report:
-                            break
-                    if conj_added >= self.max_conjunction_qas_per_report:
-                        break
-
-                if conj_added < self.max_conjunction_qas_per_report:
-                    for i in range(len(pos)):
-                        for j in range(i + 1, len(pos)):
-                            a, b = pos[i], pos[j]
-                            question = f"Are {a} and {b} present?"
-                            answer_target = "Yes, both are present."
-                            claim_text = f"{a} is present; {b} is present"
-
-                            key = (report_id, "multi_label_conjunction", f"{question}|{a}|{b}")
-                            if key in seen_keys:
-                                continue
-                            seen_keys.add(key)
-
-                            out_rows.append(
-                                {
-                                    self.patient_col: patient_id,
-                                    self.split_col: split,
-                                    self.report_id_col: report_id,
-                                    "qa_type": "multi_label_conjunction",
-                                    "case_context": case_context,
-                                    "question": question,
-                                    "answer_target": answer_target,
-                                    "claim_text": claim_text,
-                                    "supporting_span": "",
-                                    "label_name": f"{a}|{b}",
-                                    "label_value": 1,
-                                }
-                            )
-                            conj_added += 1
-                            if conj_added >= self.max_conjunction_qas_per_report:
-                                break
-                        if conj_added >= self.max_conjunction_qas_per_report:
-                            break
-
-            # 4) key_findings
-            if self.add_key_findings and case_context:
-                findings_span = self._extract_key_findings(case_context)
-                if findings_span:
+            # key_findings
+            if self.add_key_findings:
+                rows = g[g["fact_type"] == "key_findings"]
+                if len(rows) > 0:
+                    findings_span = self._safe_str(rows.iloc[0]["fact_text"])
                     question = "What are the key imaging findings?"
                     key = (report_id, "key_findings", question)
                     if key not in seen_keys:
@@ -1222,13 +1065,86 @@ class ChexpertPlusFactsAndQABuilder:
                             }
                         )
 
-            # 5) devices
-            if (self.add_device_presence or self.add_device_tip_location or self.add_devices_locations) and case_context:
-                dev_sents = self._extract_device_sentences(case_context)
+            # device_presence
+            if self.add_device_presence:
+                rows = g[g["fact_type"] == "device_presence"]
+                dev_added = 0
+                for _, r in rows.iterrows():
+                    dev_name = self._safe_str(r["fact_text"])
+                    question = f"Is a {dev_name} present?"
+                    key = (report_id, "device_presence", question)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
 
-                if self.add_devices_locations and dev_sents:
-                    dev_span = " ".join(dev_sents[:2]).strip()
-                    if dev_span and self._is_extractive(dev_span, case_context):
+                    out_rows.append(
+                        {
+                            self.patient_col: patient_id,
+                            self.split_col: split,
+                            self.report_id_col: report_id,
+                            "qa_type": "device_presence",
+                            "case_context": case_context,
+                            "question": question,
+                            "answer_target": "Yes.",
+                            "claim_text": f"{dev_name} is present",
+                            "supporting_span": "",
+                            "label_name": dev_name,
+                            "label_value": 1,
+                        }
+                    )
+                    dev_added += 1
+                    if dev_added >= self.max_device_presence_qas_per_report:
+                        break
+
+            # device_tip_location
+            if self.add_device_tip_location:
+                rows = g[g["fact_type"] == "device_tip_location"]
+                tip_added = 0
+                for _, r in rows.iterrows():
+                    s = self._safe_str(r["fact_text"])
+                    dev_label = None
+                    for name, pat in self.device_presence_vocab:
+                        if pat.search(s):
+                            dev_label = name
+                            break
+
+                    question = (
+                        f"Where does the {dev_label} terminate?"
+                        if dev_label
+                        else "Where does the line or tube terminate?"
+                    )
+                    span_hash = self._stable_hash(s)
+                    key = (report_id, "device_tip_location", f"{question}|{span_hash}")
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+
+                    out_rows.append(
+                        {
+                            self.patient_col: patient_id,
+                            self.split_col: split,
+                            self.report_id_col: report_id,
+                            "qa_type": "device_tip_location",
+                            "case_context": case_context,
+                            "question": question,
+                            "answer_target": s,
+                            "claim_text": s,
+                            "supporting_span": s,
+                            "label_name": None,
+                            "label_value": None,
+                        }
+                    )
+                    tip_added += 1
+                    if tip_added >= self.max_device_tip_qas_per_report:
+                        break
+
+            # devices_locations
+            if self.add_devices_locations:
+                dev_rows = g[g["fact_type"].isin(["device_presence", "device_tip_location"])]
+                if len(dev_rows) > 0:
+                    dev_texts = dev_rows["fact_text"].astype(str).tolist()[:2]
+                    dev_span = " ".join(dev_texts).strip()
+                    if dev_span:
                         question = "What devices are present and where are they located?"
                         key = (report_id, "devices_locations", question)
                         if key not in seen_keys:
@@ -1249,77 +1165,11 @@ class ChexpertPlusFactsAndQABuilder:
                                 }
                             )
 
-                if self.add_device_presence and dev_sents:
-                    present_devices = self._detect_present_devices(dev_sents)
-                    dev_added = 0
-                    for dev_name in present_devices:
-                        question = f"Is a {dev_name} present?"
-                        key = (report_id, "device_presence", question)
-                        if key in seen_keys:
-                            continue
-                        seen_keys.add(key)
-
-                        out_rows.append(
-                            {
-                                self.patient_col: patient_id,
-                                self.split_col: split,
-                                self.report_id_col: report_id,
-                                "qa_type": "device_presence",
-                                "case_context": case_context,
-                                "question": question,
-                                "answer_target": "Yes.",
-                                "claim_text": f"{dev_name} is present",
-                                "supporting_span": "",
-                                "label_name": dev_name,
-                                "label_value": 1,
-                            }
-                        )
-                        dev_added += 1
-                        if dev_added >= self.max_device_presence_qas_per_report:
-                            break
-
-                if self.add_device_tip_location and dev_sents:
-                    tip_sents = self._extract_tip_location_spans(dev_sents, case_context)
-                    tip_added = 0
-                    for s in tip_sents:
-                        dev_label = None
-                        for name, pat in self.device_presence_vocab:
-                            if pat.search(s):
-                                dev_label = name
-                                break
-
-                        question = (
-                            f"Where does the {dev_label} terminate?" if dev_label else "Where does the line or tube terminate?"
-                        )
-                        span_hash = self._stable_hash(s)
-                        key = (report_id, "device_tip_location", f"{question}|{span_hash}")
-                        if key in seen_keys:
-                            continue
-                        seen_keys.add(key)
-
-                        out_rows.append(
-                            {
-                                self.patient_col: patient_id,
-                                self.split_col: split,
-                                self.report_id_col: report_id,
-                                "qa_type": "device_tip_location",
-                                "case_context": case_context,
-                                "question": question,
-                                "answer_target": s,
-                                "claim_text": s,
-                                "supporting_span": s,
-                                "label_name": None,
-                                "label_value": None,
-                            }
-                        )
-                        tip_added += 1
-                        if tip_added >= self.max_device_tip_qas_per_report:
-                            break
-
-            # 6) temporal_change
-            if self.add_temporal_change and case_context:
-                tmp_span = self._extract_temporal_change(case_context)
-                if tmp_span:
+            # temporal_change
+            if self.add_temporal_change:
+                rows = g[g["fact_type"] == "temporal_change"]
+                if len(rows) > 0:
+                    tmp_span = self._safe_str(rows.iloc[0]["fact_text"])
                     question = "What interval changes are described?"
                     key = (report_id, "temporal_change", question)
                     if key not in seen_keys:
@@ -1340,10 +1190,11 @@ class ChexpertPlusFactsAndQABuilder:
                             }
                         )
 
-            # 7) compositional_finding
-            if self.add_compositional_findings and case_context:
-                comp_span = self._extract_compositional_spans(case_context)
-                if comp_span:
+            # compositional_finding
+            if self.add_compositional_findings:
+                rows = g[g["fact_type"] == "compositional_finding"]
+                if len(rows) > 0:
+                    comp_span = self._safe_str(rows.iloc[0]["fact_text"])
                     question = "Describe the abnormal finding."
                     key = (report_id, "compositional_finding", f"{question}|{self._stable_hash(comp_span)}")
                     if key not in seen_keys:
@@ -1364,10 +1215,11 @@ class ChexpertPlusFactsAndQABuilder:
                             }
                         )
 
-            # 8) limitation_uncertainty
-            if self.add_limitation_uncertainty and case_context:
-                u_span = self._extract_uncertainty_spans(case_context)
-                if u_span:
+            # limitation_uncertainty
+            if self.add_limitation_uncertainty:
+                rows = g[g["fact_type"] == "limitation_uncertainty"]
+                if len(rows) > 0:
+                    u_span = self._safe_str(rows.iloc[0]["fact_text"])
                     question = "What limitation or uncertainty is described?"
                     key = (report_id, "limitation_uncertainty", f"{question}|{self._stable_hash(u_span)}")
                     if key not in seen_keys:
@@ -1390,7 +1242,6 @@ class ChexpertPlusFactsAndQABuilder:
 
         qa = pd.DataFrame(out_rows)
 
-        # robust empty return (prevents KeyError and makes downstream predictable)
         if qa.empty:
             qa = pd.DataFrame(
                 columns=[
@@ -1418,14 +1269,10 @@ class ChexpertPlusFactsAndQABuilder:
 
         return qa
 
-
-
     def run(self) -> Tuple[pd.DataFrame, pd.DataFrame]:
         facts = self._build_facts_long()
         qa = self._build_qa_from_facts_long(facts)
         return facts, qa
-
-
 
 
 
@@ -2489,6 +2336,10 @@ def create_fixed_chexpert_test_eval_parquet(
 
 
 
+
+
+
+
 if __name__ == "__main__":
     # patient_split(csv_path=os.path.join(base_path_chexpertData, "df_chexpert_plus_240401.csv"),
     #               outpath=os.path.join(base_path_chexpertData, "chexpert_plus_reports.csv"))
@@ -2498,61 +2349,81 @@ if __name__ == "__main__":
     base_path_chexpertData = params["Preprocessing"]["base_path_mimicData"]
     base_path_evidenceData = params["Preprocessing"]["base_path_evidenceData"]
 
-
     ''' step 1 '''
     # builder = ChexpertPlusCaseContextBuilder(
     #     master_csv=os.path.join(base_path_chexpertData, "chexpert_plus_reports.csv"),
     #     out_path=os.path.join(base_path_chexpertData, "chexpertplus_case_contexts.csv"),
+    #     report_col="report",
+    #     patient_col="subject_id",
+    #     image_col="path_to_image",
+    #     split_col="split",
+    #     report_order_col="patient_report_date_order",
+    #     findings_col="section_findings",
+    #     impression_col="section_impression",
+    #     narrative_col="section_narrative",
+    #     history_col="section_history",
+    #     clinical_history_col="section_clinical_history",
+    #     comparison_col="section_comparison",
+    #     technique_col="section_technique",
+    #     procedure_comments_col="section_procedure_comments",
+    #     summary_col="section_summary",
+    #     accession_col="section_accession_number",
     # )
     # out_df = builder.build_case_context_table()
     # print(out_df[["report_id", "subject_id", "case_context"]].head(3))
     # print("Rows:", len(out_df))
-    #
-    #
-    #
-    # ''' steps 2 & 3 '''
+
+    ''' steps 2 & 3 '''
     # builder = ChexpertPlusFactsAndQABuilder(
     #     master_csv=os.path.join(base_path_chexpertData, "chexpert_plus_reports.csv"),
     #     case_context_csv=os.path.join(base_path_chexpertData, "chexpertplus_case_contexts.csv"),
     #     out_facts_path=os.path.join(base_path_chexpertData, "chexpertplus_facts_long.csv"),
     #     out_qa_path=os.path.join(base_path_chexpertData, "chexpertplus_qa_step3.csv"),
+    #     patient_col="subject_id",
+    #     image_col="path_to_image",
+    #     report_col="report",
+    #     report_id_col="report_id",
+    #     report_order_col="patient_report_date_order",
+    #     split_col="split",
     # )
     # facts_df, qa_df = builder.run()
     # print("facts:", len(facts_df), "qa:", len(qa_df))
+    # print(facts_df.head(3))
+    # print(qa_df[["report_id", "qa_type", "question", "answer_target"]].head(5))
 
 
 
     ''' step 4C '''
-    # builder = CheXpertRadiopaediaStep4ExternalTestBuilder(
-    #     qa_csv=os.path.join(base_path_chexpertData, "chexpertplus_qa_step3.csv"),
-    #     chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
-    #     out_dir=os.path.join(base_path_evidenceData, "chexpert_step4c"),
-    #     top_k=20,
-    #     alpha=0.85,
-    #     temperature=0.07,
-    #     seed=13,
-    # )
-    # builder.run()
+    builder = CheXpertRadiopaediaStep4ExternalTestBuilder(
+        qa_csv=os.path.join(base_path_chexpertData, "chexpertplus_qa_step3.csv"),
+        chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
+        out_dir=os.path.join(base_path_evidenceData, "chexpert_step4c"),
+        top_k=20,
+        alpha=0.85,
+        temperature=0.07,
+        seed=13,
+    )
+    builder.run()
 
 
 
     ''' Creating the final mimic eval parquet from Step 4C '''
-    verifier_supervision_parquet = os.path.join(base_path_evidenceData, "chexpert_step4c", "verifier_supervision.parquet")
-    radiopaedia_chunks_parquet = os.path.join(base_path_evidenceData, "chunks.parquet")
-    out_eval_parquet = os.path.join(base_path_evidenceData, "phase1_fixed_test_eval_chexpertplus", "chexpertplus_test_eval.parquet")
-
-
-    create_fixed_chexpert_test_eval_parquet(
-        verifier_supervision_parquet=verifier_supervision_parquet,
-        out_parquet=out_eval_parquet,
-        evidence_parquet=radiopaedia_chunks_parquet,
-        evidence_id_col="chunk_id",
-        evidence_text_col="chunk_text",
-        evidence_id_base=0,  # change to 1 if ids start from 1
-        preload_evidence_texts=False,
-        split_value="test",
-        parquet_batch_rows=50_000,
-        parquet_compression="zstd",
-        seed=13,
-        write_manifest_json=True,
-    )
+    # verifier_supervision_parquet = os.path.join(base_path_evidenceData, "chexpert_step4c", "verifier_supervision.parquet")
+    # radiopaedia_chunks_parquet = os.path.join(base_path_evidenceData, "chunks.parquet")
+    # out_eval_parquet = os.path.join(base_path_evidenceData, "phase1_fixed_test_eval_chexpertplus", "chexpertplus_test_eval.parquet")
+    #
+    #
+    # create_fixed_chexpert_test_eval_parquet(
+    #     verifier_supervision_parquet=verifier_supervision_parquet,
+    #     out_parquet=out_eval_parquet,
+    #     evidence_parquet=radiopaedia_chunks_parquet,
+    #     evidence_id_col="chunk_id",
+    #     evidence_text_col="chunk_text",
+    #     evidence_id_base=0,  # change to 1 if ids start from 1
+    #     preload_evidence_texts=False,
+    #     split_value="test",
+    #     parquet_batch_rows=50_000,
+    #     parquet_compression="zstd",
+    #     seed=13,
+    #     write_manifest_json=True,
+    # )
