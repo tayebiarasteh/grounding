@@ -65,6 +65,12 @@ import torch.nn as nn
 import math
 import pickle
 import heapq
+import matplotlib.pyplot as plt
+from scipy.stats import spearmanr, pearsonr
+from openai import OpenAI
+import time
+import openai
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 from models.model import BiEncoder
 from config.serde import open_experiment, create_experiment, delete_experiment, write_config
@@ -73,6 +79,8 @@ from config.serde import open_experiment, create_experiment, delete_experiment, 
 import warnings
 warnings.filterwarnings('ignore')
 
+openai.api_key = "PLACEHOLDER"
+os.environ["OPENAI_API_KEY"] = "PLACEHOLDER"
 
 
 
@@ -186,19 +194,11 @@ class S4Tier123End2EndEvaluatorTestOnly:
         except Exception:
             pass
 
-    class _DebertaRegressor(nn.Module):
-        def __init__(self, model_name: str):
-            super().__init__()
-            self.backbone = AutoModel.from_pretrained(model_name)
-            hidden = self.backbone.config.hidden_size
-            self.reg_head = nn.Linear(hidden, 1)
-
-        def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-            out = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-            cls = out.last_hidden_state[:, 0, :]
-            cls = cls.to(self.reg_head.weight.dtype)
-            y = self.reg_head(cls).squeeze(-1)
-            return y
+    def _safe_str(self, x) -> str:
+        if x is None:
+            return ""
+        s = str(x)
+        return "" if s.lower() == "nan" else s
 
     def _load_chunk_map(self) -> Dict[int, str]:
         if not os.path.exists(self.chunks_parquet):
@@ -236,14 +236,17 @@ class S4Tier123End2EndEvaluatorTestOnly:
     def _load_verifier(self) -> None:
         vname = self.params["Verifier"]["model_name"]
         self.verifier_tok = AutoTokenizer.from_pretrained(vname, use_fast=True)
-        self.verifier_model = self._DebertaRegressor(vname).to(self.device)
+
+        self.verifier_model = AutoModelForSequenceClassification.from_pretrained(
+            vname,
+            num_labels=1,
+            problem_type="regression",
+        ).to(self.device)
         self.verifier_model.eval()
 
         obj = torch.load(self.verifier_weights_path, map_location="cpu")
         state = obj["model_state_dict"] if (isinstance(obj, dict) and "model_state_dict" in obj) else obj
-        missing, unexpected = self.verifier_model.load_state_dict(state, strict=False)
-        if missing or unexpected:
-            print(f"[WARN] Verifier load_state_dict strict=False. missing={len(missing)} unexpected={len(unexpected)}")
+        self.verifier_model.load_state_dict(state, strict=True)
 
     def _loads_json_list(self, s: str) -> List:
         try:
@@ -269,8 +272,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
         if raw.lower() in {"flatip", "flat_ip", "flat-ип", "flatinnerproduct"}:
             return "Flat"
         if raw.lower() == "flatl2":
-            return "Flat"  # we still pass METRIC_INNER_PRODUCT; keep retrieval consistent
-        # Common mistake: suffix "IP" appended to "Flat"
+            return "Flat"
         if raw.endswith("IP") and raw[:-2] == "Flat":
             return "Flat"
         return raw
@@ -288,7 +290,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
         if not os.path.exists(self.chunks_parquet):
             raise FileNotFoundError(self.chunks_parquet)
 
-        # Stream chunks parquet to avoid big RAM spikes
         pf = pq.ParquetFile(self.chunks_parquet)
         n_rows = pf.metadata.num_rows if pf.metadata is not None else 0
 
@@ -314,7 +315,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
                 if not texts:
                     continue
 
-                # Embed in sub-batches
                 for i in range(0, len(texts), self.batch_size_embed_docs):
                     t_batch = texts[i:i + self.batch_size_embed_docs]
                     id_batch = ids[i:i + self.batch_size_embed_docs]
@@ -354,7 +354,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
 
         index.add(X)
         self.faiss_index = index
-
 
     # Retrieval (R*)
     def _tokenize_queries(self, texts: List[str]) -> Dict[str, torch.Tensor]:
@@ -406,13 +405,30 @@ class S4Tier123End2EndEvaluatorTestOnly:
                 texts.append(t)
         return self.evidence_sep.join(texts)
 
-
     # Verifier inference
-    def _build_verifier_inputs(self, question: str, case_context: str, evidence_text: str) -> str:
-        q = " ".join(str(question).split()).strip()
-        c = " ".join(str(case_context).split()).strip()
-        e = " ".join(str(evidence_text).split()).strip()
-        return f"Question: {q}\nCase: {c}\nEvidence: {e}"
+    def _build_verifier_inputs(
+        self,
+        case_context: str,
+        question: str,
+        answer_target: str,
+        claim_text: str,
+        evidence_text: str,
+    ) -> str:
+        sep = "\n\n"
+        return sep.join(
+            [
+                "CASE:",
+                self._safe_str(case_context).strip(),
+                "QUESTION:",
+                self._safe_str(question).strip(),
+                "ANSWER_TARGET:",
+                self._safe_str(answer_target).strip(),
+                "CLAIM:",
+                self._safe_str(claim_text).strip(),
+                "EVIDENCE:",
+                self._safe_str(evidence_text).strip(),
+            ]
+        )
 
     def _predict_support(self, texts: List[str], desc: str) -> np.ndarray:
         assert self.verifier_tok is not None
@@ -435,7 +451,8 @@ class S4Tier123End2EndEvaluatorTestOnly:
                     return_tensors="pt",
                 )
                 enc = {k: v.to(self.device) for k, v in enc.items()}
-                y = self.verifier_model(enc["input_ids"], enc["attention_mask"])
+                out = self.verifier_model(**enc)
+                y = out.logits.squeeze(-1)
                 preds.append(y.detach().float().cpu().numpy())
 
         out = np.concatenate(preds, axis=0) if preds else np.zeros((0,), dtype=np.float32)
@@ -446,10 +463,32 @@ class S4Tier123End2EndEvaluatorTestOnly:
         for i in range(len(df_sub)):
             q = df_sub.iloc[i]["question"]
             c = df_sub.iloc[i]["case_context"]
-            ev = self._materialize_evidence(ids_per_sample[i])
-            inputs.append(self._build_verifier_inputs(q, c, ev))
-        return self._predict_support(inputs, desc=desc)
 
+            if "answer_target" in df_sub.columns:
+                a = df_sub.iloc[i]["answer_target"]
+            elif "answer" in df_sub.columns:
+                a = df_sub.iloc[i]["answer"]
+            else:
+                a = ""
+
+            if "claim_text" in df_sub.columns:
+                cl = df_sub.iloc[i]["claim_text"]
+            elif "claim" in df_sub.columns:
+                cl = df_sub.iloc[i]["claim"]
+            else:
+                cl = ""
+
+            ev = self._materialize_evidence(ids_per_sample[i])
+            inputs.append(
+                self._build_verifier_inputs(
+                    case_context=c,
+                    question=q,
+                    answer_target=a,
+                    claim_text=cl,
+                    evidence_text=ev,
+                )
+            )
+        return self._predict_support(inputs, desc=desc)
 
     def _mse(self, y: np.ndarray, yhat: np.ndarray) -> float:
         return float(np.mean((y - yhat) ** 2))
@@ -648,7 +687,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
 
         return out
 
-
     def _run_end2end_test(self, df_test: pd.DataFrame) -> Dict[str, object]:
         claim_texts = df_test["claim_text"].astype(str).tolist()
         topk_ids, _ = self._retrieve_topk_chunk_ids(claim_texts, desc="S4 Retrieval (R*) [test]")
@@ -657,8 +695,31 @@ class S4Tier123End2EndEvaluatorTestOnly:
         for i in range(len(df_test)):
             q = df_test.iloc[i]["question"]
             c = df_test.iloc[i]["case_context"]
+
+            if "answer_target" in df_test.columns:
+                a = df_test.iloc[i]["answer_target"]
+            elif "answer" in df_test.columns:
+                a = df_test.iloc[i]["answer"]
+            else:
+                a = ""
+
+            if "claim_text" in df_test.columns:
+                cl = df_test.iloc[i]["claim_text"]
+            elif "claim" in df_test.columns:
+                cl = df_test.iloc[i]["claim"]
+            else:
+                cl = ""
+
             ev = self._materialize_evidence(topk_ids[i])
-            inputs.append(self._build_verifier_inputs(q, c, ev))
+            inputs.append(
+                self._build_verifier_inputs(
+                    case_context=c,
+                    question=q,
+                    answer_target=a,
+                    claim_text=cl,
+                    evidence_text=ev,
+                )
+            )
 
         yhat = self._predict_support(inputs, desc="S4 Verification (V*) [test]")
         y = pd.to_numeric(df_test["soft_support_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
@@ -761,13 +822,9 @@ class S4Tier123End2EndEvaluatorTestOnly:
         # TODO; remove this
         # df_test = df_test.iloc[: int(len(df_test) * 0.001)].reset_index(drop=True)
 
-
         if "split" in df_test.columns:
             df_test = df_test[df_test["split"].astype(str) == "test"].copy()
 
-        df_test_full = df_test.copy()
-
-        # Optional speed knob
         if self.faithfulness_max_eval is not None and self.faithfulness_max_eval > 0:
             df_test = df_test.sample(
                 n=min(len(df_test), self.faithfulness_max_eval),
@@ -777,7 +834,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
         self.chunk_map = self._load_chunk_map()
         self._load_retriever()
         self._load_verifier()
-
         self._build_faiss_on_the_fly()
 
         pack = self._run_end2end_test(df_test)
@@ -960,7 +1016,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
 
 
 
-
 class S2Tier123End2EndEvaluatorTestOnly:
     """
     S2 — Frozen dense MPNet retrieval -> V*
@@ -1063,19 +1118,11 @@ class S2Tier123End2EndEvaluatorTestOnly:
         except Exception:
             pass
 
-    class _DebertaRegressor(nn.Module):
-        def __init__(self, model_name: str):
-            super().__init__()
-            self.backbone = AutoModel.from_pretrained(model_name)
-            hidden = self.backbone.config.hidden_size
-            self.reg_head = nn.Linear(hidden, 1)
-
-        def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-            out = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-            cls = out.last_hidden_state[:, 0, :]
-            cls = cls.to(self.reg_head.weight.dtype)
-            y = self.reg_head(cls).squeeze(-1)
-            return y
+    def _safe_str(self, x) -> str:
+        if x is None:
+            return ""
+        s = str(x)
+        return "" if s.lower() == "nan" else s
 
     def _load_chunk_map(self) -> Dict[int, str]:
         if not os.path.exists(self.chunks_parquet):
@@ -1208,14 +1255,16 @@ class S2Tier123End2EndEvaluatorTestOnly:
     def _load_verifier(self) -> None:
         vname = self.params["Verifier"]["model_name"]
         self.verifier_tok = AutoTokenizer.from_pretrained(vname, use_fast=True)
-        self.verifier_model = self._DebertaRegressor(vname).to(self.device)
+        self.verifier_model = AutoModelForSequenceClassification.from_pretrained(
+            vname,
+            num_labels=1,
+            problem_type="regression",
+        ).to(self.device)
         self.verifier_model.eval()
 
         obj = torch.load(self.verifier_weights_path, map_location="cpu")
         state = obj["model_state_dict"] if (isinstance(obj, dict) and "model_state_dict" in obj) else obj
-        missing, unexpected = self.verifier_model.load_state_dict(state, strict=False)
-        if missing or unexpected:
-            print(f"[WARN] Verifier load_state_dict strict=False. missing={len(missing)} unexpected={len(unexpected)}")
+        self.verifier_model.load_state_dict(state, strict=True)
 
     # Retrieval
     def _retrieve_topk_chunk_ids(self, claim_texts: List[str]) -> List[List[int]]:
@@ -1248,11 +1297,29 @@ class S2Tier123End2EndEvaluatorTestOnly:
         return self.evidence_sep.join(texts)
 
     # ===== Verifier inference =====
-    def _build_verifier_inputs(self, question: str, case_context: str, evidence_text: str) -> str:
-        q = " ".join(str(question).split()).strip()
-        c = " ".join(str(case_context).split()).strip()
-        e = " ".join(str(evidence_text).split()).strip()
-        return f"Question: {q}\nCase: {c}\nEvidence: {e}"
+    def _build_verifier_inputs(
+        self,
+        case_context: str,
+        question: str,
+        answer_target: str,
+        claim_text: str,
+        evidence_text: str,
+    ) -> str:
+        sep = "\n\n"
+        return sep.join(
+            [
+                "CASE:",
+                self._safe_str(case_context).strip(),
+                "QUESTION:",
+                self._safe_str(question).strip(),
+                "ANSWER_TARGET:",
+                self._safe_str(answer_target).strip(),
+                "CLAIM:",
+                self._safe_str(claim_text).strip(),
+                "EVIDENCE:",
+                self._safe_str(evidence_text).strip(),
+            ]
+        )
 
     def _predict_support(self, texts: List[str], desc: str) -> np.ndarray:
         assert self.verifier_tok is not None
@@ -1275,7 +1342,8 @@ class S2Tier123End2EndEvaluatorTestOnly:
                     return_tensors="pt",
                 )
                 enc = {k: v.to(self.device) for k, v in enc.items()}
-                y = self.verifier_model(enc["input_ids"], enc["attention_mask"])
+                out = self.verifier_model(**enc)
+                y = out.logits.squeeze(-1)
                 preds.append(y.detach().float().cpu().numpy())
 
         out = np.concatenate(preds, axis=0) if preds else np.zeros((0,), dtype=np.float32)
@@ -1441,8 +1509,31 @@ class S2Tier123End2EndEvaluatorTestOnly:
         for i in range(len(df_sub)):
             q = df_sub.iloc[i]["question"]
             c = df_sub.iloc[i]["case_context"]
+
+            if "answer_target" in df_sub.columns:
+                a = df_sub.iloc[i]["answer_target"]
+            elif "answer" in df_sub.columns:
+                a = df_sub.iloc[i]["answer"]
+            else:
+                a = ""
+
+            if "claim_text" in df_sub.columns:
+                cl = df_sub.iloc[i]["claim_text"]
+            elif "claim" in df_sub.columns:
+                cl = df_sub.iloc[i]["claim"]
+            else:
+                cl = ""
+
             ev = self._materialize_evidence(ids_per_sample[i])
-            inputs.append(self._build_verifier_inputs(q, c, ev))
+            inputs.append(
+                self._build_verifier_inputs(
+                    case_context=c,
+                    question=q,
+                    answer_target=a,
+                    claim_text=cl,
+                    evidence_text=ev,
+                )
+            )
         return self._predict_support(inputs, desc=desc)
 
     # ===== Tier3 slices =====
@@ -1560,7 +1651,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
         if "split" in df_test.columns:
             df_test = df_test[df_test["split"].astype(str) == "test"].copy()
 
-        # Optional speed knob (affects all tiers consistently)
+        # Optional speed knob
         if self.faithfulness_max_eval is not None and self.faithfulness_max_eval > 0:
             df_test = df_test.sample(
                 n=min(len(df_test), self.faithfulness_max_eval),
@@ -1581,8 +1672,31 @@ class S2Tier123End2EndEvaluatorTestOnly:
         for i in range(len(df_test)):
             q = df_test.iloc[i]["question"]
             c = df_test.iloc[i]["case_context"]
+
+            if "answer_target" in df_test.columns:
+                a = df_test.iloc[i]["answer_target"]
+            elif "answer" in df_test.columns:
+                a = df_test.iloc[i]["answer"]
+            else:
+                a = ""
+
+            if "claim_text" in df_test.columns:
+                cl = df_test.iloc[i]["claim_text"]
+            elif "claim" in df_test.columns:
+                cl = df_test.iloc[i]["claim"]
+            else:
+                cl = ""
+
             ev = self._materialize_evidence(topk_test[i])
-            inputs.append(self._build_verifier_inputs(q, c, ev))
+            inputs.append(
+                self._build_verifier_inputs(
+                    case_context=c,
+                    question=q,
+                    answer_target=a,
+                    claim_text=cl,
+                    evidence_text=ev,
+                )
+            )
 
         yhat = self._predict_support(inputs, desc="S2 Verification (V*) [test]")
         y = pd.to_numeric(df_test["soft_support_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
@@ -1645,7 +1759,6 @@ class S2Tier123End2EndEvaluatorTestOnly:
         ids_shuffle = self._stress_shuffle_order(topk_test)
         ids_swapped = self._stress_swap_between_samples(topk_test)
 
-        # random trials
         rand_metrics_list: List[Dict[str, float]] = []
         rand_preds: List[np.ndarray] = []
         for t in range(self.faithfulness_random_trials):
@@ -1779,7 +1892,6 @@ class S2Tier123End2EndEvaluatorTestOnly:
 
 
 
-
 class S3Tier123End2EndEvaluatorTestOnly:
     """
     S3 — BM25 retrieval -> V*
@@ -1875,19 +1987,11 @@ class S3Tier123End2EndEvaluatorTestOnly:
         except Exception:
             pass
 
-    class _DebertaRegressor(nn.Module):
-        def __init__(self, model_name: str):
-            super().__init__()
-            self.backbone = AutoModel.from_pretrained(model_name)
-            hidden = self.backbone.config.hidden_size
-            self.reg_head = nn.Linear(hidden, 1)
-
-        def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-            out = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-            cls = out.last_hidden_state[:, 0, :]
-            cls = cls.to(self.reg_head.weight.dtype)
-            y = self.reg_head(cls).squeeze(-1)
-            return y
+    def _safe_str(self, x) -> str:
+        if x is None:
+            return ""
+        s = str(x)
+        return "" if s.lower() == "nan" else s
 
     # ===== Loading chunks into a map for evidence materialization =====
     def _load_chunk_map(self) -> Dict[int, str]:
@@ -1912,14 +2016,16 @@ class S3Tier123End2EndEvaluatorTestOnly:
     def _load_verifier(self) -> None:
         vname = self.params["Verifier"]["model_name"]
         self.verifier_tok = AutoTokenizer.from_pretrained(vname, use_fast=True)
-        self.verifier_model = self._DebertaRegressor(vname).to(self.device)
+        self.verifier_model = AutoModelForSequenceClassification.from_pretrained(
+            vname,
+            num_labels=1,
+            problem_type="regression",
+        ).to(self.device)
         self.verifier_model.eval()
 
         obj = torch.load(self.verifier_weights_path, map_location="cpu")
         state = obj["model_state_dict"] if (isinstance(obj, dict) and "model_state_dict" in obj) else obj
-        missing, unexpected = self.verifier_model.load_state_dict(state, strict=False)
-        if missing or unexpected:
-            print(f"[WARN] Verifier load_state_dict strict=False. missing={len(missing)} unexpected={len(unexpected)}")
+        self.verifier_model.load_state_dict(state, strict=True)
 
     # BM25 (in memory, on the fly)
     def _tokenize_bm25(self, text: str) -> List[str]:
@@ -2058,11 +2164,29 @@ class S3Tier123End2EndEvaluatorTestOnly:
         return self.evidence_sep.join(texts)
 
     # Verifier inference
-    def _build_verifier_inputs(self, question: str, case_context: str, evidence_text: str) -> str:
-        q = " ".join(str(question).split()).strip()
-        c = " ".join(str(case_context).split()).strip()
-        e = " ".join(str(evidence_text).split()).strip()
-        return f"Question: {q}\nCase: {c}\nEvidence: {e}"
+    def _build_verifier_inputs(
+        self,
+        case_context: str,
+        question: str,
+        answer_target: str,
+        claim_text: str,
+        evidence_text: str,
+    ) -> str:
+        sep = "\n\n"
+        return sep.join(
+            [
+                "CASE:",
+                self._safe_str(case_context).strip(),
+                "QUESTION:",
+                self._safe_str(question).strip(),
+                "ANSWER_TARGET:",
+                self._safe_str(answer_target).strip(),
+                "CLAIM:",
+                self._safe_str(claim_text).strip(),
+                "EVIDENCE:",
+                self._safe_str(evidence_text).strip(),
+            ]
+        )
 
     def _predict_support(self, texts: List[str], desc: str) -> np.ndarray:
         assert self.verifier_tok is not None
@@ -2085,12 +2209,12 @@ class S3Tier123End2EndEvaluatorTestOnly:
                     return_tensors="pt",
                 )
                 enc = {k: v.to(self.device) for k, v in enc.items()}
-                y = self.verifier_model(enc["input_ids"], enc["attention_mask"])
+                out = self.verifier_model(**enc)
+                y = out.logits.squeeze(-1)
                 preds.append(y.detach().float().cpu().numpy())
 
         out = np.concatenate(preds, axis=0) if preds else np.zeros((0,), dtype=np.float32)
         return out.astype(np.float32)
-
 
     def _sigmoid(self, x: np.ndarray) -> np.ndarray:
         return 1.0 / (1.0 + np.exp(-np.clip(x, -20, 20)))
@@ -2249,8 +2373,31 @@ class S3Tier123End2EndEvaluatorTestOnly:
         for i in range(len(df_sub)):
             q = df_sub.iloc[i]["question"]
             c = df_sub.iloc[i]["case_context"]
+
+            if "answer_target" in df_sub.columns:
+                a = df_sub.iloc[i]["answer_target"]
+            elif "answer" in df_sub.columns:
+                a = df_sub.iloc[i]["answer"]
+            else:
+                a = ""
+
+            if "claim_text" in df_sub.columns:
+                cl = df_sub.iloc[i]["claim_text"]
+            elif "claim" in df_sub.columns:
+                cl = df_sub.iloc[i]["claim"]
+            else:
+                cl = ""
+
             ev = self._materialize_evidence(ids_per_sample[i])
-            inputs.append(self._build_verifier_inputs(q, c, ev))
+            inputs.append(
+                self._build_verifier_inputs(
+                    case_context=c,
+                    question=q,
+                    answer_target=a,
+                    claim_text=cl,
+                    evidence_text=ev,
+                )
+            )
         return self._predict_support(inputs, desc=desc)
 
     # Tier3 slices
@@ -2290,7 +2437,6 @@ class S3Tier123End2EndEvaluatorTestOnly:
             out["test_slice.label_vs_extractive.extractive"] = pack(vals == "extractive")
 
         return out
-
 
     def _write_csv_summary(self) -> str:
         tier1_path = os.path.join(self.out_dir, "s3_tier1_report.json")
@@ -2354,7 +2500,6 @@ class S3Tier123End2EndEvaluatorTestOnly:
         print(f"Saved: {out_csv}")
         return out_csv
 
-
     def run(self) -> str:
         if not os.path.exists(self.test_parquet):
             raise FileNotFoundError(self.test_parquet)
@@ -2385,8 +2530,31 @@ class S3Tier123End2EndEvaluatorTestOnly:
         for i in range(len(df_test)):
             q = df_test.iloc[i]["question"]
             c = df_test.iloc[i]["case_context"]
+
+            if "answer_target" in df_test.columns:
+                a = df_test.iloc[i]["answer_target"]
+            elif "answer" in df_test.columns:
+                a = df_test.iloc[i]["answer"]
+            else:
+                a = ""
+
+            if "claim_text" in df_test.columns:
+                cl = df_test.iloc[i]["claim_text"]
+            elif "claim" in df_test.columns:
+                cl = df_test.iloc[i]["claim"]
+            else:
+                cl = ""
+
             ev = self._materialize_evidence(topk_test[i])
-            inputs.append(self._build_verifier_inputs(q, c, ev))
+            inputs.append(
+                self._build_verifier_inputs(
+                    case_context=c,
+                    question=q,
+                    answer_target=a,
+                    claim_text=cl,
+                    evidence_text=ev,
+                )
+            )
 
         yhat = self._predict_support(inputs, desc="S3 Verification (V*) [test]")
         y = pd.to_numeric(df_test["soft_support_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
@@ -2580,15 +2748,15 @@ class S3Tier123End2EndEvaluatorTestOnly:
 
 
 
-
-
 class S1Tier123CaseOnlyEvaluatorTestOnly:
     """
-    S1 — Case-only verifier V* (DeBERTa), no evidence segment.
+    S1 - Case-only verifier V* with the same verifier architecture and
+    the same input formatting style used during verifier training, except
+    that the evidence field is intentionally left empty.
 
     Test-only, end-to-end:
       - Reads phase1_fixed_test_eval/mimic_test_eval.parquet
-      - Runs verifier on (Question + Case) only
+      - Runs verifier on case/question/answer/claim with empty evidence
       - Tier1: regression + calibration-style metrics computed from sigmoid
       - Tier3: distribution shift slices on test
       - Writes one predictions parquet + json reports + one csv summary
@@ -2646,37 +2814,52 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
         except Exception:
             pass
 
-    class _DebertaRegressor(nn.Module):
-        def __init__(self, model_name: str):
-            super().__init__()
-            self.backbone = AutoModel.from_pretrained(model_name)
-            hidden = self.backbone.config.hidden_size
-            self.reg_head = nn.Linear(hidden, 1)
-
-        def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-            out = self.backbone(input_ids=input_ids, attention_mask=attention_mask)
-            cls = out.last_hidden_state[:, 0, :]
-            cls = cls.to(self.reg_head.weight.dtype)
-            y = self.reg_head(cls).squeeze(-1)
-            return y
-
     def _load_verifier(self) -> None:
         vname = self.params["Verifier"]["model_name"]
         self.verifier_tok = AutoTokenizer.from_pretrained(vname, use_fast=True)
-        self.verifier_model = self._DebertaRegressor(vname).to(self.device)
+
+        self.verifier_model = AutoModelForSequenceClassification.from_pretrained(
+            vname,
+            num_labels=1,
+            problem_type="regression",
+        ).to(self.device)
         self.verifier_model.eval()
 
         obj = torch.load(self.verifier_weights_path, map_location="cpu")
         state = obj["model_state_dict"] if (isinstance(obj, dict) and "model_state_dict" in obj) else obj
-        missing, unexpected = self.verifier_model.load_state_dict(state, strict=False)
-        if missing or unexpected:
-            print(f"[WARN] Verifier load_state_dict strict=False. missing={len(missing)} unexpected={len(unexpected)}")
+
+        self.verifier_model.load_state_dict(state, strict=True)
+
+    def _safe_str(self, x) -> str:
+        if x is None:
+            return ""
+        s = str(x)
+        return "" if s.lower() == "nan" else s
 
     # Text building
-    def _build_verifier_inputs(self, question: str, case_context: str) -> str:
-        q = " ".join(str(question).split()).strip()
-        c = " ".join(str(case_context).split()).strip()
-        return f"Question: {q}\nCase: {c}"
+    def _build_verifier_inputs(
+        self,
+        case_context: str,
+        question: str,
+        answer_target: str,
+        claim_text: str,
+        evidence_text: str = "",
+    ) -> str:
+        sep = "\n\n"
+        return sep.join(
+            [
+                "CASE:",
+                self._safe_str(case_context).strip(),
+                "QUESTION:",
+                self._safe_str(question).strip(),
+                "ANSWER_TARGET:",
+                self._safe_str(answer_target).strip(),
+                "CLAIM:",
+                self._safe_str(claim_text).strip(),
+                "EVIDENCE:",
+                self._safe_str(evidence_text).strip(),
+            ]
+        )
 
     # Inference
     def _predict_support(self, texts: List[str], desc: str) -> np.ndarray:
@@ -2700,7 +2883,10 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
                     return_tensors="pt",
                 )
                 enc = {k: v.to(self.device) for k, v in enc.items()}
-                y = self.verifier_model(enc["input_ids"], enc["attention_mask"])
+
+                out = self.verifier_model(**enc)
+                y = out.logits.squeeze(-1)
+
                 preds.append(y.detach().float().cpu().numpy())
 
         out = np.concatenate(preds, axis=0) if preds else np.zeros((0,), dtype=np.float32)
@@ -2894,6 +3080,10 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
             raise FileNotFoundError(self.test_parquet)
 
         df_test = pd.read_parquet(self.test_parquet)
+
+        # TODO; remove this
+        # df_test = df_test.iloc[: int(len(df_test) * 0.2)].reset_index(drop=True)
+
         if "split" in df_test.columns:
             df_test = df_test[df_test["split"].astype(str) == "test"].copy()
 
@@ -2903,9 +3093,32 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
         for i in range(len(df_test)):
             q = df_test.iloc[i]["question"]
             c = df_test.iloc[i]["case_context"]
-            inputs.append(self._build_verifier_inputs(q, c))
 
-        yhat = self._predict_support(inputs, desc="S1 Verification (case-only) [test]")
+            if "answer_target" in df_test.columns:
+                a = df_test.iloc[i]["answer_target"]
+            elif "answer" in df_test.columns:
+                a = df_test.iloc[i]["answer"]
+            else:
+                a = ""
+
+            if "claim_text" in df_test.columns:
+                cl = df_test.iloc[i]["claim_text"]
+            elif "claim" in df_test.columns:
+                cl = df_test.iloc[i]["claim"]
+            else:
+                cl = ""
+
+            inputs.append(
+                self._build_verifier_inputs(
+                    case_context=c,
+                    question=q,
+                    answer_target=a,
+                    claim_text=cl,
+                    evidence_text="",
+                )
+            )
+
+        yhat = self._predict_support(inputs, desc="S1 Verification (case-only, empty evidence) [test]")
         y = pd.to_numeric(df_test["soft_support_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
         y01 = np.clip(y, 0.0, 1.0)
         p = self._sigmoid(yhat)
@@ -2970,7 +3183,6 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
         self._write_csv_summary()
 
         return summary_path
-
 
 
 
@@ -3565,6 +3777,105 @@ class CrossSystemComparatorPredOnlyTestOnly:
 
 
 
+def analyze_retrieval_error_coupling(
+    parquet_path: str,
+    system_prefix: str = "s4",
+    top_k: int = 20,
+    make_plot: bool = True,
+):
+    df = pd.read_parquet(parquet_path).copy()
+
+    retrieved_col = f"{system_prefix}_retrieved_chunk_ids_json"
+    pred_col = f"{system_prefix}_pred_support_raw"
+    proto_col = "evidence_chunk_ids_json"
+    target_col = "soft_support_score"
+
+    def loads_ids(x):
+        if isinstance(x, list):
+            return x
+        return json.loads(x)
+
+    df["proto_ids"] = df[proto_col].apply(loads_ids)
+    df["retrieved_ids"] = df[retrieved_col].apply(loads_ids)
+
+    def rr_at_k(retrieved, proto, k):
+        proto = set(proto)
+        for rank, cid in enumerate(retrieved[:k], start=1):
+            if cid in proto:
+                return 1.0 / rank
+        return 0.0
+
+    df["rr"] = [
+        rr_at_k(r, p, top_k) for r, p in zip(df["retrieved_ids"], df["proto_ids"])
+    ]
+
+    df["abs_err"] = (df[pred_col] - df[target_col]).abs()
+    df["sq_err"] = (df[pred_col] - df[target_col]) ** 2
+
+    rho, pval = spearmanr(df["rr"], df["abs_err"])
+    r_pearson, p_pearson = pearsonr(df["rr"], df["abs_err"])
+
+    bins = [-0.01, 0.0, 0.1, 0.2, 0.34, 0.51, 1.0]
+    labels = ["no hit", "rank10", "rank6-9", "rank3-5", "rank2", "rank1"]
+
+    df["rr_bin"] = pd.cut(df["rr"], bins=bins, labels=labels)
+
+    bin_stats = (
+        df.groupby("rr_bin")
+        .agg(
+            n=("qa_row_id", "count"),
+            mean_abs_err=("abs_err", "mean"),
+            mean_sq_err=("sq_err", "mean"),
+        )
+        .reset_index()
+    )
+
+    output_dir = os.path.dirname(parquet_path)
+
+    os.makedirs(os.path.join(output_dir, "Mechanistic_results"), exist_ok=True)
+
+    bin_stats.to_csv(os.path.join(output_dir, "Mechanistic_results", "retrieval_error_coupling_bins.csv"), index=False)
+
+    summary = {
+        "spearman_rr_vs_abs_err": float(rho),
+        "spearman_p": float(pval),
+        "pearson_rr_vs_abs_err": float(r_pearson),
+        "pearson_p": float(p_pearson),
+        "mean_rr": float(df["rr"].mean()),
+        "mean_abs_error": float(df["abs_err"].mean()),
+        "n_samples": int(len(df)),
+        "meaning_of_analysis": "This analysis tests whether retrieval quality actually affects downstream prediction quality in the evidence-grounded system. For each test example, we compute a retrieval alignment score (e.g., reciprocal rank RR@k measuring how highly a protocol-aligned evidence chunk appears in the retrieved list) and the verifier prediction error (e.g., | yhat_i - y_i |). We then measure the correlation between these two quantities across all examples and also examine prediction error across bins of retrieval quality (e.g., no hit, rank 6-10, rank 3-5, rank 2, rank 1). If the correlation is negative, it means that examples with better retrieved evidence tend to have lower verifier error, indicating that the model's predictions are genuinely conditioned on the retrieved evidence. In other words, improved retrieval alignment translates into improved prediction quality, providing mechanistic evidence that the system is truly evidence-grounded rather than relying mainly on the question or case context",
+    }
+
+    with open(os.path.join(output_dir, "Mechanistic_results", "retrieval_error_coupling_summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    if make_plot:
+        plt.figure(figsize=(7,4))
+
+        order = labels
+        stats = bin_stats.set_index("rr_bin").reindex(order)
+
+        plt.bar(order, stats["mean_abs_err"])
+        plt.ylabel("Mean Absolute Error")
+        plt.xlabel(f"Retrieval quality bin (RR@{top_k})")
+        plt.title("Retrieval quality vs verifier error")
+
+        plt.xticks(rotation=30)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "Mechanistic_results", "retrieval_error_coupling_plot.png"))
+        plt.close()
+
+    return summary, df
+
+
+
+
+
+
+
+
 if __name__ == "__main__":
 
     with open(global_config_path, "r") as f:
@@ -3572,85 +3883,96 @@ if __name__ == "__main__":
     base_path_evidenceData = params["Preprocessing"]["base_path_evidenceData"]
 
 
+    results, df_out = analyze_retrieval_error_coupling(
+        # parquet_path=os.path.join(base_path_evidenceData, "CheXpertPlus_Results/S4", "s4_test_predictions.parquet"),
+        parquet_path=os.path.join(base_path_evidenceData, "MIMIC_Results/S4", "s4_test_predictions.parquet"),
+        system_prefix="s4",
+        top_k=20,
+        make_plot=True,
+    )
+
+
 
     ''' S1 '''
-    # s1 = S1Tier123CaseOnlyEvaluatorTestOnly(
-    #     cfg_path=global_config_path,
-    #     experiment_name=experiment_name,
-    #     base_path_evidenceData=base_path_evidenceData,
-    #     verifier_weights_path=verifier_weights_path,
-    #     device="cuda",
-    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-    #     out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S1"),
-    #     batch_size_verify=4,
-    #     ece_bins=15,
-    #     seed=13,
-    #     input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
-    # )
-    # s1.run()
-    #
-    #
-    #
-    #
-    # ''' S2 '''
-    # s2 = S2Tier123End2EndEvaluatorTestOnly(
-    #     cfg_path=global_config_path,
-    #     experiment_name=experiment_name,
-    #     base_path_evidenceData=base_path_evidenceData,
-    #     verifier_weights_path=verifier_weights_path,
-    #     device="cuda",
-    #     top_k=20,
-    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-    #     out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S2"),
-    #     batch_size_embed_chunks=128,
-    #     batch_size_retrieve=256,
-    #     batch_size_verify=4,
-    #     ece_bins=15,
-    #     input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
-    #     seed=13,
-    # )
-    # s2.run()
-    #
-    #
-    #
-    # ''' S3 '''
-    # s3 = S3Tier123End2EndEvaluatorTestOnly(
-    #     cfg_path=global_config_path,
-    #     experiment_name=experiment_name,
-    #     base_path_evidenceData=base_path_evidenceData,
-    #     verifier_weights_path=verifier_weights_path,
-    #     device="cuda",
-    #     top_k=20,
-    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-    #     out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S3"),
-    #     batch_size_verify=4,
-    #     ece_bins=15,
-    #     seed=13,
-    #     input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
-    #     bm25_k1=1.2,
-    #     bm25_b=0.75,
-    # )
-    # s3.run()
-    #
-    #
-    # ''' S4 '''
-    # runner = S4Tier123End2EndEvaluatorTestOnly(
-    #     cfg_path=global_config_path,
-    #     experiment_name=experiment_name,
-    #     base_path_evidenceData=base_path_evidenceData,
-    #     model_weights_path=model_weights_path,
-    #     verifier_weights_path=verifier_weights_path,
-    #     device="cuda",
-    #     top_k=20,
-    #     verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-    #     out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S4"),
-    #     batch_size_retrieve=256,
-    #     batch_size_verify=4,
-    #     input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
-    #     batch_size_embed_docs=256,
-    #     ece_bins=15,
-    # )
-    # runner.run()
+    s1 = S1Tier123CaseOnlyEvaluatorTestOnly(
+        cfg_path=global_config_path,
+        experiment_name=experiment_name,
+        base_path_evidenceData=base_path_evidenceData,
+        verifier_weights_path=verifier_weights_path,
+        device="cuda",
+        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+        out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S1"),
+        batch_size_verify=16,
+        ece_bins=15,
+        seed=13,
+        input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
+    )
+    s1.run()
+
+
+
+
+
+
+    ''' S2 '''
+    s2 = S2Tier123End2EndEvaluatorTestOnly(
+        cfg_path=global_config_path,
+        experiment_name=experiment_name,
+        base_path_evidenceData=base_path_evidenceData,
+        verifier_weights_path=verifier_weights_path,
+        device="cuda",
+        top_k=20,
+        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+        out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S2"),
+        batch_size_embed_chunks=128,
+        batch_size_retrieve=256,
+        batch_size_verify=16,
+        ece_bins=15,
+        input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
+        seed=13,
+    )
+    s2.run()
+
+
+
+    ''' S3 '''
+    s3 = S3Tier123End2EndEvaluatorTestOnly(
+        cfg_path=global_config_path,
+        experiment_name=experiment_name,
+        base_path_evidenceData=base_path_evidenceData,
+        verifier_weights_path=verifier_weights_path,
+        device="cuda",
+        top_k=20,
+        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+        out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S3"),
+        batch_size_verify=16,
+        ece_bins=15,
+        seed=13,
+        input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
+        bm25_k1=1.2,
+        bm25_b=0.75,
+    )
+    s3.run()
+
+
+    ''' S4 '''
+    runner = S4Tier123End2EndEvaluatorTestOnly(
+        cfg_path=global_config_path,
+        experiment_name=experiment_name,
+        base_path_evidenceData=base_path_evidenceData,
+        model_weights_path=model_weights_path,
+        verifier_weights_path=verifier_weights_path,
+        device="cuda",
+        top_k=20,
+        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+        out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S4"),
+        batch_size_retrieve=256,
+        batch_size_verify=16,
+        input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
+        batch_size_embed_docs=256,
+        ece_bins=15,
+    )
+    runner.run()
 
 
 
