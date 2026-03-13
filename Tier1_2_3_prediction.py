@@ -111,11 +111,12 @@ class S4Tier123End2EndEvaluatorTestOnly:
         verifier_weights_path: str,    # verifier trained weights
         device: str = "cuda",
         top_k: int = 20,
-        verifier_max_tokens: int = 512,
+        verifier_top_p: int = 5,
+        verifier_max_tokens: int = 1024,
         evidence_sep: str = "\n\n---\n\n",
         input_test_data: str = "phase1_fixed_test_eval/mimic_test_eval.parquet",
         batch_size_retrieve: int = 256,
-        batch_size_verify: int = 16,
+        batch_size_verify: int = 4,
         batch_size_embed_docs: int = 256,
         ece_bins: int = 15,
         out_dir: Optional[str] = None,
@@ -137,7 +138,8 @@ class S4Tier123End2EndEvaluatorTestOnly:
         self.verifier_weights_path = verifier_weights_path
 
         self.device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
-        self.top_k = int(top_k)
+        self.top_k = int(top_k)  # retrieval top-k stays 20
+        self.verifier_top_p = int(verifier_top_p)
         self.verifier_max_tokens = int(verifier_max_tokens)
         self.evidence_sep = evidence_sep
 
@@ -247,6 +249,8 @@ class S4Tier123End2EndEvaluatorTestOnly:
         obj = torch.load(self.verifier_weights_path, map_location="cpu")
         state = obj["model_state_dict"] if (isinstance(obj, dict) and "model_state_dict" in obj) else obj
         self.verifier_model.load_state_dict(state, strict=True)
+        self.verifier_model.eval()
+
 
     def _loads_json_list(self, s: str) -> List:
         try:
@@ -259,15 +263,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
 
     # Build FAISS on the fly
     def _sanitize_faiss_factory(self, s: str) -> str:
-        """
-        Accept user configs like "FlatIP" and convert to FAISS-friendly factory strings.
-
-        index_factory expects strings like:
-          "Flat"
-          "IVF4096,Flat"
-          "HNSW32"
-        Metric is given separately as METRIC_INNER_PRODUCT.
-        """
         raw = str(s).strip()
         if raw.lower() in {"flatip", "flat_ip", "flat-ип", "flatinnerproduct"}:
             return "Flat"
@@ -278,12 +273,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
         return raw
 
     def _build_faiss_on_the_fly(self) -> None:
-        """
-        Embeds all evidence chunks using R* doc encoder and builds FAISS index in memory.
-
-        Requires:
-          chunks_parquet: columns chunk_id, chunk_text
-        """
         assert self.retriever_model is not None
         assert self.retriever_tok is not None
 
@@ -399,7 +388,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
     def _materialize_evidence(self, chunk_ids: List[int]) -> str:
         assert self.chunk_map is not None
         texts = []
-        for cid in chunk_ids:
+        for cid in chunk_ids[: self.verifier_top_p]:
             t = self.chunk_map.get(int(cid), "")
             if t:
                 texts.append(t)
@@ -421,8 +410,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
                 self._safe_str(case_context).strip(),
                 "QUESTION:",
                 self._safe_str(question).strip(),
-                "ANSWER_TARGET:",
-                self._safe_str(answer_target).strip(),
                 "CLAIM:",
                 self._safe_str(claim_text).strip(),
                 "EVIDENCE:",
@@ -681,7 +668,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
             out[f"{prefix}.uncertainty_present.0"] = metrics_for_mask(~mask1)
 
         if "label_vs_extractive" in df_test.columns:
-            for v in ["label", "extractive"]:
+            for v in ["closed_form", "other"]:
                 mask = (df_test["label_vs_extractive"].astype(str).values == v)
                 out[f"{prefix}.label_vs_extractive.{v}"] = metrics_for_mask(mask)
 
@@ -710,7 +697,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
             else:
                 cl = ""
 
-            ev = self._materialize_evidence(topk_ids[i])
+            ev = self._materialize_evidence(topk_ids[i])   # now only top-5 is materialized for verifier
             inputs.append(
                 self._build_verifier_inputs(
                     case_context=c,
@@ -724,7 +711,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
         yhat = self._predict_support(inputs, desc="S4 Verification (V*) [test]")
         y = pd.to_numeric(df_test["soft_support_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
         y01 = np.clip(y, 0.0, 1.0)
-        p = self._sigmoid(yhat)
+        p = np.clip(yhat, 0.0, 1.0)
 
         out_df = df_test.copy()
         out_df["s4_retrieved_chunk_ids_json"] = [json.dumps(x) for x in topk_ids]
@@ -754,11 +741,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
         def load_json(p):
             with open(p, "r", encoding="utf-8") as f:
                 return json.load(f)
-
-        def fmt3(x):
-            if isinstance(x, (int, float)) and pd.notna(x):
-                return f"{x:.3f}"
-            return x
 
         def safe_get(d, keys, default=None):
             cur = d
@@ -808,7 +790,12 @@ class S4Tier123End2EndEvaluatorTestOnly:
                 rows.append(["Tier3", slice_name, "risk_mse@80", r80])
 
         df_csv = pd.DataFrame(rows, columns=["Tier", "Subgroup", "Metric", "Value"])
-        df_csv["Value"] = df_csv["Value"].apply(fmt3)
+        df_csv["Value"] = pd.to_numeric(df_csv["Value"], errors="coerce")
+
+        mask_n = df_csv["Metric"].astype(str).str.lower().eq("n")
+        df_csv.loc[~mask_n, "Value"] = df_csv.loc[~mask_n, "Value"] * 100.0
+        df_csv["Value"] = df_csv["Value"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
+
         df_csv.to_csv(out_csv, index=False)
         print(f"Saved: {out_csv}")
         return out_csv
@@ -820,7 +807,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
         df_test = pd.read_parquet(self.test_parquet)
 
         # TODO; remove this
-        # df_test = df_test.iloc[: int(len(df_test) * 0.001)].reset_index(drop=True)
+        df_test = df_test.iloc[: int(len(df_test) * 0.5)].reset_index(drop=True)
 
         if "split" in df_test.columns:
             df_test = df_test[df_test["split"].astype(str) == "test"].copy()
@@ -856,6 +843,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
             },
             "verifier": {
                 "weights": self.verifier_weights_path,
+                "top_p": self.verifier_top_p,        # NEW
                 "max_tokens": self.verifier_max_tokens,
             },
             "metrics": {**tier1_metrics, "SelectiveRisk": rc},
@@ -899,7 +887,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
             ids_rand = self._stress_random_ids(len(df_test))
             yhat_rand = self._predict_with_ids(df_test, ids_rand, desc=f"S4 Faithfulness random (trial {t+1}) [test]")
             random_trial_preds.append(yhat_rand)
-            p_rand = self._sigmoid(yhat_rand)
+            p_rand = np.clip(yhat_rand, 0.0, 1.0)
             random_trial_metrics.append(self._eval_preds_metrics(y01, yhat_rand, p_rand))
 
         def avg_metrics(ms: List[Dict[str, float]]) -> Dict[str, float]:
@@ -914,7 +902,7 @@ class S4Tier123End2EndEvaluatorTestOnly:
         yhat_swapped = self._predict_with_ids(df_test, ids_swapped, desc="S4 Faithfulness swapped-evidence [test]")
 
         def pack_metrics(yhat_x: np.ndarray) -> Dict[str, float]:
-            return self._eval_preds_metrics(y01, yhat_x, self._sigmoid(yhat_x))
+            return self._eval_preds_metrics(y01, yhat_x, np.clip(yhat_x, 0.0, 1.0))
 
         met_top1 = pack_metrics(yhat_top1)
         met_top3 = pack_metrics(yhat_top3)
@@ -1015,7 +1003,6 @@ class S4Tier123End2EndEvaluatorTestOnly:
 
 
 
-
 class S2Tier123End2EndEvaluatorTestOnly:
     """
     S2 — Frozen dense MPNet retrieval -> V*
@@ -1035,7 +1022,8 @@ class S2Tier123End2EndEvaluatorTestOnly:
         verifier_weights_path: str,  # verifier trained_model.pth
         device: str = "cuda",
         top_k: int = 20,
-        verifier_max_tokens: int = 512,
+        verifier_top_p: int = 5,
+        verifier_max_tokens: int = 1024,
         input_test_data: str = "phase1_fixed_test_eval/mimic_test_eval.parquet",
         evidence_sep: str = "\n\n---\n\n",
         batch_size_embed_chunks: int = 128,
@@ -1061,6 +1049,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
 
         self.device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
         self.top_k = int(top_k)
+        self.verifier_top_p = int(verifier_top_p)   # NEW
         self.verifier_max_tokens = int(verifier_max_tokens)
         self.evidence_sep = evidence_sep
 
@@ -1265,6 +1254,8 @@ class S2Tier123End2EndEvaluatorTestOnly:
         obj = torch.load(self.verifier_weights_path, map_location="cpu")
         state = obj["model_state_dict"] if (isinstance(obj, dict) and "model_state_dict" in obj) else obj
         self.verifier_model.load_state_dict(state, strict=True)
+        self.verifier_model.eval()
+
 
     # Retrieval
     def _retrieve_topk_chunk_ids(self, claim_texts: List[str]) -> List[List[int]]:
@@ -1290,7 +1281,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
     def _materialize_evidence(self, chunk_ids: List[int]) -> str:
         assert self.chunk_map is not None
         texts = []
-        for cid in chunk_ids:
+        for cid in chunk_ids[: self.verifier_top_p]:
             t = self.chunk_map.get(int(cid), "")
             if t:
                 texts.append(t)
@@ -1312,8 +1303,6 @@ class S2Tier123End2EndEvaluatorTestOnly:
                 self._safe_str(case_context).strip(),
                 "QUESTION:",
                 self._safe_str(question).strip(),
-                "ANSWER_TARGET:",
-                self._safe_str(answer_target).strip(),
                 "CLAIM:",
                 self._safe_str(claim_text).strip(),
                 "EVIDENCE:",
@@ -1569,9 +1558,10 @@ class S2Tier123End2EndEvaluatorTestOnly:
 
         if "label_vs_extractive" in df_test.columns:
             vals = df_test["label_vs_extractive"].astype(str).values
-            out["test_slice.label_vs_extractive.label"] = pack(vals == "label")
-            out["test_slice.label_vs_extractive.extractive"] = pack(vals == "extractive")
-
+            if "label_vs_extractive" in df_test.columns:
+                vals = df_test["label_vs_extractive"].astype(str).values
+                out["test_slice.label_vs_extractive.closed_form"] = pack(vals == "closed_form")
+                out["test_slice.label_vs_extractive.other"] = pack(vals == "other")
         return out
 
     # ===== Single CSV summary =====
@@ -1586,11 +1576,6 @@ class S2Tier123End2EndEvaluatorTestOnly:
         def load_json(p):
             with open(p, "r", encoding="utf-8") as f:
                 return json.load(f)
-
-        def fmt3(x):
-            if isinstance(x, (int, float)) and pd.notna(x):
-                return f"{x:.3f}"
-            return x
 
         rows = []
 
@@ -1633,7 +1618,13 @@ class S2Tier123End2EndEvaluatorTestOnly:
                 rows.append(["Tier3", slice_name, "risk_mse@80", r80])
 
         df = pd.DataFrame(rows, columns=["Tier", "Subgroup", "Metric", "Value"])
-        df["Value"] = df["Value"].apply(fmt3)
+        df["Value"] = pd.to_numeric(df["Value"], errors="coerce")
+
+        mask_n = df["Metric"].astype(str).str.lower().eq("n")
+
+        df.loc[~mask_n, "Value"] = df.loc[~mask_n, "Value"] * 100.0
+        df["Value"] = df["Value"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
+
         df.to_csv(out_csv, index=False)
         print(f"Saved: {out_csv}")
         return out_csv
@@ -1646,7 +1637,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
         df_test = pd.read_parquet(self.test_parquet)
 
         # TODO; remove this
-        # df_test = df_test.iloc[: int(len(df_test) * 0.001)].reset_index(drop=True)
+        df_test = df_test.iloc[: int(len(df_test) * 0.002)].reset_index(drop=True)
 
         if "split" in df_test.columns:
             df_test = df_test[df_test["split"].astype(str) == "test"].copy()
@@ -1687,7 +1678,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
             else:
                 cl = ""
 
-            ev = self._materialize_evidence(topk_test[i])
+            ev = self._materialize_evidence(topk_test[i])  # now only top-5 goes to verifier
             inputs.append(
                 self._build_verifier_inputs(
                     case_context=c,
@@ -1701,7 +1692,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
         yhat = self._predict_support(inputs, desc="S2 Verification (V*) [test]")
         y = pd.to_numeric(df_test["soft_support_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
         y01 = np.clip(y, 0.0, 1.0)
-        p = self._sigmoid(yhat)
+        p = np.clip(yhat, 0.0, 1.0)
 
         # Write ONE main predictions parquet
         out_df = df_test.copy()
@@ -1725,7 +1716,11 @@ class S2Tier123End2EndEvaluatorTestOnly:
                 "top_k": self.top_k,
                 "faiss": "IndexFlatIP (in-memory, not saved)",
             },
-            "verifier": {"weights": self.verifier_weights_path, "max_tokens": self.verifier_max_tokens},
+            "verifier": {
+                "weights": self.verifier_weights_path,
+                "top_p": self.verifier_top_p,  # NEW
+                "max_tokens": self.verifier_max_tokens
+            },
             "metrics": {**tier1_metrics, "SelectiveRisk": rc},
             "artifacts": {"predictions_parquet": test_pred_path},
         }
@@ -1765,7 +1760,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
             ids_rand = self._stress_random_ids(len(df_test))
             yhat_rand = self._predict_with_ids(df_test, ids_rand, desc=f"S2 Faithfulness random (trial {t+1}) [test]")
             rand_preds.append(yhat_rand)
-            p_rand = self._sigmoid(yhat_rand)
+            p_rand = np.clip(yhat_rand, 0.0, 1.0)
             rand_metrics_list.append(self._eval_preds_metrics(y01, yhat_rand, p_rand))
 
         def avg_metrics(ms: List[Dict[str, float]]) -> Dict[str, float]:
@@ -1780,7 +1775,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
         yhat_swapped = self._predict_with_ids(df_test, ids_swapped, desc="S2 Faithfulness swapped-evidence [test]")
 
         def met(yhat_x: np.ndarray) -> Dict[str, float]:
-            return self._eval_preds_metrics(y01, yhat_x, self._sigmoid(yhat_x))
+            return self._eval_preds_metrics(y01, yhat_x, np.clip(yhat_x, 0.0, 1.0))
 
         met_top1 = met(yhat_top1)
         met_top3 = met(yhat_top3)
@@ -1892,6 +1887,7 @@ class S2Tier123End2EndEvaluatorTestOnly:
 
 
 
+
 class S3Tier123End2EndEvaluatorTestOnly:
     """
     S3 — BM25 retrieval -> V*
@@ -1910,7 +1906,8 @@ class S3Tier123End2EndEvaluatorTestOnly:
         verifier_weights_path: str,
         device: str = "cuda",
         top_k: int = 20,
-        verifier_max_tokens: int = 512,
+        verifier_top_p: int = 5,          # NEW
+        verifier_max_tokens: int = 1024,  # NEW
         evidence_sep: str = "\n\n---\n\n",
         batch_size_verify: int = 16,
         ece_bins: int = 15,
@@ -1936,6 +1933,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
 
         self.device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
         self.top_k = int(top_k)
+        self.verifier_top_p = int(verifier_top_p)   # NEW
         self.verifier_max_tokens = int(verifier_max_tokens)
         self.evidence_sep = evidence_sep
         self.batch_size_verify = int(batch_size_verify)
@@ -2026,6 +2024,8 @@ class S3Tier123End2EndEvaluatorTestOnly:
         obj = torch.load(self.verifier_weights_path, map_location="cpu")
         state = obj["model_state_dict"] if (isinstance(obj, dict) and "model_state_dict" in obj) else obj
         self.verifier_model.load_state_dict(state, strict=True)
+        self.verifier_model.eval()
+
 
     # BM25 (in memory, on the fly)
     def _tokenize_bm25(self, text: str) -> List[str]:
@@ -2157,7 +2157,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
     def _materialize_evidence(self, chunk_ids: List[int]) -> str:
         assert self.chunk_map is not None
         texts = []
-        for cid in chunk_ids:
+        for cid in chunk_ids[: self.verifier_top_p]:  # NEW
             t = self.chunk_map.get(int(cid), "")
             if t:
                 texts.append(t)
@@ -2179,8 +2179,8 @@ class S3Tier123End2EndEvaluatorTestOnly:
                 self._safe_str(case_context).strip(),
                 "QUESTION:",
                 self._safe_str(question).strip(),
-                "ANSWER_TARGET:",
-                self._safe_str(answer_target).strip(),
+                # "ANSWER_TARGET:",
+                # self._safe_str(answer_target).strip(),
                 "CLAIM:",
                 self._safe_str(claim_text).strip(),
                 "EVIDENCE:",
@@ -2433,9 +2433,10 @@ class S3Tier123End2EndEvaluatorTestOnly:
 
         if "label_vs_extractive" in df_test.columns:
             vals = df_test["label_vs_extractive"].astype(str).values
-            out["test_slice.label_vs_extractive.label"] = pack(vals == "label")
-            out["test_slice.label_vs_extractive.extractive"] = pack(vals == "extractive")
-
+            if "label_vs_extractive" in df_test.columns:
+                vals = df_test["label_vs_extractive"].astype(str).values
+                out["test_slice.label_vs_extractive.closed_form"] = pack(vals == "closed_form")
+                out["test_slice.label_vs_extractive.other"] = pack(vals == "other")
         return out
 
     def _write_csv_summary(self) -> str:
@@ -2449,11 +2450,6 @@ class S3Tier123End2EndEvaluatorTestOnly:
         def load_json(p):
             with open(p, "r", encoding="utf-8") as f:
                 return json.load(f)
-
-        def fmt3(x):
-            if isinstance(x, (int, float)) and pd.notna(x):
-                return f"{x:.3f}"
-            return x
 
         rows = []
         t1 = load_json(tier1_path) if os.path.exists(tier1_path) else {}
@@ -2495,7 +2491,13 @@ class S3Tier123End2EndEvaluatorTestOnly:
                 rows.append(["Tier3", slice_name, "risk_mse@80", r80])
 
         df = pd.DataFrame(rows, columns=["Tier", "Subgroup", "Metric", "Value"])
-        df["Value"] = df["Value"].apply(fmt3)
+        df["Value"] = pd.to_numeric(df["Value"], errors="coerce")
+
+        mask_n = df["Metric"].astype(str).str.lower().eq("n")
+
+        df.loc[~mask_n, "Value"] = df.loc[~mask_n, "Value"] * 100.0
+        df["Value"] = df["Value"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
+
         df.to_csv(out_csv, index=False)
         print(f"Saved: {out_csv}")
         return out_csv
@@ -2507,7 +2509,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
         df_test = pd.read_parquet(self.test_parquet)
 
         # TODO; remove this
-        # df_test = df_test.iloc[: int(len(df_test) * 0.001)].reset_index(drop=True)
+        df_test = df_test.iloc[: int(len(df_test) * 0.5)].reset_index(drop=True)
 
         if "split" in df_test.columns:
             df_test = df_test[df_test["split"].astype(str) == "test"].copy()
@@ -2559,7 +2561,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
         yhat = self._predict_support(inputs, desc="S3 Verification (V*) [test]")
         y = pd.to_numeric(df_test["soft_support_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
         y01 = np.clip(y, 0.0, 1.0)
-        p = self._sigmoid(yhat)
+        p = np.clip(yhat, 0.0, 1.0)
 
         out_df = df_test.copy()
         out_df["s3_retrieved_chunk_ids_json"] = [json.dumps(x) for x in topk_test]
@@ -2583,7 +2585,11 @@ class S3Tier123End2EndEvaluatorTestOnly:
                 "k1": self.bm25_k1,
                 "b": self.bm25_b,
             },
-            "verifier": {"weights": self.verifier_weights_path, "max_tokens": self.verifier_max_tokens},
+            "verifier": {
+                "weights": self.verifier_weights_path,
+                "top_p": self.verifier_top_p,  # NEW
+                "max_tokens": self.verifier_max_tokens
+            },
             "metrics": {**tier1_metrics, "SelectiveRisk": rc},
             "artifacts": {"predictions_parquet": test_pred_path},
         }
@@ -2623,7 +2629,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
             ids_rand = self._stress_random_ids(len(df_test))
             yhat_rand = self._predict_with_ids(df_test, ids_rand, desc=f"S3 Faithfulness random (trial {t+1}) [test]")
             rand_preds.append(yhat_rand)
-            rand_metrics_list.append(self._eval_preds_metrics(y01, yhat_rand, self._sigmoid(yhat_rand)))
+            rand_metrics_list.append(self._eval_preds_metrics(y01, yhat_rand, np.clip(yhat_rand, 0.0, 1.0)))
 
         def avg_metrics(ms: List[Dict[str, float]]) -> Dict[str, float]:
             if not ms:
@@ -2637,7 +2643,7 @@ class S3Tier123End2EndEvaluatorTestOnly:
         yhat_swapped = self._predict_with_ids(df_test, ids_swapped, desc="S3 Faithfulness swapped-evidence [test]")
 
         def met(yhat_x: np.ndarray) -> Dict[str, float]:
-            return self._eval_preds_metrics(y01, yhat_x, self._sigmoid(yhat_x))
+            return self._eval_preds_metrics(y01, yhat_x, np.clip(yhat_x, 0.0, 1.0))
 
         met_top1 = met(yhat_top1)
         met_top3 = met(yhat_top3)
@@ -2747,7 +2753,6 @@ class S3Tier123End2EndEvaluatorTestOnly:
 
 
 
-
 class S1Tier123CaseOnlyEvaluatorTestOnly:
     """
     S1 - Case-only verifier V* with the same verifier architecture and
@@ -2769,7 +2774,8 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
         base_path_evidenceData: str,
         verifier_weights_path: str,
         device: str = "cuda",
-        verifier_max_tokens: int = 512,
+        verifier_top_p: int = 5,
+        verifier_max_tokens: int = 1024,
         batch_size_verify: int = 16,
         ece_bins: int = 15,
         out_dir: Optional[str] = None,
@@ -2782,6 +2788,7 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
         self.verifier_weights_path = verifier_weights_path
 
         self.device = device if (device == "cuda" and torch.cuda.is_available()) else "cpu"
+        self.verifier_top_p = int(verifier_top_p)
         self.verifier_max_tokens = int(verifier_max_tokens)
         self.batch_size_verify = int(batch_size_verify)
         self.ece_bins = int(ece_bins)
@@ -2829,6 +2836,8 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
         state = obj["model_state_dict"] if (isinstance(obj, dict) and "model_state_dict" in obj) else obj
 
         self.verifier_model.load_state_dict(state, strict=True)
+        self.verifier_model.eval()
+
 
     def _safe_str(self, x) -> str:
         if x is None:
@@ -2852,12 +2861,8 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
                 self._safe_str(case_context).strip(),
                 "QUESTION:",
                 self._safe_str(question).strip(),
-                "ANSWER_TARGET:",
-                self._safe_str(answer_target).strip(),
                 "CLAIM:",
                 self._safe_str(claim_text).strip(),
-                "EVIDENCE:",
-                self._safe_str(evidence_text).strip(),
             ]
         )
 
@@ -2883,6 +2888,7 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
                     return_tensors="pt",
                 )
                 enc = {k: v.to(self.device) for k, v in enc.items()}
+
 
                 out = self.verifier_model(**enc)
                 y = out.logits.squeeze(-1)
@@ -3027,9 +3033,10 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
 
         if "label_vs_extractive" in df_test.columns:
             vals = df_test["label_vs_extractive"].astype(str).values
-            out["test_slice.label_vs_extractive.label"] = pack(vals == "label")
-            out["test_slice.label_vs_extractive.extractive"] = pack(vals == "extractive")
-
+            if "label_vs_extractive" in df_test.columns:
+                vals = df_test["label_vs_extractive"].astype(str).values
+                out["test_slice.label_vs_extractive.closed_form"] = pack(vals == "closed_form")
+                out["test_slice.label_vs_extractive.other"] = pack(vals == "other")
         return out
 
     def _write_csv_summary(self) -> str:
@@ -3070,10 +3077,17 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
                 rows.append(["Tier3", slice_name, "risk_mse@80", r80])
 
         df = pd.DataFrame(rows, columns=["Tier", "Subgroup", "Metric", "Value"])
-        df["Value"] = df["Value"].apply(fmt3)
+        df["Value"] = pd.to_numeric(df["Value"], errors="coerce")
+
+        mask_n = df["Metric"].astype(str).str.lower().eq("n")
+
+        df.loc[~mask_n, "Value"] = df.loc[~mask_n, "Value"] * 100.0
+        df["Value"] = df["Value"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "")
+
         df.to_csv(out_csv, index=False)
         print(f"Saved: {out_csv}")
         return out_csv
+
 
     def run(self) -> str:
         if not os.path.exists(self.test_parquet):
@@ -3082,7 +3096,7 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
         df_test = pd.read_parquet(self.test_parquet)
 
         # TODO; remove this
-        # df_test = df_test.iloc[: int(len(df_test) * 0.2)].reset_index(drop=True)
+        df_test = df_test.iloc[: int(len(df_test) * 0.002)].reset_index(drop=True)
 
         if "split" in df_test.columns:
             df_test = df_test[df_test["split"].astype(str) == "test"].copy()
@@ -3120,8 +3134,9 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
 
         yhat = self._predict_support(inputs, desc="S1 Verification (case-only, empty evidence) [test]")
         y = pd.to_numeric(df_test["soft_support_score"], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
+
         y01 = np.clip(y, 0.0, 1.0)
-        p = self._sigmoid(yhat)
+        p = np.clip(yhat, 0.0, 1.0)
 
         # One predictions parquet
         out_df = df_test.copy()
@@ -3140,7 +3155,11 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
             "system": "S1 (case-only verifier)",
             "test_parquet": self.test_parquet,
             "n_test": int(len(df_test)),
-            "verifier": {"weights": self.verifier_weights_path, "max_tokens": self.verifier_max_tokens},
+            "verifier": {
+                "weights": self.verifier_weights_path,
+                "top_p": self.verifier_top_p,   # NEW
+                "max_tokens": self.verifier_max_tokens
+            },
             "metrics": {**tier1_metrics, "SelectiveRisk": rc},
             "reliability_bins": bins,
             "artifacts": {"predictions_parquet": pred_path},
@@ -3183,7 +3202,6 @@ class S1Tier123CaseOnlyEvaluatorTestOnly:
         self._write_csv_summary()
 
         return summary_path
-
 
 
 
@@ -3340,7 +3358,7 @@ class CrossSystemComparatorPredOnlyTestOnly:
         y01 = np.asarray(y01, dtype=np.float64)
         yhat = np.asarray(yhat, dtype=np.float64)
 
-        p = self._sigmoid(yhat)
+        p = np.clip(yhat, 0.0, 1.0)
         conf = np.maximum(p, 1.0 - p)
         order = np.argsort(-conf, kind="stable")
 
@@ -3628,7 +3646,7 @@ class CrossSystemComparatorPredOnlyTestOnly:
                 p = pd.to_numeric(df[cols["pred_prob"]], errors="coerce").fillna(0.0).to_numpy(dtype=np.float32)
                 p = np.clip(p, 0.0, 1.0)
             else:
-                p = self._sigmoid(yhat).astype(np.float32)
+                p = np.clip(yhat, 0.0, 1.0).astype(np.float32)
 
             per_system[sys_name] = {
                 "MSE": self._mse(y01, yhat),
@@ -3883,13 +3901,13 @@ if __name__ == "__main__":
     base_path_evidenceData = params["Preprocessing"]["base_path_evidenceData"]
 
 
-    results, df_out = analyze_retrieval_error_coupling(
-        # parquet_path=os.path.join(base_path_evidenceData, "CheXpertPlus_Results/S4", "s4_test_predictions.parquet"),
-        parquet_path=os.path.join(base_path_evidenceData, "MIMIC_Results/S4", "s4_test_predictions.parquet"),
-        system_prefix="s4",
-        top_k=20,
-        make_plot=True,
-    )
+    # results, df_out = analyze_retrieval_error_coupling(
+    #     # parquet_path=os.path.join(base_path_evidenceData, "CheXpertPlus_Results/S4", "s4_test_predictions.parquet"),
+    #     parquet_path=os.path.join(base_path_evidenceData, "MIMIC_Results/S4", "s4_test_predictions.parquet"),
+    #     system_prefix="s4",
+    #     top_k=20,
+    #     make_plot=True,
+    # )
 
 
 
@@ -3900,21 +3918,17 @@ if __name__ == "__main__":
         base_path_evidenceData=base_path_evidenceData,
         verifier_weights_path=verifier_weights_path,
         device="cuda",
-        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+        verifier_top_p=5,
+        verifier_max_tokens=1024,
         out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S1"),
-        batch_size_verify=16,
+        batch_size_verify=4,
         ece_bins=15,
         seed=13,
         input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
     )
     s1.run()
 
-
-
-
-
-
-    ''' S2 '''
+    # ''' S2 '''
     s2 = S2Tier123End2EndEvaluatorTestOnly(
         cfg_path=global_config_path,
         experiment_name=experiment_name,
@@ -3922,93 +3936,96 @@ if __name__ == "__main__":
         verifier_weights_path=verifier_weights_path,
         device="cuda",
         top_k=20,
-        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
+        verifier_top_p=5,
+        verifier_max_tokens=1024,
         out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S2"),
         batch_size_embed_chunks=128,
         batch_size_retrieve=256,
-        batch_size_verify=16,
+        batch_size_verify=4,
         ece_bins=15,
         input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
         seed=13,
     )
     s2.run()
-
-
-
-    ''' S3 '''
-    s3 = S3Tier123End2EndEvaluatorTestOnly(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        verifier_weights_path=verifier_weights_path,
-        device="cuda",
-        top_k=20,
-        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-        out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S3"),
-        batch_size_verify=16,
-        ece_bins=15,
-        seed=13,
-        input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
-        bm25_k1=1.2,
-        bm25_b=0.75,
-    )
-    s3.run()
-
-
-    ''' S4 '''
-    runner = S4Tier123End2EndEvaluatorTestOnly(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        model_weights_path=model_weights_path,
-        verifier_weights_path=verifier_weights_path,
-        device="cuda",
-        top_k=20,
-        verifier_max_tokens=int(params["Verifier"]["max_tokens"]),
-        out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S4"),
-        batch_size_retrieve=256,
-        batch_size_verify=16,
-        input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
-        batch_size_embed_docs=256,
-        ece_bins=15,
-    )
-    runner.run()
-
-
-
-    ''' Cross comparison '''
-    base = params["Preprocessing"]["base_path_evidenceData"]
-
-    comparator = CrossSystemComparatorPredOnlyTestOnly(
-        system_test_predictions={
-            "S1": os.path.join(base, "MIMIC_Results/S1", "s1_test_predictions.parquet"),
-            "S2": os.path.join(base, "MIMIC_Results/S2", "s2_test_predictions.parquet"),
-            "S3": os.path.join(base, "MIMIC_Results/S3", "s3_test_predictions.parquet"),
-            "S4": os.path.join(base, "MIMIC_Results/S4", "s4_test_predictions.parquet"),
-        },
-        system_full_results_csvs={
-            "S1": os.path.join(base, "MIMIC_Results/S1", "S1_full_results.csv"),
-            "S2": os.path.join(base, "MIMIC_Results/S2", "S2_full_results.csv"),
-            "S3": os.path.join(base, "MIMIC_Results/S3", "S3_full_results.csv"),
-            "S4": os.path.join(base, "MIMIC_Results/S4", "S4_full_results.csv"),
-        },
-        system_faithfulness_predictions={
-            "S2": os.path.join(base, "MIMIC_Results/S2", "s2_tier2_faithfulness_predictions.parquet"),
-            "S3": os.path.join(base, "MIMIC_Results/S3", "s3_tier2_faithfulness_predictions.parquet"),
-            "S4": os.path.join(base, "MIMIC_Results/S4", "s4_tier2_faithfulness_predictions.parquet"),
-        },
-        out_path=os.path.join(
-            base,
-            "MIMIC_Results",
-            "cross_system_results",
-            "s1_s4_cross_system_comparison.json",
-        ),
-        ece_bins=15,
-        n_boot=1000,
-        seed=13,
-        verbose=True,
-        use_unordered_pairs_only=True,
-    )
-
-    comparator.run()
+    #
+    #
+    # ''' S3 '''
+    # s3 = S3Tier123End2EndEvaluatorTestOnly(
+    #     cfg_path=global_config_path,
+    #     experiment_name=experiment_name,
+    #     base_path_evidenceData=base_path_evidenceData,
+    #     verifier_weights_path=verifier_weights_path,
+    #     device="cuda",
+    #     top_k=20,
+    #     verifier_top_p=5,
+    #     verifier_max_tokens=1024,
+    #     out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S3"),
+    #     batch_size_verify=16,
+    #     ece_bins=15,
+    #     seed=13,
+    #     input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
+    #     bm25_k1=1.2,
+    #     bm25_b=0.75,
+    # )
+    # s3.run()
+    #
+    #
+    # ''' S4 '''
+    # runner = S4Tier123End2EndEvaluatorTestOnly(
+    #     cfg_path=global_config_path,
+    #     experiment_name=experiment_name,
+    #     base_path_evidenceData=base_path_evidenceData,
+    #     model_weights_path=model_weights_path,
+    #     verifier_weights_path=verifier_weights_path,
+    #     device="cuda",
+    #     top_k=20,
+    #     verifier_top_p=5,
+    #     verifier_max_tokens=1024,
+    #     out_dir=os.path.join(base_path_evidenceData, "MIMIC_Results/S4"),
+    #     batch_size_retrieve=256,
+    #     batch_size_verify=4,
+    #     input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet",
+    #     batch_size_embed_docs=256,
+    #     ece_bins=15,
+    # )
+    # runner.run()
+    #
+    #
+    #
+    #
+    # ''' Cross comparison '''
+    # base = params["Preprocessing"]["base_path_evidenceData"]
+    #
+    # comparator = CrossSystemComparatorPredOnlyTestOnly(
+    #     system_test_predictions={
+    #         "S1": os.path.join(base, "MIMIC_Results/S1", "s1_test_predictions.parquet"),
+    #         "S2": os.path.join(base, "MIMIC_Results/S2", "s2_test_predictions.parquet"),
+    #         "S3": os.path.join(base, "MIMIC_Results/S3", "s3_test_predictions.parquet"),
+    #         "S4": os.path.join(base, "MIMIC_Results/S4", "s4_test_predictions.parquet"),
+    #     },
+    #     system_full_results_csvs={
+    #         "S1": os.path.join(base, "MIMIC_Results/S1", "S1_full_results.csv"),
+    #         "S2": os.path.join(base, "MIMIC_Results/S2", "S2_full_results.csv"),
+    #         "S3": os.path.join(base, "MIMIC_Results/S3", "S3_full_results.csv"),
+    #         "S4": os.path.join(base, "MIMIC_Results/S4", "S4_full_results.csv"),
+    #     },
+    #     system_faithfulness_predictions={
+    #         "S2": os.path.join(base, "MIMIC_Results/S2", "s2_tier2_faithfulness_predictions.parquet"),
+    #         "S3": os.path.join(base, "MIMIC_Results/S3", "s3_tier2_faithfulness_predictions.parquet"),
+    #         "S4": os.path.join(base, "MIMIC_Results/S4", "s4_tier2_faithfulness_predictions.parquet"),
+    #     },
+    #     out_path=os.path.join(
+    #         base,
+    #         "MIMIC_Results",
+    #         "cross_system_results",
+    #         "s1_s4_cross_system_comparison.json",
+    #     ),
+    #     ece_bins=15,
+    #     n_boot=1000,
+    #     seed=13,
+    #     verbose=True,
+    #     use_unordered_pairs_only=True,
+    # )
+    #
+    # comparator.run()
 

@@ -239,20 +239,16 @@ class EvidenceTextStore:
     """
     Deterministic chunk_id -> chunk_text lookup.
 
-    Assumption (recommended / most common in your pipeline):
-      chunk_id is the *row index* in the evidence parquet (0-based).
-    If your chunk ids are 1-based, set id_base=1.
-
-    Two modes:
-      - preload=True: loads all texts to RAM once per worker (fastest at runtime).
-      - preload=False: row-group cached reads (lower RAM, slower).
+    Assumption:
+      chunk_id is the row index in the evidence parquet (0-based).
+    If chunk ids are 1-based, set id_base=1.
     """
 
     def __init__(
         self,
         evidence_parquet_path: str,
         text_col: str = "chunk_text",
-        id_base: int = 0,  # 0 if chunk ids are 0..M-1, 1 if 1..M
+        id_base: int = 0,
         preload: bool = False,
         cache_row_groups: int = 2,
     ) -> None:
@@ -269,9 +265,8 @@ class EvidenceTextStore:
         if self.text_col not in set(self.pf.schema.names):
             raise ValueError(f"Evidence parquet missing required text column: {self.text_col}")
 
-        # Row group metadata for O(1) mapping row_idx -> (rg, offset)
         self._rg_num_rows = [self.pf.metadata.row_group(i).num_rows for i in range(self.pf.num_row_groups)]
-        self._rg_prefix = np.cumsum([0] + self._rg_num_rows).tolist()  # len = num_rgs + 1
+        self._rg_prefix = np.cumsum([0] + self._rg_num_rows).tolist()
         self._total_rows = self._rg_prefix[-1]
 
         self._rg_cache: Dict[int, List[str]] = {}
@@ -279,8 +274,6 @@ class EvidenceTextStore:
 
         self._texts: Optional[List[str]] = None
         if self.preload:
-            # Load all chunk texts into RAM once (per worker/process).
-            # This is fast at training time but can be memory heavy.
             self._texts = self.pf.read(columns=[self.text_col]).column(0).to_pylist()
 
     def _cache_put(self, rg: int, texts: List[str]) -> None:
@@ -291,7 +284,6 @@ class EvidenceTextStore:
             self._rg_cache.pop(old, None)
 
     def _row_to_rg(self, row_idx: int) -> Tuple[int, int]:
-        # binary search over prefix sums
         lo, hi = 0, len(self._rg_prefix) - 2
         while lo <= hi:
             mid = (lo + hi) // 2
@@ -332,37 +324,39 @@ class EvidenceTextStore:
 class VerifierSupervisionDataset(Dataset):
     """
     Reads Step 4C verifier_supervision.parquet and materializes evidence text on-the-fly
-    using a frozen evidence chunk store (Radiopaedia chunks).
+    using a frozen evidence chunk store.
 
-    This replaces the old Step 7 "materialized evidence_text" dependency.
+    Updated for the new pipeline:
+      - supports supporting_span / retrieval_query columns
+      - sorts evidence by evidence_weights_json before truncating to top-k
+      - keeps verifier input as CASE + QUESTION + CLAIM + EVIDENCE
     """
 
     def __init__(
         self,
         cfg_path: str,
         split_name: str,
-        # Step 4C supervision parquet
         supervision_relpath: str = "step4c_supervision/verifier_supervision.parquet",
-        # Evidence chunk table (must contain chunk_text column; chunk_id must map to row index)
         evidence_parquet_relpath: str = "chunks.parquet",
         evidence_text_col: str = "chunk_text",
-        evidence_id_base: int = 0,  # set to 1 if your chunk ids are 1..M
+        evidence_id_base: int = 0,
         preload_evidence_texts: bool = False,
         evidence_cache_row_groups: int = 2,
-        # columns in Step 4C verifier_supervision.parquet
         split_col: str = "split",
         qa_row_id_col: str = "qa_row_id",
         case_context_col: str = "case_context",
         question_col: str = "question",
         answer_col: str = "answer_target",
         claim_col: str = "claim_text",
+        supporting_span_col: str = "supporting_span",
+        retrieval_query_col: str = "retrieval_query",
         evidence_ids_col: str = "evidence_chunk_ids_json",
+        evidence_weights_col: str = "evidence_weights_json",
         target_col: str = "soft_support_score",
-        # formatting
         evidence_separator: str = "\n\n---\n\n",
         max_evidence_chars: int = 20_000,
+        verifier_top_k_evidence: int = 5,
         join_with_newlines: bool = True,
-        # performance knobs
         cache_row_groups: int = 2,
         assume_split_is_string: bool = True,
     ) -> None:
@@ -378,11 +372,15 @@ class VerifierSupervisionDataset(Dataset):
         self.question_col = str(question_col)
         self.answer_col = str(answer_col)
         self.claim_col = str(claim_col)
+        self.supporting_span_col = str(supporting_span_col)
+        self.retrieval_query_col = str(retrieval_query_col)
         self.evidence_ids_col = str(evidence_ids_col)
+        self.evidence_weights_col = str(evidence_weights_col)
         self.target_col = str(target_col)
 
         self.evidence_separator = str(evidence_separator)
         self.max_evidence_chars = int(max_evidence_chars)
+        self.verifier_top_k_evidence = int(verifier_top_k_evidence)
         self.join_with_newlines = bool(join_with_newlines)
 
         self.cache_row_groups = int(cache_row_groups)
@@ -399,9 +397,9 @@ class VerifierSupervisionDataset(Dataset):
             self.split_col,
             self.case_context_col,
             self.question_col,
-            self.answer_col,
             self.claim_col,
             self.evidence_ids_col,
+            self.evidence_weights_col,
             self.target_col,
         ]
         for c in required:
@@ -409,8 +407,10 @@ class VerifierSupervisionDataset(Dataset):
                 raise ValueError(f"Missing required column in verifier_supervision.parquet: {c}")
 
         self.has_qa_row_id = self.qa_row_id_col in schema_names
+        self.has_answer = self.answer_col in schema_names
+        self.has_supporting_span = self.supporting_span_col in schema_names
+        self.has_retrieval_query = self.retrieval_query_col in schema_names
 
-        # Evidence store
         evidence_path = os.path.join(self.base_path, evidence_parquet_relpath)
         self.evidence_store = EvidenceTextStore(
             evidence_parquet_path=evidence_path,
@@ -420,11 +420,9 @@ class VerifierSupervisionDataset(Dataset):
             cache_row_groups=evidence_cache_row_groups,
         )
 
-        # Build split index (row-group + row offset)
         self._rg_row_index: List[Tuple[int, int]] = []
         self._build_split_index()
 
-        # Row-group cache for supervision parquet
         self._rg_cache: Dict[int, Dict[str, List]] = {}
         self._rg_cache_order: List[int] = []
 
@@ -462,22 +460,48 @@ class VerifierSupervisionDataset(Dataset):
             return s[: self.max_evidence_chars]
         return s
 
-    def _materialize_evidence(self, evidence_ids_json: str) -> str:
+    def _materialize_evidence(self, evidence_ids_json: str, evidence_weights_json: str) -> str:
         ids = self._loads_json_list(self._safe_str(evidence_ids_json))
-        out_chunks: List[str] = []
-        for cid in ids:
+        weights = self._loads_json_list(self._safe_str(evidence_weights_json))
+
+        pairs: List[Tuple[int, float]] = []
+        m = min(len(ids), len(weights))
+        for i in range(m):
             try:
-                out_chunks.append(self.evidence_store.get(int(cid)))
+                cid = int(ids[i])
+                ww = float(weights[i])
+                pairs.append((cid, ww))
             except Exception:
-                out_chunks.append("")
-        joined = self.evidence_separator.join([x for x in out_chunks if x])
+                continue
+
+        if len(ids) > m:
+            for i in range(m, len(ids)):
+                try:
+                    pairs.append((int(ids[i]), 0.0))
+                except Exception:
+                    continue
+
+        pairs.sort(key=lambda x: x[1], reverse=True)
+
+        if self.verifier_top_k_evidence > 0:
+            pairs = pairs[: self.verifier_top_k_evidence]
+
+        out_chunks: List[str] = []
+        for cid, _ in pairs:
+            try:
+                txt = self.evidence_store.get(int(cid))
+                if txt:
+                    out_chunks.append(txt)
+            except Exception:
+                pass
+
+        joined = self.evidence_separator.join(out_chunks)
         return self._truncate_evidence(joined)
 
     def _build_input_text(
         self,
         case_context: str,
         question: str,
-        answer_target: str,
         claim_text: str,
         evidence_text: str,
     ) -> str:
@@ -488,8 +512,6 @@ class VerifierSupervisionDataset(Dataset):
                 self._safe_str(case_context).strip(),
                 "QUESTION:",
                 self._safe_str(question).strip(),
-                "ANSWER_TARGET:",
-                self._safe_str(answer_target).strip(),
                 "CLAIM:",
                 self._safe_str(claim_text).strip(),
                 "EVIDENCE:",
@@ -512,13 +534,19 @@ class VerifierSupervisionDataset(Dataset):
         cols = [
             self.case_context_col,
             self.question_col,
-            self.answer_col,
             self.claim_col,
             self.evidence_ids_col,
+            self.evidence_weights_col,
             self.target_col,
         ]
         if self.has_qa_row_id:
             cols.append(self.qa_row_id_col)
+        if self.has_answer:
+            cols.append(self.answer_col)
+        if self.has_supporting_span:
+            cols.append(self.supporting_span_col)
+        if self.has_retrieval_query:
+            cols.append(self.retrieval_query_col)
 
         t = self.pf.read_row_group(rg, columns=cols)
         payload: Dict[str, List] = {c: t.column(c).to_pylist() for c in cols}
@@ -540,16 +568,18 @@ class VerifierSupervisionDataset(Dataset):
 
         case_context = payload[self.case_context_col][row_in_group]
         question = payload[self.question_col][row_in_group]
-        answer_target = payload[self.answer_col][row_in_group]
         claim_text = payload[self.claim_col][row_in_group]
         evidence_ids_json = payload[self.evidence_ids_col][row_in_group]
+        evidence_weights_json = payload[self.evidence_weights_col][row_in_group]
 
-        evidence_text = self._materialize_evidence(evidence_ids_json)
+        evidence_text = self._materialize_evidence(
+            evidence_ids_json=evidence_ids_json,
+            evidence_weights_json=evidence_weights_json,
+        )
 
         input_text = self._build_input_text(
             case_context=case_context,
             question=question,
-            answer_target=answer_target,
             claim_text=claim_text,
             evidence_text=evidence_text,
         )
@@ -559,7 +589,11 @@ class VerifierSupervisionDataset(Dataset):
         except Exception:
             target = 0.0
 
-        return {"qa_row_id": qa_row_id, "input_text": input_text, "target": target}
+        return {
+            "qa_row_id": qa_row_id,
+            "input_text": input_text,
+            "target": target,
+        }
 
 
 class NonRepeatingChunkSampler(Sampler[int]):
