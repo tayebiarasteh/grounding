@@ -238,10 +238,10 @@ class MimicCaseContextBuilder:
 
 class MimicFactTableBuilder:
     """
-    Step 2: Build per-report 'facts' from the 14 CheXpert labels.
+    Step 2: Build one row per report with only report-level metadata and case_context.
 
-    Output schema (one row per fact):
-      subject_id, split, report_rel_path, case_context, label_name, label_value
+    Output schema:
+      subject_id, split, report_rel_path, case_context
     """
 
     def __init__(
@@ -261,71 +261,6 @@ class MimicFactTableBuilder:
         self.subject_col = subject_col
         self.report_path_col = report_path_col
 
-        # CheXpert label semantics:
-        # 0 = negative mention, 1 = positive mention, 2 = no mention, 3 = uncertain/ambiguous mention
-        self.valid_fact_values = {0, 1, 3}
-
-    def _detect_label_columns(self, df: pd.DataFrame) -> List[str]:
-        """
-        Finds label columns as all integer-like columns excluding known meta columns.
-        If your master CSV has explicit label column names, you can replace this with a fixed list.
-        """
-        meta = {self.subject_col, self.report_path_col, self.split_col}
-        # keep numeric columns that aren't meta
-        label_cols = []
-        for c in df.columns:
-            if c in meta:
-                continue
-            # label cols are usually small ints 0/1/2/3
-            if pd.api.types.is_numeric_dtype(df[c]):
-                label_cols.append(c)
-        if not label_cols:
-            raise ValueError("No numeric label columns found. Provide explicit label column names.")
-        return label_cols
-
-    def _aggregate_labels_per_report(self, df: pd.DataFrame, label_cols: List[str]) -> pd.DataFrame:
-        """
-        Aggregate labels per report_rel_path across multiple image-rows.
-
-        Priority rule:
-          if any 1 -> 1
-          elif any 3 -> 3
-          elif any 0 -> 0
-          else -> 2
-        """
-        # Make sure label cols are numeric (coerce safely)
-        work = df[[self.report_path_col, self.subject_col] + (
-            [self.split_col] if self.split_col in df.columns else []) + label_cols].copy()
-        for c in label_cols:
-            work[c] = pd.to_numeric(work[c], errors="coerce")
-
-        # priority encoding: 2 lowest, then 0, then 3, then 1 highest
-        # map label -> priority score
-        pri_map = {2: 0, 0: 1, 3: 2, 1: 3}
-
-        # convert each label col to priority scores (NaN stays NaN -> treat as 0)
-        for c in label_cols:
-            work[c] = work[c].map(pri_map).fillna(0).astype("int8")
-
-        # group by report only (subject_id is constant per report in MIMIC)
-        g = work.groupby(self.report_path_col, as_index=False)
-
-        out = g[[self.subject_col]].first()
-        if self.split_col in work.columns:
-            out[self.split_col] = g[self.split_col].first()[self.split_col]
-
-        # max priority per label per report
-        max_pri = g[label_cols].max()
-
-        # map priority back to label
-        inv_pri = {0: 2, 1: 0, 2: 3, 3: 1}
-        for c in label_cols:
-            out[c] = max_pri[c].map(inv_pri).astype("int8")
-
-        return out
-
-
-
     def build_fact_table(self) -> pd.DataFrame:
         master = pd.read_csv(self.master_csv)
         ctx = pd.read_csv(self.case_context_csv)
@@ -338,44 +273,46 @@ class MimicFactTableBuilder:
             raise ValueError(f"Master CSV missing columns: {missing_master}")
 
         required_ctx = {self.subject_col, self.report_path_col, "case_context"}
+        if self.split_col in ctx.columns:
+            required_ctx.add(self.split_col)
         missing_ctx = required_ctx - set(ctx.columns)
         if missing_ctx:
             raise ValueError(f"Case-context CSV missing columns: {missing_ctx}")
 
-        label_cols = self._detect_label_columns(master)
+        master_keep = [self.subject_col, self.report_path_col]
+        if self.split_col in master.columns:
+            master_keep.append(self.split_col)
 
-        # aggregate labels to one row per report
-        per_report = self._aggregate_labels_per_report(master, label_cols)
+        ctx_keep = [self.subject_col, self.report_path_col, "case_context"]
+        if self.split_col in ctx.columns:
+            ctx_keep.append(self.split_col)
 
-        # merge with case_context
-        merged = per_report.merge(
-            ctx[[self.subject_col, self.report_path_col, "case_context"] + ([self.split_col] if self.split_col in ctx.columns else [])],
+        master_u = (
+            master[master_keep]
+            .drop_duplicates(subset=[self.report_path_col])
+            .reset_index(drop=True)
+        )
+        ctx_u = (
+            ctx[ctx_keep]
+            .drop_duplicates(subset=[self.report_path_col])
+            .reset_index(drop=True)
+        )
+
+        merged = master_u.merge(
+            ctx_u,
             on=[self.subject_col, self.report_path_col],
             how="inner",
             suffixes=("", "_ctx"),
         )
 
-        # choose split from ctx if present, else from master
         if self.split_col in merged.columns and f"{self.split_col}_ctx" in merged.columns:
             merged[self.split_col] = merged[f"{self.split_col}_ctx"].fillna(merged[self.split_col])
             merged = merged.drop(columns=[f"{self.split_col}_ctx"])
+        elif f"{self.split_col}_ctx" in merged.columns:
+            merged[self.split_col] = merged[f"{self.split_col}_ctx"]
+            merged = merged.drop(columns=[f"{self.split_col}_ctx"])
 
-        # make long "facts" table
-        long_rows = []
-        for _, row in merged.iterrows():
-            for lab in label_cols:
-                v = int(row[lab])
-                if v in self.valid_fact_values:
-                    long_rows.append({
-                        self.subject_col: row[self.subject_col],
-                        self.split_col: row[self.split_col] if self.split_col in merged.columns else None,
-                        self.report_path_col: row[self.report_path_col],
-                        "case_context": row["case_context"],
-                        "label_name": lab,
-                        "label_value": v,
-                    })
-
-        facts = pd.DataFrame(long_rows)
+        facts = merged[[self.subject_col, self.report_path_col, "case_context"] + ([self.split_col] if self.split_col in merged.columns else [])].copy()
 
         if self.out_path:
             outp = Path(self.out_path)
@@ -383,7 +320,6 @@ class MimicFactTableBuilder:
             facts.to_csv(outp, index=False)
 
         return facts
-
 
 
 
@@ -402,25 +338,22 @@ class QAItem:
     claim_text: str
     supporting_span: str
 
+
 class MimicQATableBuilder:
     """
     Step 3
-    Build case-conditioned QA from facts_long.
+    Build strict, closed-form, case-grounded QA from case_context.
 
-    Guarantees:
-      1) Sentence splitting is newline-safe: join wrapped lines before splitting.
-      2) Extractive spans must be substrings of case_context after normalization, else skipped.
-      3) No label leakage: label_name/label_value ONLY for:
-         - label_presence
-         - multi_label_conjunction
-         - device_presence (label_name=device, label_value=1)
-         All other qa_types: label_name=None, label_value=None.
-      4) Dedup per-report using robust keys.
-         For device_tip_location we allow multiple rows by including a stable span hash in the key.
+    Kept qa_types:
+      - normality_statement
+      - finding_presence
 
-    Hard fixes:
-      A) device_presence is negation/removal-aware (prevents false Yes).
-      B) compositional_finding excludes negated/normality sentences (prevents "abnormal finding" mismatch).
+    Kept finding concepts only:
+      - pleural effusion
+      - pneumothorax
+      - cardiomegaly
+      - atelectasis
+      - consolidation
     """
 
     def __init__(
@@ -431,30 +364,9 @@ class MimicQATableBuilder:
         subject_col: str = "subject_id",
         report_path_col: str = "report_rel_path",
         case_context_col: str = "case_context",
-        label_name_col: str = "label_name",
-        label_value_col: str = "label_value",
-        max_label_qas_per_report: int = 14,
-        max_conjunction_qas_per_report: int = 3,
-        add_key_findings: bool = True,
         add_normality: bool = True,
-        add_multi_label_conjunction: bool = True,
-        add_device_presence: bool = True,
-        add_device_tip_location: bool = True,
-        add_devices_locations: bool = False,
-        add_temporal_change: bool = True,
-        add_compositional_findings: bool = True,
-        add_limitation_uncertainty: bool = True,
-        max_sentences_key_findings: int = 3,
-        max_sentences_temporal: int = 2,
-        max_sentences_compositional: int = 2,
-        max_sentences_uncertainty: int = 2,
-        max_device_presence_qas_per_report: int = 8,
-        max_device_tip_qas_per_report: int = 6,
+        add_finding_presence: bool = True,
         tqdm_desc: str = "Building QA table (Step 3)",
-        skip_labels: Optional[Set[str]] = None,
-        include_negative_labels: bool = True,
-        # NEW knobs (safe defaults)
-        device_negation_window_chars: int = 45,
     ) -> None:
         self.facts_long_csv = str(facts_long_csv)
         self.out_path = str(out_path)
@@ -463,173 +375,79 @@ class MimicQATableBuilder:
         self.subject_col = subject_col
         self.report_path_col = report_path_col
         self.case_context_col = case_context_col
-        self.label_name_col = label_name_col
-        self.label_value_col = label_value_col
 
-        self.max_label_qas_per_report = max_label_qas_per_report
-        self.max_conjunction_qas_per_report = max_conjunction_qas_per_report
-
-        self.add_key_findings = add_key_findings
-        self.add_normality = add_normality
-        self.add_multi_label_conjunction = add_multi_label_conjunction
-        self.add_device_presence = add_device_presence
-        self.add_device_tip_location = add_device_tip_location
-        self.add_devices_locations = add_devices_locations
-        self.add_temporal_change = add_temporal_change
-        self.add_compositional_findings = add_compositional_findings
-        self.add_limitation_uncertainty = add_limitation_uncertainty
-
-        self.max_sentences_key_findings = max_sentences_key_findings
-        self.max_sentences_temporal = max_sentences_temporal
-        self.max_sentences_compositional = max_sentences_compositional
-        self.max_sentences_uncertainty = max_sentences_uncertainty
-        self.max_device_presence_qas_per_report = max_device_presence_qas_per_report
-        self.max_device_tip_qas_per_report = max_device_tip_qas_per_report
-
+        self.add_normality = bool(add_normality)
+        self.add_finding_presence = bool(add_finding_presence)
         self.tqdm_desc = tqdm_desc
 
-        base_skip = skip_labels or {"no_finding"}
-        self.skip_labels = {self._normalize_label_token(s) for s in base_skip}
-        self.include_negative_labels = include_negative_labels
-
-        self.device_negation_window_chars = int(device_negation_window_chars)
-
-        # Sentence splitting only on punctuation boundaries (no newline splitting).
         self.sent_split_re = re.compile(r"(?<=[\.\?\!])\s+")
 
-        # Drop admin/history/communication sentences
-        self.drop_sentence_re = re.compile(
+        self.admin_re = re.compile(
             r"\b("
-            r"history|indication|clinical (history|indication)|reason for examination|technique|comparison|"
-            r"results were communicated|discussed with|called to|phone|paged|paging|notified|communicated"
+            r"history|indication|clinical (history|indication)|reason for exam|reason for examination|"
+            r"technique|comparison|exam|examination|portable chest|single ap portable view|pa and lateral|"
+            r"results were communicated|discussed with|called to|phone|paged|paging|notified|communicated|"
+            r"assess for|evaluate for|eval for|check for"
             r")\b",
             re.IGNORECASE,
         )
 
-        # Core clinical signal scoring
-        self.clinical_signal_re = re.compile(
-            r"\b(no|without|absent|present|seen|demonstrates?|shows?|consistent|cannot|exclude|likely|possible|"
-            r"opacity|opacities|effusion|pneumothorax|pneumomediastinum|edema|atelectasis|consolidation|"
-            r"airspace|cardiomediastinal|cardiac|cardiomegaly|hilar|mediastinum|nodule|mass|infiltrate|"
-            r"vascular|congestion|volume loss|collapse|pleural)\b",
-            re.IGNORECASE,
-        )
-        self.negation_re = re.compile(r"\b(no|without|absent|neither|never)\b", re.IGNORECASE)
+        self.bad_start_re = re.compile(r"^\s*(/|//|\?|\:)\s*")
+        self.malformed_re = re.compile(r"^[^A-Za-z0-9]{0,3}$")
 
-        self.removal_re = re.compile(
+        self.negation_re = re.compile(
             r"\b("
-            r"removed|removal of|interval removal of|discontinued|extubated|repositioned out of|withdrawn|"
-            r"not seen|no longer seen|not visualized|not present"
+            r"no|without|absent|negative for|free of|neither|"
+            r"no evidence of|no definite|no focal|no sign of|no signs of"
             r")\b",
             re.IGNORECASE,
         )
 
-        # Normality endpoints (report-level)
+        self.uncertainty_re = re.compile(
+            r"\b("
+            r"may|might|possible|possibly|probable|probably|likely|unlikely|"
+            r"suggesting|suggestive of|cannot exclude|cannot be excluded|"
+            r"difficult to exclude|concerning for|suspicious for|question of|"
+            r"could represent|may represent|appears to|appearance of|"
+            r"rule out|r/o|rather than"
+            r")\b",
+            re.IGNORECASE,
+        )
+
+        self.resolution_re = re.compile(
+            r"\b("
+            r"resolved|has resolved|have resolved|essentially resolved|near complete resolution|"
+            r"cleared|has cleared|have cleared|improved|markedly improved|significantly improved|"
+            r"decreased|markedly decreased|significantly decreased|diminished"
+            r")\b",
+            re.IGNORECASE,
+        )
+
+        self.history_re = re.compile(
+            r"\b("
+            r"previous|prior|previously|old|remote|history of"
+            r")\b",
+            re.IGNORECASE,
+        )
+
         self.normality_re = re.compile(
             r"\b("
             r"no acute cardiopulmonary (process|abnormality)|"
             r"no acute intrathoracic process|"
-            r"no acute chest abnormality|"
-            r"lungs are clear|"
-            r"clear lungs|"
-            r"no focal consolidation|"
-            r"no (pleural )?effusion( is seen)?|"
-            r"no pneumothorax( is seen)?"
-            r")\b",
-            re.IGNORECASE,
-        )
-        self.hedge_re = re.compile(
-            r"\b(may|might|cannot exclude|cannot be excluded|limited|poorly assessed)\b",
-            re.IGNORECASE,
-        )
-
-        # Devices
-        self.device_sentence_re = re.compile(
-            r"\b("
-            r"picc|peripherally inserted central catheter|central venous catheter|cvc|"
-            r"endotracheal tube|ett|nasogastric|ng tube|enteric|dobhoff|feeding tube|"
-            r"chest tube|pigtail|pleural catheter|"
-            r"swan[-\s]?ganz|pa catheter|introducer sheath|"
-            r"subclavian catheter|internal jugular|ij\b|"
-            r"line tip|catheter tip|tip\b|terminates|terminating|"
-            r"svc|s\.v\.c\.|cavoatrial junction|right atrium|carina"
+            r"no acute chest abnormality"
             r")\b",
             re.IGNORECASE,
         )
 
-        self.device_presence_vocab: List[Tuple[str, re.Pattern]] = [
-            ("picc", re.compile(r"\bpicc\b|\bperipherally inserted central catheter\b", re.IGNORECASE)),
-            ("central venous catheter", re.compile(r"\bcentral venous catheter\b|\bcvc\b", re.IGNORECASE)),
-            ("endotracheal tube", re.compile(r"\bendotracheal tube\b|\bett\b", re.IGNORECASE)),
-            ("nasogastric tube", re.compile(r"\bnasogastric\b|\bng tube\b", re.IGNORECASE)),
-            ("enteric tube", re.compile(r"\benteric catheter\b|\bdobhoff\b|\bfeeding tube\b", re.IGNORECASE)),
-            ("chest tube", re.compile(r"\bchest tube\b", re.IGNORECASE)),
-            ("pigtail catheter", re.compile(r"\bpigtail\b", re.IGNORECASE)),
-            ("pleural catheter", re.compile(r"\bpleural catheter\b", re.IGNORECASE)),
-            ("swan-ganz catheter", re.compile(r"\bswan[-\s]?ganz\b|\bpa catheter\b", re.IGNORECASE)),
-            ("subclavian catheter", re.compile(r"\bsubclavian\b.*\bcatheter\b", re.IGNORECASE)),
-            ("internal jugular catheter", re.compile(r"\binternal jugular\b|\bij\b.*\bcatheter\b", re.IGNORECASE)),
+        self.finding_patterns: List[Tuple[str, re.Pattern]] = [
+            ("pleural effusion", re.compile(r"\bpleural effusions?\b|\beffusions?\b", re.IGNORECASE)),
+            ("pneumothorax", re.compile(r"\bpneumothorax\b|\bpneumothoraces\b", re.IGNORECASE)),
+            ("cardiomegaly", re.compile(r"\bcardiomegaly\b|\benlarged cardiac silhouette\b|\bcardiac silhouette is enlarged\b|\benlarged heart\b", re.IGNORECASE)),
+            ("atelectasis", re.compile(r"\batelecta(?:sis|tic)\b", re.IGNORECASE)),
+            ("consolidation", re.compile(r"\bconsolidation\b", re.IGNORECASE)),
         ]
 
-        self.tip_loc_re = re.compile(
-            r"\b("
-            r"tip is at|tip (lies|projects|terminates|terminating) (in|at)|"
-            r"terminates (in|at)|terminating (in|at)|at the level of|"
-            r"cavoatrial junction|mid (to[-\s]?lower )?portion of the svc|mid svc|"
-            r"right brachiocephalic vein|junction with svc|right atrium|carina|cavoatrial"
-            r")\b",
-            re.IGNORECASE,
-        )
-
-        # Temporal change
-        self.temporal_re = re.compile(
-            r"\b("
-            r"interval|compared to|as compared to|since prior|prior study|previous study|"
-            r"improved|worsened|increased|decreased|unchanged|stable|new|resolved|persistent|"
-            r"removal|removed|placement|placed|re[-\s]?accumulation|progression"
-            r")\b",
-            re.IGNORECASE,
-        )
-
-        # Compositional findings
-        self.pathology_token_re = re.compile(
-            r"\b("
-            r"effusion|pneumothorax|edema|atelectasis|consolidation|opacity|opacities|airspace|"
-            r"nodule|mass|infiltrate|vascular congestion|volume loss|collapse|pneumomediastinum"
-            r")\b",
-            re.IGNORECASE,
-        )
-        self.modifier_token_re = re.compile(
-            r"\b("
-            r"small|mild|moderate|large|trace|tiny|minimal|"
-            r"right|left|bilateral|diffuse|focal|perihilar|retrocardiac|lower lobe|upper lobe|mid lung|"
-            r"layering|with|consistent with|likely|may represent|cannot exclude"
-            r")\b",
-            re.IGNORECASE,
-        )
-
-        # Limitation / uncertainty
-        self.uncertainty_re = re.compile(
-            r"\b("
-            r"within the limitations of|limitation(s)?|limited evaluation|poorly assessed|"
-            r"cannot exclude|cannot be excluded|may represent|might reflect|possible|likely|"
-            r"cannot be evaluated|not well seen|underlying .* cannot be excluded"
-            r")\b",
-            re.IGNORECASE,
-        )
-
-    # normalization utilities
-
-    def _normalize_label_token(self, s: str) -> str:
-        s = str(s).strip().lower().replace("_", " ")
-        s = re.sub(r"\s+", " ", s)
-        return s
-
     def _normalize_text(self, t: str) -> str:
-        """
-        Used for substring checks and stable sentence ops.
-        Join wrapped lines before sentence splitting.
-        """
         if t is None or (isinstance(t, float) and pd.isna(t)):
             return ""
         x = str(t)
@@ -638,212 +456,127 @@ class MimicQATableBuilder:
         x = re.sub(r"\s+", " ", x)
         return x.strip()
 
-    def _is_extractive(self, span: str, case_context: str) -> bool:
-        span_n = self._normalize_text(span)
-        ctx_n = self._normalize_text(case_context)
-        if not span_n or not ctx_n:
-            return False
-        return span_n in ctx_n
-
     def _stable_hash(self, s: str) -> str:
         return hashlib.md5(self._normalize_text(s).encode("utf-8", errors="ignore")).hexdigest()[:10]
-
-
-    # label QA utilities
-
-    def _label_value_to_answer(self, v: int) -> str:
-        if v == 1:
-            return "Yes."
-        if v == 0:
-            return "No."
-        if v == 3:
-            return "Uncertain."
-        raise ValueError(f"Unexpected label_value: {v}")
-
-    def _label_value_to_claim(self, label_phrase: str, v: int) -> str:
-        if v == 1:
-            return f"{label_phrase} is present"
-        if v == 0:
-            return f"{label_phrase} is absent"
-        if v == 3:
-            return f"{label_phrase} is uncertain"
-        raise ValueError(f"Unexpected label_value: {v}")
-
-    def _safe_int_label_value(self, x) -> Optional[int]:
-        try:
-            if pd.isna(x):
-                return None
-            return int(float(x))
-        except Exception:
-            return None
-
-    def _aggregate_label_values(self, values: List[int]) -> Optional[int]:
-        if not values:
-            return None
-        s = set(values)
-        if 1 in s:
-            return 1
-        if 3 in s:
-            return 3
-        if 0 in s:
-            return 0
-        return None
-
-
-    # sentence utilities
 
     def _split_sentences(self, text: str) -> List[str]:
         t = self._normalize_text(text)
         if not t:
             return []
+
         parts = [p.strip() for p in self.sent_split_re.split(t) if p and p.strip()]
-        parts = [p for p in parts if len(p) >= 10]
-        parts = [p for p in parts if not self.drop_sentence_re.search(p)]
-        return parts
+        clean: List[str] = []
 
-    def _score_sentence_for_findings(self, sent: str) -> int:
-        score = 0
-        if self.clinical_signal_re.search(sent):
-            score += 2
-        if self.negation_re.search(sent):
-            score += 1
-        if len(sent) >= 80:
-            score += 1
-        return score
+        for p in parts:
+            if len(p) < 8:
+                continue
+            if self.bad_start_re.search(p):
+                continue
+            if self.malformed_re.search(p):
+                continue
+            if self.admin_re.search(p):
+                continue
+            clean.append(p)
 
-    def _extract_key_findings(self, case_context: str) -> str:
-        sents = self._split_sentences(case_context)
-        scored = [(self._score_sentence_for_findings(s), s) for s in sents]
-        scored = [x for x in scored if x[0] > 0]
-        if not scored:
-            return ""
-        scored.sort(key=lambda x: (-x[0], -len(x[1])))
-        top = [s for _, s in scored[: self.max_sentences_key_findings]]
-        span = " ".join(top).strip()
-        return span if self._is_extractive(span, case_context) else ""
+        return clean
 
-    def _extract_temporal_change(self, case_context: str) -> str:
-        sents = self._split_sentences(case_context)
-        tmp = [s for s in sents if self.temporal_re.search(s)]
-        if not tmp:
-            return ""
-        span = " ".join(tmp[: self.max_sentences_temporal]).strip()
-        return span if self._is_extractive(span, case_context) else ""
+    def _canonical_answer(self, state: str) -> str:
+        if state == "present":
+            return "Yes."
+        if state == "absent":
+            return "No."
+        if state == "uncertain":
+            return "Uncertain."
+        raise ValueError(state)
 
-    def _extract_uncertainty_spans(self, case_context: str) -> str:
-        sents = self._split_sentences(case_context)
-        hits = [s for s in sents if self.uncertainty_re.search(s)]
-        if not hits:
-            return ""
-        span = " ".join(hits[: self.max_sentences_uncertainty]).strip()
-        return span if self._is_extractive(span, case_context) else ""
+    def _canonical_claim(self, concept: str, state: str) -> str:
+        if state == "present":
+            return f"{concept} is present"
+        if state == "absent":
+            return f"{concept} is absent"
+        if state == "uncertain":
+            return f"{concept} is uncertain"
+        raise ValueError(state)
 
-    def _is_sentence_negated_global(self, sent: str) -> bool:
-        # For things like "no pneumothorax", "without effusion" etc.
-        return bool(self.negation_re.search(sent))
+    def _question_for_finding(self, concept: str) -> str:
+        return f"Is there {concept}?"
 
-    def _is_sentence_normality(self, sent: str) -> bool:
-        return bool(self.normality_re.search(sent))
+    def _is_sentence_usable_for_concept(self, sent: str, concept: str) -> bool:
+        s = sent.lower()
 
-    def _extract_compositional_spans(self, case_context: str) -> str:
-        """
-        Only return *abnormal* descriptive sentences:
-          - must contain pathology + modifier tokens
-          - must NOT be a global negation sentence ("no effusion")
-          - must NOT be a normality boilerplate sentence ("lungs are clear")
-        """
-        sents = self._split_sentences(case_context)
-        hits: List[str] = []
+        if "eval for" in s or "evaluate for" in s or "assess for" in s or "check for" in s:
+            return False
+
+        if self.admin_re.search(sent):
+            return False
+
+        if self.history_re.search(sent):
+            if not any(tok in s for tok in ["unchanged", "stable", "persistent", "remains", "still"]):
+                return False
+
+        if concept == "consolidation" and "no focal consolidation" in s:
+            return True
+
+        return True
+
+    def _classify_concept_in_sentence(self, sent: str, pat: re.Pattern) -> Optional[str]:
+        m = pat.search(sent)
+        if not m:
+            return None
+
+        lo = max(0, m.start() - 80)
+        hi = min(len(sent), m.end() + 80)
+        window = sent[lo:hi]
+
+        has_neg = bool(self.negation_re.search(window))
+        has_unc = bool(self.uncertainty_re.search(window))
+        has_res = bool(self.resolution_re.search(window))
+
+        if has_neg:
+            return "absent"
+
+        if has_unc and has_res:
+            return "uncertain"
+
+        if has_unc:
+            return "uncertain"
+
+        if has_res:
+            return "absent"
+
+        return "present"
+
+    def _aggregate_states(self, states: List[str]) -> Optional[str]:
+        if not states:
+            return None
+        s = set(states)
+        if "present" in s:
+            return "present"
+        if "uncertain" in s:
+            return "uncertain"
+        if "absent" in s:
+            return "absent"
+        return None
+
+    def _supporting_span_for_state(self, sents: List[str], pat: re.Pattern, state: str) -> str:
         for s in sents:
-            if not (self.pathology_token_re.search(s) and self.modifier_token_re.search(s)):
+            if self._classify_concept_in_sentence(s, pat) == state:
+                return s
+        return ""
+
+    def _detect_normality(self, sents: List[str]) -> Tuple[Optional[str], str]:
+        for s in sents:
+            if not self.normality_re.search(s):
                 continue
-            if self._is_sentence_normality(s):
-                continue
-            if self._is_sentence_negated_global(s):
-                continue
-            hits.append(s)
-
-        if not hits:
-            return ""
-
-        span = " ".join(hits[: self.max_sentences_compositional]).strip()
-        return span if self._is_extractive(span, case_context) else ""
-
-    def _extract_device_sentences(self, case_context: str) -> List[str]:
-        sents = self._split_sentences(case_context)
-        return [s for s in sents if self.device_sentence_re.search(s)]
-
-    def _extract_tip_location_spans(self, device_sents: List[str], case_context: str) -> List[str]:
-        out: List[str] = []
-        for s in device_sents:
-            if not self.tip_loc_re.search(s):
-                continue
-            if self._is_extractive(s, case_context):
-                out.append(s)
-        return out
-
-    def _find_normality_spans(self, case_context: str) -> str:
-        sents = self._split_sentences(case_context)
-        hits = [s for s in sents if self.normality_re.search(s)]
-        if not hits:
-            return ""
-        span = " ".join(hits[:2]).strip()
-        return span if self._is_extractive(span, case_context) else ""
-
-
-    # device presence (negation-aware)
-
-    def _is_negated_mention(self, sent: str, match_start: int, match_end: int) -> bool:
-        """
-        Conservative window-based check around a device mention.
-        Reject if negation/removal cues occur near the mention.
-        """
-        s = sent
-        w = self.device_negation_window_chars
-        lo = max(0, match_start - w)
-        hi = min(len(s), match_end + w)
-        window = s[lo:hi]
-        if self.removal_re.search(window):
-            return True
-        if self.negation_re.search(window):
-            return True
-        return False
-
-    def _detect_present_devices(self, device_sents: List[str]) -> List[str]:
-        """
-        Mark device present if there exists at least one sentence where:
-          - the device pattern matches
-          - the match is NOT negated/removed in a local window
-        """
-        present: List[str] = []
-        for name, pat in self.device_presence_vocab:
-            ok = False
-            for s in device_sents:
-                m = pat.search(s)
-                if not m:
-                    continue
-                if self._is_negated_mention(s, m.start(), m.end()):
-                    continue
-                ok = True
-                break
-            if ok:
-                present.append(name)
-        return present
-
-
-    # main build
+            if self.uncertainty_re.search(s):
+                return "uncertain", s
+            return "absent", s
+        return None, ""
 
     def build_qa_table(self) -> pd.DataFrame:
         facts = pd.read_csv(self.facts_long_csv)
-        # facts = facts.head(10_000)
 
-        required = {
-            self.subject_col,
-            self.report_path_col,
-            self.case_context_col,
-            self.label_name_col,
-            self.label_value_col,
-        }
+        required = {self.subject_col, self.report_path_col, self.case_context_col}
         missing = required - set(facts.columns)
         if missing:
             raise ValueError(f"facts_long is missing columns: {missing}")
@@ -851,109 +584,38 @@ class MimicQATableBuilder:
         if self.split_col not in facts.columns:
             facts[self.split_col] = None
 
-        # Harden types
         facts[self.report_path_col] = facts[self.report_path_col].astype(str).str.strip()
-
         facts[self.subject_col] = pd.to_numeric(facts[self.subject_col], errors="coerce")
-        facts = facts[~facts[self.subject_col].isna()]
+        facts = facts[~facts[self.subject_col].isna()].copy()
         facts[self.subject_col] = facts[self.subject_col].astype(int)
 
-        groups = facts.groupby(self.report_path_col, sort=False)
+        facts = (
+            facts[[self.subject_col, self.report_path_col, self.case_context_col, self.split_col]]
+            .drop_duplicates(subset=[self.report_path_col])
+            .reset_index(drop=True)
+        )
 
         out_rows: List[Dict[str, object]] = []
 
-        for report_rel_path, g in tqdm(groups, desc=self.tqdm_desc, total=groups.ngroups):
-            report_rel_path = str(report_rel_path).strip()
+        for _, row in tqdm(facts.iterrows(), desc=self.tqdm_desc, total=len(facts)):
+            report_rel_path = str(row[self.report_path_col]).strip()
+            subject_id = int(row[self.subject_col])
+            split = row[self.split_col] if self.split_col in facts.columns else None
+            case_context = self._normalize_text(row[self.case_context_col])
+
+            if not case_context or case_context.lower() == "nan":
+                continue
+
+            sents = self._split_sentences(case_context)
+            if not sents:
+                continue
+
             seen_keys: Set[Tuple[str, str, str]] = set()
 
-            g0 = g.iloc[0]
-            subject_id = int(g0[self.subject_col])
-            split = g0[self.split_col] if self.split_col in g.columns else None
-
-            case_context_raw = g0[self.case_context_col]
-            case_context = self._normalize_text(case_context_raw)
-            if case_context.lower() == "nan":
-                case_context = ""
-
-            # 1) label_presence (robust aggregation)
-            label_qas_added = 0
-            agg_map: Dict[str, Dict[str, object]] = {}
-
-            gg = g[[self.label_name_col, self.label_value_col]].copy()
-            gg = gg[~gg[self.label_name_col].isna()]
-            gg[self.label_name_col] = gg[self.label_name_col].astype(str).str.strip()
-            gg = gg[gg[self.label_name_col] != ""]
-
-            if not gg.empty:
-                gg["__lab_norm"] = gg[self.label_name_col].map(self._normalize_label_token)
-                gg["__v"] = gg[self.label_value_col].map(self._safe_int_label_value)
-                gg = gg[~gg["__v"].isna()]
-                gg["__v"] = gg["__v"].astype(int)
-                gg = gg[gg["__v"].isin([0, 1, 3])]
-
-                for _, r in gg.iterrows():
-                    lab_raw = str(r[self.label_name_col]).strip()
-                    lab_norm = str(r["__lab_norm"]).strip()
-                    v = int(r["__v"])
-
-                    if not lab_norm:
-                        continue
-                    if lab_norm in self.skip_labels:
-                        continue
-                    if (v == 0) and (not self.include_negative_labels):
-                        continue
-
-                    if lab_norm not in agg_map:
-                        agg_map[lab_norm] = {"lab_raw": lab_raw, "values": [v]}
-                    else:
-                        agg_map[lab_norm]["values"].append(v)
-
-                for lab_norm in sorted(agg_map.keys()):
-                    v_agg = self._aggregate_label_values([int(x) for x in agg_map[lab_norm]["values"]])
-                    if v_agg is None:
-                        continue
-
-                    question = f"Is there {lab_norm}?"
-                    answer_target = self._label_value_to_answer(int(v_agg))
-                    claim_text = self._label_value_to_claim(lab_norm, int(v_agg))
-
-                    key = (report_rel_path, "label_presence", question)
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-
-                    out_rows.append(
-                        {
-                            self.subject_col: subject_id,
-                            self.split_col: split,
-                            self.report_path_col: report_rel_path,
-                            "qa_type": "label_presence",
-                            self.case_context_col: case_context,
-                            "question": question,
-                            "answer_target": answer_target,
-                            "claim_text": claim_text,
-                            "supporting_span": "",
-                            "label_name": str(agg_map[lab_norm]["lab_raw"]),
-                            "label_value": int(v_agg),
-                        }
-                    )
-
-                    label_qas_added += 1
-                    if self.max_label_qas_per_report > 0 and label_qas_added >= self.max_label_qas_per_report:
-                        break
-
-            # 2) normality_statement (extractive)
-            if self.add_normality and case_context:
-                norm_span = self._find_normality_spans(case_context)
-                if norm_span:
+            if self.add_normality:
+                state, span = self._detect_normality(sents)
+                if state is not None and span:
                     question = "Is the study described as showing an acute cardiopulmonary abnormality?"
-                    if re.search(r"\bno acute\b", norm_span, re.IGNORECASE) and not self.hedge_re.search(norm_span):
-                        answer_target = "No."
-                        claim_text = "no acute cardiopulmonary abnormality"
-                    else:
-                        answer_target = norm_span
-                        claim_text = norm_span
-
                     key = (report_rel_path, "normality_statement", question)
                     if key not in seen_keys:
                         seen_keys.add(key)
@@ -965,294 +627,55 @@ class MimicQATableBuilder:
                                 "qa_type": "normality_statement",
                                 self.case_context_col: case_context,
                                 "question": question,
-                                "answer_target": answer_target,
-                                "claim_text": claim_text,
-                                "supporting_span": norm_span,
-                                "label_name": None,
-                                "label_value": None,
+                                "answer_target": self._canonical_answer(state),
+                                "claim_text": self._canonical_claim("acute cardiopulmonary abnormality", state),
+                                "supporting_span": span,
                             }
                         )
 
-            # 3) multi_label_conjunction (from aggregated labels)
-            if self.add_multi_label_conjunction and agg_map:
-                lab_to_v: Dict[str, int] = {}
-                for lab_norm, payload in agg_map.items():
-                    v_agg = self._aggregate_label_values([int(x) for x in payload["values"]])
-                    if v_agg is None:
+            if self.add_finding_presence:
+                for concept, pat in self.finding_patterns:
+                    states: List[str] = []
+                    usable_sents: List[str] = []
+
+                    for s in sents:
+                        if not self._is_sentence_usable_for_concept(s, concept):
+                            continue
+                        st = self._classify_concept_in_sentence(s, pat)
+                        if st is not None:
+                            states.append(st)
+                            usable_sents.append(s)
+
+                    state = self._aggregate_states(states)
+                    if state is None:
                         continue
-                    lab_to_v[lab_norm] = int(v_agg)
 
-                neg = sorted([l for l, v in lab_to_v.items() if v == 0])
-                pos = sorted([l for l, v in lab_to_v.items() if v == 1])
+                    span = self._supporting_span_for_state(usable_sents, pat, state)
+                    if not span:
+                        continue
 
-                conj_added = 0
+                    question = self._question_for_finding(concept)
+                    key = (report_rel_path, "finding_presence", question)
+                    if key in seen_keys:
+                        continue
+                    seen_keys.add(key)
 
-                for i in range(len(neg)):
-                    for j in range(i + 1, len(neg)):
-                        a, b = neg[i], neg[j]
-                        question = f"Are {a} and {b} present?"
-                        answer_target = "No, neither is present."
-                        claim_text = f"{a} is absent; {b} is absent"
-
-                        key = (report_rel_path, "multi_label_conjunction", f"{question}|{a}|{b}")
-                        if key in seen_keys:
-                            continue
-                        seen_keys.add(key)
-
-                        out_rows.append(
-                            {
-                                self.subject_col: subject_id,
-                                self.split_col: split,
-                                self.report_path_col: report_rel_path,
-                                "qa_type": "multi_label_conjunction",
-                                self.case_context_col: case_context,
-                                "question": question,
-                                "answer_target": answer_target,
-                                "claim_text": claim_text,
-                                "supporting_span": "",
-                                "label_name": f"{a}|{b}",
-                                "label_value": 0,
-                            }
-                        )
-                        conj_added += 1
-                        if conj_added >= self.max_conjunction_qas_per_report:
-                            break
-                    if conj_added >= self.max_conjunction_qas_per_report:
-                        break
-
-                if conj_added < self.max_conjunction_qas_per_report:
-                    for i in range(len(pos)):
-                        for j in range(i + 1, len(pos)):
-                            a, b = pos[i], pos[j]
-                            question = f"Are {a} and {b} present?"
-                            answer_target = "Yes, both are present."
-                            claim_text = f"{a} is present; {b} is present"
-
-                            key = (report_rel_path, "multi_label_conjunction", f"{question}|{a}|{b}")
-                            if key in seen_keys:
-                                continue
-                            seen_keys.add(key)
-
-                            out_rows.append(
-                                {
-                                    self.subject_col: subject_id,
-                                    self.split_col: split,
-                                    self.report_path_col: report_rel_path,
-                                    "qa_type": "multi_label_conjunction",
-                                    self.case_context_col: case_context,
-                                    "question": question,
-                                    "answer_target": answer_target,
-                                    "claim_text": claim_text,
-                                    "supporting_span": "",
-                                    "label_name": f"{a}|{b}",
-                                    "label_value": 1,
-                                }
-                            )
-                            conj_added += 1
-                            if conj_added >= self.max_conjunction_qas_per_report:
-                                break
-                        if conj_added >= self.max_conjunction_qas_per_report:
-                            break
-
-            # 4) key_findings (extractive)
-            if self.add_key_findings and case_context:
-                findings_span = self._extract_key_findings(case_context)
-                if findings_span:
-                    question = "What are the key imaging findings?"
-                    key = (report_rel_path, "key_findings", question)
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        out_rows.append(
-                            {
-                                self.subject_col: subject_id,
-                                self.split_col: split,
-                                self.report_path_col: report_rel_path,
-                                "qa_type": "key_findings",
-                                self.case_context_col: case_context,
-                                "question": question,
-                                "answer_target": findings_span,
-                                "claim_text": findings_span,
-                                "supporting_span": findings_span,
-                                "label_name": None,
-                                "label_value": None,
-                            }
-                        )
-
-            # 5) devices
-            if (self.add_device_presence or self.add_device_tip_location or self.add_devices_locations) and case_context:
-                dev_sents = self._extract_device_sentences(case_context)
-
-                # legacy devices_locations
-                if self.add_devices_locations and dev_sents:
-                    dev_span = " ".join(dev_sents[:2]).strip()
-                    if dev_span and self._is_extractive(dev_span, case_context):
-                        question = "What devices are present and where are they located?"
-                        key = (report_rel_path, "devices_locations", question)
-                        if key not in seen_keys:
-                            seen_keys.add(key)
-                            out_rows.append(
-                                {
-                                    self.subject_col: subject_id,
-                                    self.split_col: split,
-                                    self.report_path_col: report_rel_path,
-                                    "qa_type": "devices_locations",
-                                    self.case_context_col: case_context,
-                                    "question": question,
-                                    "answer_target": dev_span,
-                                    "claim_text": dev_span,
-                                    "supporting_span": dev_span,
-                                    "label_name": None,
-                                    "label_value": None,
-                                }
-                            )
-
-                # device_presence (negation-aware)
-                if self.add_device_presence and dev_sents:
-                    present_devices = self._detect_present_devices(dev_sents)
-                    dev_added = 0
-                    for dev_name in present_devices:
-                        question = f"Is a {dev_name} present?"
-                        key = (report_rel_path, "device_presence", question)
-                        if key in seen_keys:
-                            continue
-                        seen_keys.add(key)
-
-                        out_rows.append(
-                            {
-                                self.subject_col: subject_id,
-                                self.split_col: split,
-                                self.report_path_col: report_rel_path,
-                                "qa_type": "device_presence",
-                                self.case_context_col: case_context,
-                                "question": question,
-                                "answer_target": "Yes.",
-                                "claim_text": f"{dev_name} is present",
-                                "supporting_span": "",
-                                "label_name": dev_name,
-                                "label_value": 1,
-                            }
-                        )
-                        dev_added += 1
-                        if dev_added >= self.max_device_presence_qas_per_report:
-                            break
-
-                # device_tip_location (allow multiple, dedup by span hash)
-                if self.add_device_tip_location and dev_sents:
-                    tip_sents = self._extract_tip_location_spans(dev_sents, case_context)
-                    tip_added = 0
-                    for s in tip_sents:
-                        dev_label = None
-                        for name, pat in self.device_presence_vocab:
-                            if pat.search(s):
-                                dev_label = name
-                                break
-
-                        question = (
-                            f"Where does the {dev_label} terminate?"
-                            if dev_label
-                            else "Where does the line or tube terminate?"
-                        )
-
-                        span_hash = self._stable_hash(s)
-                        key = (report_rel_path, "device_tip_location", f"{question}|{span_hash}")
-                        if key in seen_keys:
-                            continue
-                        seen_keys.add(key)
-
-                        out_rows.append(
-                            {
-                                self.subject_col: subject_id,
-                                self.split_col: split,
-                                self.report_path_col: report_rel_path,
-                                "qa_type": "device_tip_location",
-                                self.case_context_col: case_context,
-                                "question": question,
-                                "answer_target": s,
-                                "claim_text": s,
-                                "supporting_span": s,
-                                "label_name": None,
-                                "label_value": None,
-                            }
-                        )
-                        tip_added += 1
-                        if tip_added >= self.max_device_tip_qas_per_report:
-                            break
-
-            # 6) temporal_change (extractive)
-            if self.add_temporal_change and case_context:
-                tmp_span = self._extract_temporal_change(case_context)
-                if tmp_span:
-                    question = "What interval changes are described?"
-                    key = (report_rel_path, "temporal_change", question)
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        out_rows.append(
-                            {
-                                self.subject_col: subject_id,
-                                self.split_col: split,
-                                self.report_path_col: report_rel_path,
-                                "qa_type": "temporal_change",
-                                self.case_context_col: case_context,
-                                "question": question,
-                                "answer_target": tmp_span,
-                                "claim_text": tmp_span,
-                                "supporting_span": tmp_span,
-                                "label_name": None,
-                                "label_value": None,
-                            }
-                        )
-
-            # 7) compositional_finding (extractive)
-            if self.add_compositional_findings and case_context:
-                comp_span = self._extract_compositional_spans(case_context)
-                if comp_span:
-                    question = "Describe the abnormal finding."
-                    key = (report_rel_path, "compositional_finding", f"{question}|{self._stable_hash(comp_span)}")
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        out_rows.append(
-                            {
-                                self.subject_col: subject_id,
-                                self.split_col: split,
-                                self.report_path_col: report_rel_path,
-                                "qa_type": "compositional_finding",
-                                self.case_context_col: case_context,
-                                "question": question,
-                                "answer_target": comp_span,
-                                "claim_text": comp_span,
-                                "supporting_span": comp_span,
-                                "label_name": None,
-                                "label_value": None,
-                            }
-                        )
-
-            # 8) limitation_uncertainty (extractive)
-            if self.add_limitation_uncertainty and case_context:
-                u_span = self._extract_uncertainty_spans(case_context)
-                if u_span:
-                    question = "What limitation or uncertainty is described?"
-                    key = (report_rel_path, "limitation_uncertainty", f"{question}|{self._stable_hash(u_span)}")
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        out_rows.append(
-                            {
-                                self.subject_col: subject_id,
-                                self.split_col: split,
-                                self.report_path_col: report_rel_path,
-                                "qa_type": "limitation_uncertainty",
-                                self.case_context_col: case_context,
-                                "question": question,
-                                "answer_target": u_span,
-                                "claim_text": u_span,
-                                "supporting_span": u_span,
-                                "label_name": None,
-                                "label_value": None,
-                            }
-                        )
+                    out_rows.append(
+                        {
+                            self.subject_col: subject_id,
+                            self.split_col: split,
+                            self.report_path_col: report_rel_path,
+                            "qa_type": "finding_presence",
+                            self.case_context_col: case_context,
+                            "question": question,
+                            "answer_target": self._canonical_answer(state),
+                            "claim_text": self._canonical_claim(concept, state),
+                            "supporting_span": span,
+                        }
+                    )
 
         qa = pd.DataFrame(out_rows)
 
-        # final safety
         if self.report_path_col in qa.columns:
             qa[self.report_path_col] = qa[self.report_path_col].astype(str).str.strip()
 
@@ -1501,30 +924,32 @@ class RadiopaediaSnapshotBuilder:
 
 
 
-
-
 @dataclass(frozen=True)
 class WeakAlignmentRow:
     qa_row_id: int
     report_rel_path: str
     qa_type: str
+    question: str
     claim_text: str
+    supporting_span: str
+    retrieval_query: str
     retrieved_chunk_ids_json: str
     support_weights_json: str
     embed_scores_json: str
     lexical_scores_json: str
     combined_scores_json: str
 
+
 class RadiopaediaWeakEvidenceAligner:
     """
-    Step 4B: Weak claim–evidence alignment (no humans)
+    Step 4B: Weak claim–evidence alignment
 
     Input:
-      - qa_csv: Step 3 output (mimic_qa_step3.csv)
-      - chunks_parquet: Step 4A output (chunks.parquet)
+      - qa_csv: Step 3 output
+      - chunks_parquet: Step 4A output
 
     Output:
-      - out_parquet: per-QA row: top-k retrieved chunk_ids + soft weights (JSON arrays)
+      - out_parquet: per-QA row with top-k retrieved chunk_ids + soft weights
     """
 
     def __init__(
@@ -1532,34 +957,30 @@ class RadiopaediaWeakEvidenceAligner:
         qa_csv: str | Path,
         chunks_parquet: str | Path,
         out_parquet: str | Path,
-        # HF embedder (fixed bootstrap)
         model_name: str = "sentence-transformers/all-mpnet-base-v2",
-        max_query_tokens: int = 128,
+        max_query_tokens: int = 256,
         max_doc_tokens: int = 256,
-        # retrieval
         top_k: int = 20,
         qa_batch_size: int = 256,
         doc_batch_size: int = 128,
-        # scoring
         alpha: float = 0.85,
         temperature: float = 0.07,
-        # caching
         cache_dir: Optional[str | Path] = None,
         faiss_index_name: str = "radiopaedia_flatip.index",
         chunk_embeds_name: str = "radiopaedia_chunk_embeds.npy",
-        # columns
+        qa_row_id_col: str = "qa_row_id",
+        question_col: str = "question",
         claim_col: str = "claim_text",
+        supporting_span_col: str = "supporting_span",
         report_path_col: str = "report_rel_path",
         qa_type_col: str = "qa_type",
         chunk_id_col: str = "chunk_id",
         chunk_text_col: str = "chunk_text",
-        # determinism
         seed: int = 13,
         device: str = "cuda",
         force_cpu_faiss: bool = True,
         tqdm_desc: str = "Step 4B: weak claim–evidence alignment",
         qa_chunksize_rows: int = 50_000,
-        # writer
         parquet_compression: str = "zstd",
     ) -> None:
         self.qa_csv = Path(qa_csv)
@@ -1583,7 +1004,10 @@ class RadiopaediaWeakEvidenceAligner:
         self.faiss_index_path = self.cache_dir / faiss_index_name
         self.chunk_embeds_path = self.cache_dir / chunk_embeds_name
 
+        self.qa_row_id_col = str(qa_row_id_col)
+        self.question_col = str(question_col)
         self.claim_col = str(claim_col)
+        self.supporting_span_col = str(supporting_span_col)
         self.report_path_col = str(report_path_col)
         self.qa_type_col = str(qa_type_col)
 
@@ -1600,13 +1024,9 @@ class RadiopaediaWeakEvidenceAligner:
         self._word_re = re.compile(r"[a-z0-9]+")
         self._tokenizer: Optional[AutoTokenizer] = None
         self._model: Optional[AutoModel] = None
-
-        # will be set in _init_writer()
         self._pa_schema: Optional[pa.Schema] = None
 
         self._set_determinism()
-
-    # determinism
 
     def _set_determinism(self) -> None:
         random.seed(self.seed)
@@ -1617,7 +1037,6 @@ class RadiopaediaWeakEvidenceAligner:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
-        # Disable TF32 (important for reproducibility on Ampere+)
         try:
             torch.backends.cuda.matmul.allow_tf32 = False
             torch.backends.cudnn.allow_tf32 = False
@@ -1630,11 +1049,14 @@ class RadiopaediaWeakEvidenceAligner:
             except Exception:
                 pass
 
-
-    def _normalize_text(self, s: str) -> str:
+    def _safe_str(self, s) -> str:
         if s is None:
             return ""
-        x = str(s).lower()
+        x = str(s)
+        return "" if x.lower() == "nan" else x
+
+    def _normalize_text(self, s: str) -> str:
+        x = self._safe_str(s).lower()
         x = re.sub(r"\s+", " ", x).strip()
         return x
 
@@ -1654,6 +1076,20 @@ class RadiopaediaWeakEvidenceAligner:
             return 0.0
         return float(len(qset.intersection(dset))) / float(len(qset))
 
+    def _build_retrieval_query(self, question: str, claim_text: str, supporting_span: str) -> str:
+        parts: List[str] = []
+        q = self._safe_str(question).strip()
+        c = self._safe_str(claim_text).strip()
+        s = self._safe_str(supporting_span).strip()
+
+        if q:
+            parts.extend(["QUESTION:", q])
+        if c:
+            parts.extend(["CLAIM:", c])
+        if s:
+            parts.extend(["REPORT_EVIDENCE_HINT:", s])
+
+        return "\n\n".join(parts).strip()
 
     def _get_tokenizer_and_model(self) -> Tuple[AutoTokenizer, AutoModel]:
         if self._tokenizer is not None and self._model is not None:
@@ -1673,7 +1109,7 @@ class RadiopaediaWeakEvidenceAligner:
         return tok, model
 
     def _mean_pool(self, last_hidden: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        mask = attention_mask.unsqueeze(-1).type_as(last_hidden)  # (B,T,1)
+        mask = attention_mask.unsqueeze(-1).type_as(last_hidden)
         summed = (last_hidden * mask).sum(dim=1)
         denom = mask.sum(dim=1).clamp(min=1e-6)
         return summed / denom
@@ -1691,7 +1127,7 @@ class RadiopaediaWeakEvidenceAligner:
         n = len(texts)
 
         for i in range(0, n, batch_size):
-            batch = texts[i : i + batch_size]
+            batch = texts[i:i + batch_size]
             batch = [self._normalize_text(x) for x in batch]
 
             enc = tok(
@@ -1712,8 +1148,10 @@ class RadiopaediaWeakEvidenceAligner:
             if pbar is not None:
                 pbar.update(len(batch))
 
-        return np.vstack(embs) if embs else np.zeros((0, 768), dtype=np.float32)
-
+        if embs:
+            return np.vstack(embs)
+        hidden = getattr(model.config, "hidden_size", 768)
+        return np.zeros((0, hidden), dtype=np.float32)
 
     def _load_chunks_table(self) -> pd.DataFrame:
         cols = [self.chunk_id_col, self.chunk_text_col]
@@ -1722,8 +1160,6 @@ class RadiopaediaWeakEvidenceAligner:
         df = df[~df[self.chunk_id_col].isna()].copy()
         df[self.chunk_id_col] = df[self.chunk_id_col].astype(int)
         df[self.chunk_text_col] = df[self.chunk_text_col].astype(str)
-
-        # stable order
         df = df.sort_values(self.chunk_id_col).reset_index(drop=True)
         return df
 
@@ -1755,16 +1191,13 @@ class RadiopaediaWeakEvidenceAligner:
 
     def _build_or_load_faiss_index(self, chunk_embeds: np.ndarray) -> faiss.Index:
         if self.faiss_index_path.exists():
-            idx = faiss.read_index(str(self.faiss_index_path))
-            return idx
+            return faiss.read_index(str(self.faiss_index_path))
 
         dim = int(chunk_embeds.shape[1])
-        index = faiss.IndexFlatIP(dim)  # cosine via normalized embeddings
+        index = faiss.IndexFlatIP(dim)
         index.add(chunk_embeds)
-
         faiss.write_index(index, str(self.faiss_index_path))
         return index
-
 
     def _softmax(self, x: np.ndarray) -> np.ndarray:
         x = x.astype(np.float32)
@@ -1783,17 +1216,18 @@ class RadiopaediaWeakEvidenceAligner:
             return w
         return self._softmax(combined / float(self.temperature)).astype(np.float32)
 
-
     def _init_writer(self) -> pq.ParquetWriter:
         self.out_parquet.parent.mkdir(parents=True, exist_ok=True)
 
-        # store schema so every batch uses identical schema
         self._pa_schema = pa.schema(
             [
                 ("qa_row_id", pa.int64()),
                 ("report_rel_path", pa.string()),
                 ("qa_type", pa.string()),
+                ("question", pa.string()),
                 ("claim_text", pa.string()),
+                ("supporting_span", pa.string()),
+                ("retrieval_query", pa.string()),
                 ("retrieved_chunk_ids_json", pa.string()),
                 ("support_weights_json", pa.string()),
                 ("embed_scores_json", pa.string()),
@@ -1801,6 +1235,7 @@ class RadiopaediaWeakEvidenceAligner:
                 ("combined_scores_json", pa.string()),
             ]
         )
+
         return pq.ParquetWriter(
             str(self.out_parquet),
             schema=self._pa_schema,
@@ -1808,13 +1243,15 @@ class RadiopaediaWeakEvidenceAligner:
         )
 
     def _coerce_batch_df_for_parquet(self, batch_df: pd.DataFrame) -> pd.DataFrame:
-        # Force consistent dtypes to avoid string vs large_string mismatch
         batch_df["qa_row_id"] = pd.to_numeric(batch_df["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
 
         for c in [
             "report_rel_path",
             "qa_type",
+            "question",
             "claim_text",
+            "supporting_span",
+            "retrieval_query",
             "retrieved_chunk_ids_json",
             "support_weights_json",
             "embed_scores_json",
@@ -1825,14 +1262,12 @@ class RadiopaediaWeakEvidenceAligner:
 
         return batch_df
 
-
     def run(self) -> None:
         if not self.qa_csv.exists():
             raise FileNotFoundError(f"qa_csv not found: {self.qa_csv}")
         if not self.chunks_parquet.exists():
             raise FileNotFoundError(f"chunks_parquet not found: {self.chunks_parquet}")
 
-        # load chunks + index
         chunks_df = self._load_chunks_table()
         chunk_ids = chunks_df[self.chunk_id_col].to_numpy(dtype=np.int64)
         chunk_texts = chunks_df[self.chunk_text_col].tolist()
@@ -1840,55 +1275,78 @@ class RadiopaediaWeakEvidenceAligner:
         chunk_embeds = self._build_or_load_chunk_embeddings(chunks_df)
         index = self._build_or_load_faiss_index(chunk_embeds)
 
-        # stream QA CSV
         writer = self._init_writer()
         assert self._pa_schema is not None
 
         total_rows = sum(1 for _ in open(self.qa_csv, "r", encoding="utf-8", errors="ignore")) - 1
-        pbar = tqdm(
-            total=max(total_rows, 0),
-            desc=self.tqdm_desc,
-            unit="rows",
-            miniters=1,
-        )
+        pbar = tqdm(total=max(total_rows, 0), desc=self.tqdm_desc, unit="rows", miniters=1)
 
-        qa_row_id = 0
+        next_qa_row_id = 0
+
         try:
             for df in pd.read_csv(self.qa_csv, chunksize=self.qa_chunksize_rows):
-                for c in [self.report_path_col, self.qa_type_col, self.claim_col]:
+                required = [self.report_path_col, self.qa_type_col, self.question_col, self.claim_col, self.supporting_span_col]
+                for c in required:
                     if c not in df.columns:
                         raise ValueError(f"QA CSV missing required column: {c}")
 
-                df[self.report_path_col] = df[self.report_path_col].astype(str)
-                df[self.qa_type_col] = df[self.qa_type_col].astype(str)
-                df[self.claim_col] = df[self.claim_col].astype(str)
+                if self.qa_row_id_col not in df.columns:
+                    df[self.qa_row_id_col] = np.arange(next_qa_row_id, next_qa_row_id + len(df), dtype=np.int64)
 
-                claims = df[self.claim_col].tolist()
+                df[self.qa_row_id_col] = pd.to_numeric(df[self.qa_row_id_col], errors="coerce")
+                bad_mask = df[self.qa_row_id_col].isna()
+                if bad_mask.any():
+                    n_bad = int(bad_mask.sum())
+                    fill_vals = np.arange(next_qa_row_id, next_qa_row_id + n_bad, dtype=np.int64)
+                    df.loc[bad_mask, self.qa_row_id_col] = fill_vals
+
+                df[self.qa_row_id_col] = df[self.qa_row_id_col].astype(np.int64)
+                next_qa_row_id = int(df[self.qa_row_id_col].max()) + 1
+
+                for c in [self.report_path_col, self.qa_type_col, self.question_col, self.claim_col, self.supporting_span_col]:
+                    df[c] = df[c].astype(str)
+
+                retrieval_queries = [
+                    self._build_retrieval_query(q, c, s)
+                    for q, c, s in zip(
+                        df[self.question_col].tolist(),
+                        df[self.claim_col].tolist(),
+                        df[self.supporting_span_col].tolist(),
+                    )
+                ]
+
                 q_emb = self._encode_texts(
-                    claims,
+                    retrieval_queries,
                     max_len=self.max_query_tokens,
                     batch_size=self.qa_batch_size,
-                    pbar=pbar,  # updates per encoder batch
+                    pbar=pbar,
                 )
 
-                D, I = index.search(q_emb, self.top_k)  # (B,k)
+                D, I = index.search(q_emb, self.top_k)
 
                 out_rows: List[Dict[str, object]] = []
 
                 for i in range(len(df)):
-                    report_rel_path = df.iloc[i][self.report_path_col]
-                    qa_type = df.iloc[i][self.qa_type_col]
-                    claim_text = df.iloc[i][self.claim_col]
-                    claim_norm = self._normalize_text(claim_text)
+                    qa_row_id = int(df.iloc[i][self.qa_row_id_col])
+                    report_rel_path = self._safe_str(df.iloc[i][self.report_path_col])
+                    qa_type = self._safe_str(df.iloc[i][self.qa_type_col])
+                    question = self._safe_str(df.iloc[i][self.question_col])
+                    claim_text = self._safe_str(df.iloc[i][self.claim_col])
+                    supporting_span = self._safe_str(df.iloc[i][self.supporting_span_col])
+                    retrieval_query = retrieval_queries[i]
+                    query_norm = self._normalize_text(retrieval_query)
 
-                    if not claim_norm:
+                    if not query_norm:
                         out_rows.append(
                             asdict(
                                 WeakAlignmentRow(
                                     qa_row_id=qa_row_id,
                                     report_rel_path=report_rel_path,
                                     qa_type=qa_type,
+                                    question=question,
                                     claim_text=claim_text,
+                                    supporting_span=supporting_span,
+                                    retrieval_query=retrieval_query,
                                     retrieved_chunk_ids_json="[]",
                                     support_weights_json="[]",
                                     embed_scores_json="[]",
@@ -1897,7 +1355,6 @@ class RadiopaediaWeakEvidenceAligner:
                                 )
                             )
                         )
-                        qa_row_id += 1
                         continue
 
                     faiss_idxs = I[i].tolist()
@@ -1914,12 +1371,11 @@ class RadiopaediaWeakEvidenceAligner:
                         retrieved_texts.append(chunk_texts[j])
                         valid_embed_scores.append(float(sc))
 
-                    lex_scores = [float(self._lexical_overlap(claim_norm, t)) for t in retrieved_texts]
+                    lex_scores = [float(self._lexical_overlap(query_norm, t)) for t in retrieved_texts]
 
                     e = np.array(valid_embed_scores, dtype=np.float32)
                     l = np.array(lex_scores, dtype=np.float32)
                     combined = self.alpha * e + (1.0 - self.alpha) * l
-
                     w = self._weights_from_scores(combined)
 
                     out_rows.append(
@@ -1928,7 +1384,10 @@ class RadiopaediaWeakEvidenceAligner:
                                 qa_row_id=qa_row_id,
                                 report_rel_path=report_rel_path,
                                 qa_type=qa_type,
+                                question=question,
                                 claim_text=claim_text,
+                                supporting_span=supporting_span,
+                                retrieval_query=retrieval_query,
                                 retrieved_chunk_ids_json=json.dumps(retrieved_ids),
                                 support_weights_json=json.dumps([float(x) for x in w.tolist()]),
                                 embed_scores_json=json.dumps([float(x) for x in e.tolist()]),
@@ -1937,7 +1396,6 @@ class RadiopaediaWeakEvidenceAligner:
                             )
                         )
                     )
-                    qa_row_id += 1
 
                 batch_df = pd.DataFrame(out_rows)
                 batch_df = self._coerce_batch_df_for_parquet(batch_df)
@@ -1955,6 +1413,7 @@ class RadiopaediaWeakEvidenceAligner:
             "chunks_parquet": str(self.chunks_parquet.resolve()),
             "out_parquet": str(self.out_parquet.resolve()),
             "bootstrap_embedder": self.model_name,
+            "retrieval_query_format": "QUESTION + CLAIM + REPORT_EVIDENCE_HINT",
             "params": {
                 "max_query_tokens": self.max_query_tokens,
                 "max_doc_tokens": self.max_doc_tokens,
@@ -1974,7 +1433,8 @@ class RadiopaediaWeakEvidenceAligner:
             },
         }
         (self.out_parquet.parent / "manifest_step4b.json").write_text(
-            json.dumps(manifest, indent=2), encoding="utf-8"
+            json.dumps(manifest, indent=2),
+            encoding="utf-8",
         )
 
         print(f"Wrote: {self.out_parquet}")
@@ -1986,15 +1446,17 @@ class RadiopaediaWeakEvidenceAligner:
 
 
 
-
 @dataclass(frozen=True)
 class RetrieverSupervisionRow:
     qa_row_id: int
     subject_id: int
-    split: str                    # "train" / "valid" / "test"
+    split: str
     report_rel_path: str
     qa_type: str
     claim_text: str
+    question: str
+    supporting_span: str
+    retrieval_query: str
     pos_chunk_ids_json: str
     pos_weights_json: str
 
@@ -2010,6 +1472,8 @@ class VerifierSupervisionRow:
     question: str
     answer_target: str
     claim_text: str
+    supporting_span: str
+    retrieval_query: str
     evidence_chunk_ids_json: str
     evidence_weights_json: str
     soft_support_score: float
@@ -2017,9 +1481,15 @@ class VerifierSupervisionRow:
 
 class RadiopaediaStep4CSupervisionBuilder:
     """
-    Step 4C: Convert Step 3 + Step 4B outputs into final supervision artifacts
+    Step 4C: Convert Step 3 + Step 4B outputs into final supervision artifacts.
 
-    Split is computed ONLY from subject_id (no leakage across patients) and is deterministic.
+    Fixes versus old version:
+      - merges by qa_row_id instead of relying on row order
+      - actually builds and writes patient-wise split map if missing
+      - keeps question / supporting_span / retrieval_query in supervision
+      - replaces invalid soft_support_score = max(combined_scores)
+      - uses weighted positive retrieval score as weak support target
+      - applies optional global min-max normalization to soft support
     """
 
     def __init__(
@@ -2027,26 +1497,25 @@ class RadiopaediaStep4CSupervisionBuilder:
         qa_csv: str | Path,
         weak_alignment_parquet: str | Path,
         out_dir: str | Path,
-        # columns in qa_csv
-        subject_id_col: str = "subject_id",          # NEW
+        subject_id_col: str = "subject_id",
+        qa_row_id_col: str = "qa_row_id",
         report_path_col: str = "report_rel_path",
         qa_type_col: str = "qa_type",
         claim_col: str = "claim_text",
         case_context_col: str = "case_context",
         question_col: str = "question",
         answer_col: str = "answer_target",
-        # streaming
+        supporting_span_col: str = "supporting_span",
+        retrieval_query_col: str = "retrieval_query",
         qa_chunksize_rows: int = 50_000,
         parquet_batch_rows: int = 50_000,
-        # supervision shaping
         top_k: Optional[int] = None,
         min_weight: float = 0.0,
-        # split config (NEW)
         split_seed: int = 13,
         frac_train: float = 0.75,
         frac_valid: float = 0.10,
         frac_test: float = 0.15,
-        # progress
+        normalize_soft_support: bool = True,
         tqdm_desc: str = "Step 4C: building supervision",
         parquet_compression: str = "zstd",
     ) -> None:
@@ -2055,13 +1524,16 @@ class RadiopaediaStep4CSupervisionBuilder:
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
-        self.subject_id_col = str(subject_id_col)     # NEW
+        self.subject_id_col = str(subject_id_col)
+        self.qa_row_id_col = str(qa_row_id_col)
         self.report_path_col = str(report_path_col)
         self.qa_type_col = str(qa_type_col)
         self.claim_col = str(claim_col)
         self.case_context_col = str(case_context_col)
         self.question_col = str(question_col)
         self.answer_col = str(answer_col)
+        self.supporting_span_col = str(supporting_span_col)
+        self.retrieval_query_col = str(retrieval_query_col)
 
         self.qa_chunksize_rows = int(qa_chunksize_rows)
         self.parquet_batch_rows = int(parquet_batch_rows)
@@ -2074,19 +1546,19 @@ class RadiopaediaStep4CSupervisionBuilder:
         self.frac_valid = float(frac_valid)
         self.frac_test = float(frac_test)
         if not np.isclose(self.frac_train + self.frac_valid + self.frac_test, 1.0):
-            raise ValueError("Split fractions must sum to 1.0 (train+valid+test).")
+            raise ValueError("Split fractions must sum to 1.0.")
 
+        self.normalize_soft_support = bool(normalize_soft_support)
         self.tqdm_desc = str(tqdm_desc)
         self.parquet_compression = str(parquet_compression)
 
         self.retriever_out = self.out_dir / "retriever_supervision.parquet"
         self.verifier_out = self.out_dir / "verifier_supervision.parquet"
         self.manifest_out = self.out_dir / "manifest_step4c.json"
-        self.split_map_out = self.out_dir / "patient_split_map.json"  # NEW
+        self.split_map_out = self.out_dir / "patient_split_map.json"
 
         self._retr_schema: Optional[pa.Schema] = None
         self._ver_schema: Optional[pa.Schema] = None
-
         self._patient_split_map: Optional[Dict[int, str]] = None
 
     def _safe_str(self, x) -> str:
@@ -2101,43 +1573,106 @@ class RadiopaediaStep4CSupervisionBuilder:
         except Exception:
             return []
 
-    def _filter_and_truncate(self, ids: List[int], w: List[float]) -> Tuple[List[int], List[float]]:
+    def _filter_and_truncate(self, ids: List[int], w: List[float], combined: List[float]) -> Tuple[List[int], List[float], List[float]]:
+        m = min(len(ids), len(w), len(combined))
+        ids = ids[:m]
+        w = w[:m]
+        combined = combined[:m]
+
         if self.top_k is not None:
             ids = ids[: self.top_k]
             w = w[: self.top_k]
+            combined = combined[: self.top_k]
+
         if self.min_weight > 0:
-            keep = [(i, ww) for i, ww in zip(ids, w) if float(ww) >= self.min_weight]
-            ids = [int(i) for i, _ in keep]
-            w = [float(ww) for _, ww in keep]
-        return ids, w
+            keep = [(i, ww, cc) for i, ww, cc in zip(ids, w, combined) if float(ww) >= self.min_weight]
+            ids = [int(i) for i, _, _ in keep]
+            w = [float(ww) for _, ww, _ in keep]
+            combined = [float(cc) for _, _, cc in keep]
 
-    def _soft_support_from_combined(self, combined_scores: List[float]) -> float:
-        if not combined_scores:
-            return 0.0
-        try:
-            return float(np.max(np.asarray(combined_scores, dtype=np.float32)))
-        except Exception:
-            return 0.0
+        return ids, w, combined
 
-    # patient-wise split map (deterministic)
-    def _build_patient_split_map(self) -> Dict[int, str]:
-        split_map_path = os.path.join(base_path_evidenceData, "step4c_supervision/patient_split_map.json")
-        if not os.path.exists(split_map_path):
-            raise FileNotFoundError(f"Patient split map not found: {split_map_path}")
-        with open(split_map_path, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        split_map: Dict[int, str] = {int(k): str(v) for k, v in raw.items()}
+    def _build_patient_split_map(self, qa_df: pd.DataFrame) -> Dict[int, str]:
+        subjects = pd.to_numeric(qa_df[self.subject_id_col], errors="coerce")
+        subjects = subjects[~subjects.isna()].astype(np.int64).unique().tolist()
+        subjects = sorted(int(x) for x in subjects)
+
+        rng = np.random.default_rng(self.split_seed)
+        perm = rng.permutation(len(subjects))
+        shuffled = [subjects[i] for i in perm]
+
+        n = len(shuffled)
+        n_train = int(round(self.frac_train * n))
+        n_valid = int(round(self.frac_valid * n))
+        n_test = n - n_train - n_valid
+
+        if n > 0 and n_train == 0:
+            n_train = 1
+        if n_train + n_valid > n:
+            n_valid = max(0, n - n_train)
+        n_test = max(0, n - n_train - n_valid)
+
+        train_ids = shuffled[:n_train]
+        valid_ids = shuffled[n_train:n_train + n_valid]
+        test_ids = shuffled[n_train + n_valid:n_train + n_valid + n_test]
+
+        split_map: Dict[int, str] = {}
+        for sid in train_ids:
+            split_map[int(sid)] = "train"
+        for sid in valid_ids:
+            split_map[int(sid)] = "valid"
+        for sid in test_ids:
+            split_map[int(sid)] = "test"
+
+        self.split_map_out.write_text(
+            json.dumps({str(k): v for k, v in split_map.items()}, indent=2),
+            encoding="utf-8",
+        )
         return split_map
+
+    def _weighted_support_from_scores(self, weights: List[float], combined_scores: List[float]) -> float:
+        if not weights or not combined_scores:
+            return 0.0
+
+        m = min(len(weights), len(combined_scores))
+        w = np.asarray(weights[:m], dtype=np.float32)
+        c = np.asarray(combined_scores[:m], dtype=np.float32)
+
+        c = np.maximum(c, 0.0)
+
+        s = float(w.sum())
+        if s > 0:
+            w = w / s
+        elif len(w) > 0:
+            w = np.ones_like(w, dtype=np.float32) / float(len(w))
+        else:
+            return 0.0
+
+        return float(np.sum(w * c))
+
+    def _normalize_soft_support_scores(self, xs: List[float]) -> List[float]:
+        if not xs:
+            return xs
+        arr = np.asarray(xs, dtype=np.float32)
+        lo = float(arr.min())
+        hi = float(arr.max())
+        if hi <= lo + 1e-12:
+            return [0.5 for _ in xs]
+        arr = (arr - lo) / (hi - lo)
+        return [float(x) for x in arr.tolist()]
 
     def _init_retriever_writer(self) -> pq.ParquetWriter:
         self._retr_schema = pa.schema(
             [
                 ("qa_row_id", pa.int64()),
-                ("subject_id", pa.int64()),     # NEW
-                ("split", pa.string()),         # NEW
+                ("subject_id", pa.int64()),
+                ("split", pa.string()),
                 ("report_rel_path", pa.string()),
                 ("qa_type", pa.string()),
                 ("claim_text", pa.string()),
+                ("question", pa.string()),
+                ("supporting_span", pa.string()),
+                ("retrieval_query", pa.string()),
                 ("pos_chunk_ids_json", pa.string()),
                 ("pos_weights_json", pa.string()),
             ]
@@ -2152,14 +1687,16 @@ class RadiopaediaStep4CSupervisionBuilder:
         self._ver_schema = pa.schema(
             [
                 ("qa_row_id", pa.int64()),
-                ("subject_id", pa.int64()),     # NEW
-                ("split", pa.string()),         # NEW
+                ("subject_id", pa.int64()),
+                ("split", pa.string()),
                 ("report_rel_path", pa.string()),
                 ("qa_type", pa.string()),
                 ("case_context", pa.string()),
                 ("question", pa.string()),
                 ("answer_target", pa.string()),
                 ("claim_text", pa.string()),
+                ("supporting_span", pa.string()),
+                ("retrieval_query", pa.string()),
                 ("evidence_chunk_ids_json", pa.string()),
                 ("evidence_weights_json", pa.string()),
                 ("soft_support_score", pa.float32()),
@@ -2179,26 +1716,29 @@ class RadiopaediaStep4CSupervisionBuilder:
         df["qa_row_id"] = pd.to_numeric(df["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
         df["subject_id"] = pd.to_numeric(df["subject_id"], errors="coerce").fillna(-1).astype(np.int64)
 
-        for c in [
+        string_cols = [
             "split",
             "report_rel_path",
             "qa_type",
             "claim_text",
+            "question",
+            "supporting_span",
+            "retrieval_query",
             "pos_chunk_ids_json",
             "pos_weights_json",
             "case_context",
-            "question",
             "answer_target",
             "evidence_chunk_ids_json",
             "evidence_weights_json",
-        ]:
+        ]
+        for c in string_cols:
             if c in df.columns:
                 df[c] = df[c].astype(str)
 
         if "soft_support_score" in df.columns:
-            df["soft_support_score"] = pd.to_numeric(df["soft_support_score"], errors="coerce").fillna(0.0).astype(
-                np.float32
-            )
+            df["soft_support_score"] = pd.to_numeric(
+                df["soft_support_score"], errors="coerce"
+            ).fillna(0.0).astype(np.float32)
 
         return pa.Table.from_pandas(df, schema=schema, preserve_index=False)
 
@@ -2208,29 +1748,10 @@ class RadiopaediaStep4CSupervisionBuilder:
         if not self.weak_alignment_parquet.exists():
             raise FileNotFoundError(f"Weak alignment parquet not found: {self.weak_alignment_parquet}")
 
-        self._patient_split_map = self._build_patient_split_map()
+        qa_df = pd.read_csv(self.qa_csv)
+        align_df = pd.read_parquet(self.weak_alignment_parquet)
 
-        total_rows = sum(1 for _ in open(self.qa_csv, "r", encoding="utf-8", errors="ignore")) - 1
-        pbar = tqdm(total=max(total_rows, 0), desc=self.tqdm_desc, unit="rows", miniters=1)
-
-        retr_writer = self._init_retriever_writer()
-        ver_writer = self._init_verifier_writer()
-        assert self._retr_schema is not None
-        assert self._ver_schema is not None
-
-        pf = pq.ParquetFile(str(self.weak_alignment_parquet))
-
-        align_cols = [
-            "qa_row_id",
-            "report_rel_path",
-            "qa_type",
-            "claim_text",
-            "retrieved_chunk_ids_json",
-            "support_weights_json",
-            "combined_scores_json",
-        ]
-
-        needed_qa_cols = [
+        required_qa = [
             self.subject_id_col,
             self.report_path_col,
             self.qa_type_col,
@@ -2239,136 +1760,178 @@ class RadiopaediaStep4CSupervisionBuilder:
             self.question_col,
             self.answer_col,
         ]
+        for c in required_qa:
+            if c not in qa_df.columns:
+                raise ValueError(f"QA CSV missing required column: {c}")
 
-        qa_reader = pd.read_csv(self.qa_csv, chunksize=self.qa_chunksize_rows)
+        if self.qa_row_id_col not in qa_df.columns:
+            qa_df[self.qa_row_id_col] = np.arange(len(qa_df), dtype=np.int64)
 
-        qa_row_id_expected = 0
-        align_row_id_expected = 0
+        required_align = [
+            self.qa_row_id_col,
+            "retrieved_chunk_ids_json",
+            "support_weights_json",
+            "combined_scores_json",
+        ]
+        for c in required_align:
+            if c not in align_df.columns:
+                raise ValueError(f"Weak alignment parquet missing required column: {c}")
+
+        if self.supporting_span_col not in qa_df.columns:
+            qa_df[self.supporting_span_col] = ""
+        if self.retrieval_query_col not in align_df.columns:
+            align_df[self.retrieval_query_col] = ""
+        if self.question_col not in align_df.columns:
+            align_df[self.question_col] = ""
+        if self.supporting_span_col not in align_df.columns:
+            align_df[self.supporting_span_col] = ""
+
+        qa_df[self.qa_row_id_col] = pd.to_numeric(qa_df[self.qa_row_id_col], errors="coerce")
+        qa_df = qa_df[~qa_df[self.qa_row_id_col].isna()].copy()
+        qa_df[self.qa_row_id_col] = qa_df[self.qa_row_id_col].astype(np.int64)
+
+        align_df[self.qa_row_id_col] = pd.to_numeric(align_df[self.qa_row_id_col], errors="coerce")
+        align_df = align_df[~align_df[self.qa_row_id_col].isna()].copy()
+        align_df[self.qa_row_id_col] = align_df[self.qa_row_id_col].astype(np.int64)
+
+        qa_df[self.subject_id_col] = pd.to_numeric(qa_df[self.subject_id_col], errors="coerce")
+        qa_df = qa_df[~qa_df[self.subject_id_col].isna()].copy()
+        qa_df[self.subject_id_col] = qa_df[self.subject_id_col].astype(np.int64)
+
+        qa_df[self.report_path_col] = qa_df[self.report_path_col].astype(str)
+        qa_df[self.qa_type_col] = qa_df[self.qa_type_col].astype(str)
+        qa_df[self.claim_col] = qa_df[self.claim_col].astype(str)
+        qa_df[self.case_context_col] = qa_df[self.case_context_col].astype(str)
+        qa_df[self.question_col] = qa_df[self.question_col].astype(str)
+        qa_df[self.answer_col] = qa_df[self.answer_col].astype(str)
+        qa_df[self.supporting_span_col] = qa_df[self.supporting_span_col].astype(str)
+
+        align_df["retrieved_chunk_ids_json"] = align_df["retrieved_chunk_ids_json"].astype(str)
+        align_df["support_weights_json"] = align_df["support_weights_json"].astype(str)
+        align_df["combined_scores_json"] = align_df["combined_scores_json"].astype(str)
+        align_df[self.retrieval_query_col] = align_df[self.retrieval_query_col].astype(str)
+
+        self._patient_split_map = self._build_patient_split_map(qa_df)
+
+        merged = qa_df.merge(
+            align_df[
+                [
+                    self.qa_row_id_col,
+                    "retrieved_chunk_ids_json",
+                    "support_weights_json",
+                    "combined_scores_json",
+                    self.retrieval_query_col,
+                ]
+            ],
+            on=self.qa_row_id_col,
+            how="inner",
+            validate="one_to_one",
+        )
+
+        total_rows = len(merged)
+        pbar = tqdm(total=total_rows, desc=self.tqdm_desc, unit="rows", miniters=1)
+
+        retr_writer = self._init_retriever_writer()
+        ver_writer = self._init_verifier_writer()
+        assert self._retr_schema is not None
+        assert self._ver_schema is not None
+        assert self._patient_split_map is not None
+
+        retr_buffer: List[Dict[str, object]] = []
+        ver_buffer: List[Dict[str, object]] = []
+        raw_soft_scores: List[float] = []
 
         try:
-            align_iter = pf.iter_batches(batch_size=self.parquet_batch_rows, columns=align_cols)
+            for i in range(total_rows):
+                row = merged.iloc[i]
 
-            for qa_chunk in qa_reader:
-                for c in needed_qa_cols:
-                    if c not in qa_chunk.columns:
-                        raise ValueError(f"QA CSV missing required column: {c}")
+                qa_row_id = int(row[self.qa_row_id_col])
+                subject_id = int(row[self.subject_id_col])
+                split = self._patient_split_map.get(subject_id, "train")
 
-                qa_chunk = qa_chunk.copy()
+                report_rel_path = self._safe_str(row[self.report_path_col])
+                qa_type = self._safe_str(row[self.qa_type_col])
+                claim_text = self._safe_str(row[self.claim_col])
+                case_context = self._safe_str(row[self.case_context_col])
+                question = self._safe_str(row[self.question_col])
+                answer_target = self._safe_str(row[self.answer_col])
+                supporting_span = self._safe_str(row[self.supporting_span_col])
+                retrieval_query = self._safe_str(row.get(self.retrieval_query_col, ""))
 
-                qa_chunk[self.subject_id_col] = pd.to_numeric(qa_chunk[self.subject_id_col], errors="coerce")
-                qa_chunk = qa_chunk[~qa_chunk[self.subject_id_col].isna()]
-                qa_chunk[self.subject_id_col] = qa_chunk[self.subject_id_col].astype(np.int64)
+                ids = self._loads_json_list(self._safe_str(row.get("retrieved_chunk_ids_json", "[]")))
+                w = self._loads_json_list(self._safe_str(row.get("support_weights_json", "[]")))
+                combined = self._loads_json_list(self._safe_str(row.get("combined_scores_json", "[]")))
 
-                qa_chunk[self.report_path_col] = qa_chunk[self.report_path_col].astype(str)
-                qa_chunk[self.qa_type_col] = qa_chunk[self.qa_type_col].astype(str)
-                qa_chunk[self.claim_col] = qa_chunk[self.claim_col].astype(str)
-                qa_chunk[self.case_context_col] = qa_chunk[self.case_context_col].astype(str)
-                qa_chunk[self.question_col] = qa_chunk[self.question_col].astype(str)
-                qa_chunk[self.answer_col] = qa_chunk[self.answer_col].astype(str)
+                ids = [int(x) for x in ids if str(x).strip() != ""]
+                w = [float(x) for x in w]
+                combined = [float(x) for x in combined]
 
-                n = len(qa_chunk)
-                if n == 0:
-                    continue
+                ids, w, combined = self._filter_and_truncate(ids, w, combined)
 
-                align_rows: List[pd.DataFrame] = []
-                need = n
-                while need > 0:
-                    batch = next(align_iter, None)
-                    if batch is None:
-                        raise RuntimeError(f"Alignment parquet ended early. Still needed {need} rows.")
-                    bdf = batch.to_pandas()
-                    align_rows.append(bdf)
-                    need -= len(bdf)
+                if len(ids) != len(w):
+                    m = min(len(ids), len(w))
+                    ids = ids[:m]
+                    w = w[:m]
+                if len(ids) != len(combined):
+                    m = min(len(ids), len(combined))
+                    ids = ids[:m]
+                    w = w[:m]
+                    combined = combined[:m]
 
-                align_df = pd.concat(align_rows, ignore_index=True)
-                if len(align_df) > n:
-                    align_df = align_df.iloc[:n].copy()
+                soft_support_score = self._weighted_support_from_scores(w, combined)
+                raw_soft_scores.append(float(soft_support_score))
 
-                if "qa_row_id" not in align_df.columns:
-                    raise ValueError("Alignment parquet missing qa_row_id column.")
-
-                first_id = int(align_df.iloc[0]["qa_row_id"])
-                if first_id != align_row_id_expected:
-                    raise RuntimeError(
-                        f"Alignment qa_row_id mismatch: expected {align_row_id_expected}, got {first_id}."
-                    )
-
-                retr_rows: List[Dict[str, object]] = []
-                ver_rows: List[Dict[str, object]] = []
-
-                assert self._patient_split_map is not None
-
-                for i in range(n):
-                    qa_row_id = qa_row_id_expected
-                    al_row = align_df.iloc[i]
-
-                    ids = self._loads_json_list(self._safe_str(al_row.get("retrieved_chunk_ids_json", "[]")))
-                    w = self._loads_json_list(self._safe_str(al_row.get("support_weights_json", "[]")))
-                    combined = self._loads_json_list(self._safe_str(al_row.get("combined_scores_json", "[]")))
-
-                    ids = [int(x) for x in ids if str(x).strip() != ""]
-                    w = [float(x) for x in w]
-                    combined = [float(x) for x in combined]
-
-                    ids, w = self._filter_and_truncate(ids, w)
-                    if len(w) != len(ids):
-                        m = min(len(w), len(ids))
-                        ids, w = ids[:m], w[:m]
-
-                    subject_id = int(qa_chunk.iloc[i][self.subject_id_col])
-                    split = self._patient_split_map.get(subject_id, "train")  # should always exist
-
-                    report_rel_path = self._safe_str(qa_chunk.iloc[i][self.report_path_col])
-                    qa_type = self._safe_str(qa_chunk.iloc[i][self.qa_type_col])
-                    claim_text = self._safe_str(qa_chunk.iloc[i][self.claim_col])
-                    case_context = self._safe_str(qa_chunk.iloc[i][self.case_context_col])
-                    question = self._safe_str(qa_chunk.iloc[i][self.question_col])
-                    answer_target = self._safe_str(qa_chunk.iloc[i][self.answer_col])
-
-                    retr_rows.append(
-                        asdict(
-                            RetrieverSupervisionRow(
-                                qa_row_id=qa_row_id,
-                                subject_id=subject_id,
-                                split=split,
-                                report_rel_path=report_rel_path,
-                                qa_type=qa_type,
-                                claim_text=claim_text,
-                                pos_chunk_ids_json=json.dumps(ids),
-                                pos_weights_json=json.dumps([float(x) for x in w]),
-                            )
+                retr_buffer.append(
+                    asdict(
+                        RetrieverSupervisionRow(
+                            qa_row_id=qa_row_id,
+                            subject_id=subject_id,
+                            split=split,
+                            report_rel_path=report_rel_path,
+                            qa_type=qa_type,
+                            claim_text=claim_text,
+                            question=question,
+                            supporting_span=supporting_span,
+                            retrieval_query=retrieval_query,
+                            pos_chunk_ids_json=json.dumps(ids),
+                            pos_weights_json=json.dumps([float(x) for x in w]),
                         )
                     )
+                )
 
-                    ver_rows.append(
-                        asdict(
-                            VerifierSupervisionRow(
-                                qa_row_id=qa_row_id,
-                                subject_id=subject_id,
-                                split=split,
-                                report_rel_path=report_rel_path,
-                                qa_type=qa_type,
-                                case_context=case_context,
-                                question=question,
-                                answer_target=answer_target,
-                                claim_text=claim_text,
-                                evidence_chunk_ids_json=json.dumps(ids),
-                                evidence_weights_json=json.dumps([float(x) for x in w]),
-                                soft_support_score=self._soft_support_from_combined(combined),
-                            )
+                ver_buffer.append(
+                    asdict(
+                        VerifierSupervisionRow(
+                            qa_row_id=qa_row_id,
+                            subject_id=subject_id,
+                            split=split,
+                            report_rel_path=report_rel_path,
+                            qa_type=qa_type,
+                            case_context=case_context,
+                            question=question,
+                            answer_target=answer_target,
+                            claim_text=claim_text,
+                            supporting_span=supporting_span,
+                            retrieval_query=retrieval_query,
+                            evidence_chunk_ids_json=json.dumps(ids),
+                            evidence_weights_json=json.dumps([float(x) for x in w]),
+                            soft_support_score=float(soft_support_score),
                         )
                     )
+                )
 
-                    qa_row_id_expected += 1
-                    align_row_id_expected += 1
+                pbar.update(1)
 
-                retr_df = pd.DataFrame(retr_rows)
-                ver_df = pd.DataFrame(ver_rows)
+            if self.normalize_soft_support and ver_buffer:
+                norm_scores = self._normalize_soft_support_scores(raw_soft_scores)
+                for j, s in enumerate(norm_scores):
+                    ver_buffer[j]["soft_support_score"] = float(s)
 
-                retr_writer.write_table(self._to_table(retr_df, self._retr_schema))
-                ver_writer.write_table(self._to_table(ver_df, self._ver_schema))
+            retr_df = pd.DataFrame(retr_buffer)
+            ver_df = pd.DataFrame(ver_buffer)
 
-                pbar.update(n)
+            retr_writer.write_table(self._to_table(retr_df, self._retr_schema))
+            ver_writer.write_table(self._to_table(ver_df, self._ver_schema))
 
         finally:
             pbar.close()
@@ -2382,22 +1945,26 @@ class RadiopaediaStep4CSupervisionBuilder:
                 "weak_alignment_parquet": str(self.weak_alignment_parquet.resolve()),
             },
             "outputs": {
-                "retriever_supervision": str(self.retriever_out),
-                "verifier_supervision": str(self.verifier_out),
-                "patient_split_map": str(self.split_map_out),
+                "retriever_supervision": str(self.retriever_out.resolve()),
+                "verifier_supervision": str(self.verifier_out.resolve()),
+                "patient_split_map": str(self.split_map_out.resolve()),
             },
             "split": {
                 "method": "patient-wise",
                 "seed": self.split_seed,
-                "fractions": {"train": self.frac_train, "valid": self.frac_valid, "test": self.frac_test},
+                "fractions": {
+                    "train": self.frac_train,
+                    "valid": self.frac_valid,
+                    "test": self.frac_test,
+                },
                 "labels": ["train", "valid", "test"],
             },
             "params": {
-                "qa_chunksize_rows": self.qa_chunksize_rows,
-                "parquet_batch_rows": self.parquet_batch_rows,
                 "top_k": self.top_k,
                 "min_weight": self.min_weight,
-                "soft_support_scalar": "max(combined_scores)",
+                "normalize_soft_support": self.normalize_soft_support,
+                "soft_support_scalar": "weighted_sum(max(combined_scores,0), normalized_by_support_weights); optional dataset min-max normalization",
+                "join_key": "qa_row_id",
             },
         }
         self.manifest_out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -2406,7 +1973,6 @@ class RadiopaediaStep4CSupervisionBuilder:
         print(f"Wrote: {self.verifier_out}")
         print(f"Wrote: {self.split_map_out}")
         print(f"Wrote: {self.manifest_out}")
-
 
 
 
@@ -2440,7 +2006,12 @@ class _RunningStats:
         if self.n <= 0:
             return {"min": 0.0, "max": 0.0, "mean": 0.0, "std": 0.0}
         var = self.M2 / (self.n - 1) if self.n > 1 else 0.0
-        return {"min": float(self.min_v), "max": float(self.max_v), "mean": float(self.mean), "std": float(np.sqrt(var))}
+        return {
+            "min": float(self.min_v),
+            "max": float(self.max_v),
+            "mean": float(self.mean),
+            "std": float(np.sqrt(var)),
+        }
 
 
 class EvidenceTextStore:
@@ -2448,13 +2019,10 @@ class EvidenceTextStore:
     Minimal, deterministic chunk-id -> text lookup.
 
     Assumptions:
-      - evidence parquet has either:
-          (A) explicit id column + text column, OR
-          (B) row index is the id (rare; not recommended)
-      - ids in Step 4C are stable and match this table.
-
-    You can use preload=True if M fits in RAM.
+      - evidence parquet has explicit id column + text column
+      - ids in Step 4C match this table
     """
+
     def __init__(
         self,
         evidence_parquet: str | Path,
@@ -2463,7 +2031,7 @@ class EvidenceTextStore:
         text_col: str = "chunk_text",
         preload: bool = False,
         cache_row_groups: int = 2,
-        evidence_id_base: int = 0,  # 0 if ids are 0..M-1, 1 if ids are 1..M
+        evidence_id_base: int = 0,
     ) -> None:
         self.evidence_path = Path(evidence_parquet)
         if not self.evidence_path.exists():
@@ -2523,23 +2091,15 @@ class EvidenceTextStore:
         return payload
 
     def get(self, chunk_id: int) -> str:
-        # adjust if Step4C stores 1-based ids
         chunk_id = int(chunk_id)
-        if self.evidence_id_base == 1:
-            chunk_id = chunk_id  # keep as-is (ids already 1..M)
-        elif self.evidence_id_base == 0:
-            chunk_id = chunk_id  # keep as-is (ids already 0..M-1)
 
         if self._map is not None:
             return self._map.get(chunk_id, "")
 
-        # streaming lookup: scan row groups (fast enough if cache_row_groups>0 and ids are clustered)
-        # NOTE: if ids are arbitrary, consider preload=True.
         for rg in range(self.pf.num_row_groups):
             payload = self._get_rg_payload(rg)
             ids = payload[self.id_col]
             try:
-                # linear search; acceptable for moderate rg size
                 for i, cid in enumerate(ids):
                     if int(cid) == chunk_id:
                         s = payload[self.text_col][i]
@@ -2556,7 +2116,7 @@ def create_fixed_mimic_test_eval_parquet(
     evidence_parquet: str | Path,
     evidence_id_col: str = "chunk_id",
     evidence_text_col: str = "chunk_text",
-    evidence_id_base: int = 0,  # set to 1 if your ids are 1..M
+    evidence_id_base: int = 0,
     preload_evidence_texts: bool = False,
     evidence_join_delim: str = "\n\n---\n\n",
     max_evidence_chars: int = 20_000,
@@ -2567,23 +2127,22 @@ def create_fixed_mimic_test_eval_parquet(
     write_manifest_json: bool = True,
 ) -> Dict[str, object]:
     """
-    Phase 1 — Freeze the evaluation object.
+    Freeze the evaluation object for S1-S4 using the new Step 4C output.
 
-    Reads Step 4C output:
+    Reads:
       step4c_supervision/verifier_supervision.parquet
 
-    Materializes evidence_text on-the-fly from Radiopaedia chunk table (evidence_parquet),
-    using evidence_chunk_ids_json from Step 4C (protocol ids).
-
-    Writes ONE immutable test artifact:
-      mimic_test_eval.parquet
+    Materializes evidence_text from:
+      evidence_chunk_ids_json + evidence_weights_json
 
     Output columns:
-      qa_row_id, subject_id, split, qa_type, case_context, question, answer_target, claim_text,
-      evidence_chunk_ids_json, evidence_text, soft_support_score,
+      qa_row_id, subject_id, split, qa_type, case_context, question, answer_target,
+      claim_text, supporting_span, retrieval_query,
+      evidence_chunk_ids_json, evidence_weights_json, evidence_text,
+      soft_support_score,
       report_length_bucket, device_present, uncertainty_present, label_vs_extractive
     """
-    _ = np.random.RandomState(seed)  # reserved for future deterministic sampling (unused)
+    _ = np.random.RandomState(seed)
 
     in_path = Path(verifier_supervision_parquet)
     out_path = Path(out_parquet)
@@ -2591,7 +2150,6 @@ def create_fixed_mimic_test_eval_parquet(
     if not in_path.exists():
         raise FileNotFoundError(f"verifier_supervision_parquet not found: {in_path}")
 
-    # Evidence store (Radiopaedia chunks)
     ev_store = EvidenceTextStore(
         evidence_parquet=evidence_parquet,
         id_col=evidence_id_col,
@@ -2601,27 +2159,47 @@ def create_fixed_mimic_test_eval_parquet(
         evidence_id_base=evidence_id_base,
     )
 
-    def _loads_json_list(s: str) -> List[int]:
+    def _safe_str(x) -> str:
+        if x is None:
+            return ""
+        s = str(x)
+        return "" if s.lower() == "nan" else s
+
+    def _loads_json_list(s: str) -> List:
         try:
-            xs = json.loads(s)
-            return [int(x) for x in xs]
+            return json.loads(s)
         except Exception:
             return []
 
     def _truncate(s: str) -> str:
-        s = "" if s is None else str(s)
+        s = _safe_str(s)
         if max_evidence_chars > 0 and len(s) > max_evidence_chars:
             return s[:max_evidence_chars]
         return s
 
-    def materialize_evidence(ids_json: str) -> str:
-        ids = _loads_json_list(str(ids_json))
-        if not ids:
-            return ""
-        chunks = [ev_store.get(cid) for cid in ids]
+    def materialize_evidence(ids_json: str, weights_json: str) -> str:
+        ids = _loads_json_list(_safe_str(ids_json))
+        weights = _loads_json_list(_safe_str(weights_json))
+
+        pairs = []
+        m = min(len(ids), len(weights))
+        for i in range(m):
+            try:
+                pairs.append((int(ids[i]), float(weights[i])))
+            except Exception:
+                continue
+
+        if len(ids) > m:
+            for i in range(m, len(ids)):
+                try:
+                    pairs.append((int(ids[i]), 0.0))
+                except Exception:
+                    continue
+
+        pairs.sort(key=lambda x: x[1], reverse=True)
+        chunks = [ev_store.get(cid) for cid, _ in pairs]
         return _truncate(evidence_join_delim.join([c for c in chunks if c]))
 
-    # Heuristics consistent with Step 3 vocab
     device_re = re.compile(
         r"\b("
         r"picc|peripherally inserted central catheter|central venous catheter|cvc|"
@@ -2637,7 +2215,8 @@ def create_fixed_mimic_test_eval_parquet(
     uncertainty_re = re.compile(
         r"\b("
         r"may|might|possible|likely|cannot exclude|cannot be excluded|"
-        r"limited|limitation|poorly assessed|not well seen|underlying .* cannot be excluded"
+        r"limited|limitation|poorly assessed|not well seen|underlying .* cannot be excluded|"
+        r"uncertain"
         r")\b",
         re.IGNORECASE,
     )
@@ -2652,11 +2231,10 @@ def create_fixed_mimic_test_eval_parquet(
 
     def label_vs_extractive_flag(qa_type: str) -> str:
         t = str(qa_type).strip().lower()
-        if t in {"label_presence", "multi_label_conjunction", "device_presence"}:
-            return "label"
-        return "extractive"
+        if t in {"normality_statement", "finding_presence"}:
+            return "closed_form"
+        return "other"
 
-    # Step 4C required input columns (NO evidence_text in file)
     required_in_cols = [
         "qa_row_id",
         "subject_id",
@@ -2666,7 +2244,10 @@ def create_fixed_mimic_test_eval_parquet(
         "question",
         "answer_target",
         "claim_text",
+        "supporting_span",
+        "retrieval_query",
         "evidence_chunk_ids_json",
+        "evidence_weights_json",
         "soft_support_score",
     ]
 
@@ -2686,7 +2267,10 @@ def create_fixed_mimic_test_eval_parquet(
             ("question", pa.string()),
             ("answer_target", pa.string()),
             ("claim_text", pa.string()),
+            ("supporting_span", pa.string()),
+            ("retrieval_query", pa.string()),
             ("evidence_chunk_ids_json", pa.string()),
+            ("evidence_weights_json", pa.string()),
             ("evidence_text", pa.string()),
             ("soft_support_score", pa.float32()),
             ("report_length_bucket", pa.string()),
@@ -2699,9 +2283,8 @@ def create_fixed_mimic_test_eval_parquet(
     writer = pq.ParquetWriter(str(out_path), schema=out_schema, compression=parquet_compression)
 
     total_rows = pf.metadata.num_rows if pf.metadata is not None else 0
-    pbar = tqdm(total=total_rows, desc="Phase 1: freezing mimic_test_eval.parquet", unit="rows", miniters=1)
+    pbar = tqdm(total=total_rows, desc="Freezing mimic_test_eval.parquet", unit="rows", miniters=1)
 
-    # Streaming summary (to store the “prints” into manifest)
     subj_set: set[int] = set()
     qa_type_ctr = Counter()
     bucket_ctr = Counter()
@@ -2726,24 +2309,39 @@ def create_fixed_mimic_test_eval_parquet(
 
             d = df.loc[mask].copy()
 
-            # Types
             d["qa_row_id"] = pd.to_numeric(d["qa_row_id"], errors="coerce").fillna(-1).astype(np.int64)
             d["subject_id"] = pd.to_numeric(d["subject_id"], errors="coerce").fillna(-1).astype(np.int64)
             d["soft_support_score"] = pd.to_numeric(d["soft_support_score"], errors="coerce").fillna(0.0).astype(np.float32)
 
-            for c in ["split", "qa_type", "case_context", "question", "answer_target", "claim_text", "evidence_chunk_ids_json"]:
+            for c in [
+                "split",
+                "qa_type",
+                "case_context",
+                "question",
+                "answer_target",
+                "claim_text",
+                "supporting_span",
+                "retrieval_query",
+                "evidence_chunk_ids_json",
+                "evidence_weights_json",
+            ]:
                 d[c] = d[c].astype(str)
 
-            # Materialize evidence text from ids
-            d["evidence_text"] = d["evidence_chunk_ids_json"].map(materialize_evidence).astype(str)
+            d["evidence_text"] = [
+                materialize_evidence(ids_json, weights_json)
+                for ids_json, weights_json in zip(
+                    d["evidence_chunk_ids_json"].tolist(),
+                    d["evidence_weights_json"].tolist(),
+                )
+            ]
 
-            # Derived tags
             d["report_length_bucket"] = d["case_context"].map(report_length_bucket).astype(str)
             d["device_present"] = d["case_context"].map(lambda x: 1 if device_re.search(str(x)) else 0).astype(np.int8)
-            d["uncertainty_present"] = d["case_context"].map(lambda x: 1 if uncertainty_re.search(str(x)) else 0).astype(np.int8)
+            d["uncertainty_present"] = (
+                d["case_context"].map(lambda x: 1 if uncertainty_re.search(str(x)) else 0).astype(np.int8)
+            )
             d["label_vs_extractive"] = d["qa_type"].map(label_vs_extractive_flag).astype(str)
 
-            # Update streaming summary
             subj_set.update(map(int, d["subject_id"].tolist()))
             qa_type_ctr.update(d["qa_type"].tolist())
             bucket_ctr.update(d["report_length_bucket"].tolist())
@@ -2752,7 +2350,6 @@ def create_fixed_mimic_test_eval_parquet(
             label_ctr.update(d["label_vs_extractive"].tolist())
             target_stats.update(d["soft_support_score"].to_numpy())
 
-            # Column order
             d = d[
                 [
                     "qa_row_id",
@@ -2763,7 +2360,10 @@ def create_fixed_mimic_test_eval_parquet(
                     "question",
                     "answer_target",
                     "claim_text",
+                    "supporting_span",
+                    "retrieval_query",
                     "evidence_chunk_ids_json",
+                    "evidence_weights_json",
                     "evidence_text",
                     "soft_support_score",
                     "report_length_bucket",
@@ -2784,7 +2384,6 @@ def create_fixed_mimic_test_eval_parquet(
         pbar.close()
         writer.close()
 
-    # Build the exact “print block” info for manifest + printing
     summary = {
         "basic_info": {
             "rows": int(kept),
@@ -2845,6 +2444,7 @@ def create_fixed_mimic_test_eval_parquet(
             "preload_evidence_texts": bool(preload_evidence_texts),
             "evidence_join_delim": evidence_join_delim,
             "max_evidence_chars": int(max_evidence_chars),
+            "ordering": "descending evidence_weights_json",
         },
         "params": {
             "parquet_batch_rows": int(parquet_batch_rows),
@@ -2861,7 +2461,7 @@ def create_fixed_mimic_test_eval_parquet(
             "input_rows_seen": int(written),
             "rows_written": int(kept),
         },
-        "prints_saved": summary,  # <-- everything that used to be printed
+        "prints_saved": summary,
     }
 
     if write_manifest_json:
@@ -2873,7 +2473,6 @@ def create_fixed_mimic_test_eval_parquet(
         print(f"Wrote: {out_path.parent / 'manifest_phase1_test_eval.json'}")
 
     return manifest
-
 
 
 
@@ -2896,97 +2495,100 @@ if __name__ == "__main__":
 
 
     ''' step 1 '''
-    builder = MimicCaseContextBuilder(
-        master_csv=os.path.join(base_path_mimicData, "mimic_master_list_forReports.csv"),
-        reports_root=base_path_mimicData,
-        out_path="mimic_case_contexts.csv",
-    )
-    out_df = builder.build_case_context_table()
-    print(out_df[["report_rel_path", "case_context"]].head(3))
-    print("Rows:", len(out_df))
-
-
+    # builder = MimicCaseContextBuilder(
+    #     master_csv=os.path.join(base_path_mimicData, "mimic_master_list_forReports.csv"),
+    #     reports_root=base_path_mimicData,
+    #     out_path="mimic_case_contexts.csv",
+    # )
+    # out_df = builder.build_case_context_table()
+    # print(out_df[["report_rel_path", "case_context"]].head(3))
+    # print("Rows:", len(out_df))
 
     ''' step 2 '''
-    builder = MimicFactTableBuilder(
-        master_csv=os.path.join(base_path_mimicData, "mimic_master_list_forReports.csv"),
-        case_context_csv=os.path.join(base_path_mimicData, "mimic_case_contexts.csv"),
-        out_path="mimic_facts_long.csv",
-    )
-    facts_df = builder.build_fact_table()
-    print(facts_df.head(10))
-    print("n_facts:", len(facts_df))
+    # builder = MimicFactTableBuilder(
+    #     master_csv=os.path.join(base_path_mimicData, "mimic_master_list_forReports.csv"),
+    #     case_context_csv=os.path.join(base_path_mimicData, "mimic_case_contexts.csv"),
+    #     out_path=os.path.join(base_path_mimicData, "mimic_facts_long.csv"),
+    # )
+    # reports_df = builder.build_fact_table()
+    # print(reports_df.head(10))
+    # print("n_reports:", len(reports_df))
+    # print(reports_df.columns.tolist())
 
 
-
-    ''' step 3 '''
-    builder = MimicQATableBuilder(
-        facts_long_csv=os.path.join(base_path_mimicData, "mimic_facts_long.csv"),
-        out_path="mimic_qa_step3.csv",
-    )
-    qa_df = builder.build_qa_table()
-    print("QA rows:", len(qa_df))
-    print(qa_df[["qa_type", "question", "answer_target"]].head(10))
-
-
-
-
-    ''' step 4a: RadiopaediaSnapshot_v1 (chunking only, no embeddings) '''
-    builder = RadiopaediaSnapshotBuilder(
-        in_dir=os.path.join(base_path_evidenceData, "articles_clean_txt"),  # folder with ~17k *.txt
-        out_dir=base_path_evidenceData,
-        snapshot_name=params['Preprocessing']['snapshot_name'],
-        tokenizer_name=params['Preprocessing']['tokenizer_name'],
-        target_tokens=200,
-        min_tokens=50,
-        write_csv=False,  # parquet is preferred
-    )
-    chunks_df = builder.run()
-    print(chunks_df.head(10))
-    print("n_chunks:", len(chunks_df))
-    print("n_articles:", chunks_df["article_id"].nunique())
-    print(chunks_df[["chunk_id", "article_id", "article_title", "chunk_token_count"]].head(10))
+    # ''' step 3 '''
+    # builder = MimicQATableBuilder(
+    #     facts_long_csv=os.path.join(base_path_mimicData, "mimic_facts_long.csv"),
+    #     out_path=os.path.join(base_path_mimicData, "mimic_qa_step3.csv"),
+    #     add_normality=True,
+    #     add_finding_presence=True,
+    # )
+    # qa_df = builder.build_qa_table()
+    # print("QA rows:", len(qa_df))
+    # print(qa_df["qa_type"].value_counts())
+    # print(qa_df[["qa_type", "question", "answer_target", "claim_text", "supporting_span"]].head(10))
 
 
-
-
-
-    ''' step 4b '''
-    builder = RadiopaediaWeakEvidenceAligner(
-        qa_csv=os.path.join(base_path_mimicData, "mimic_qa_step3.csv"),
-        chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
-        out_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step4b.parquet"),
-        model_name=params['Preprocessing']['tokenizer_name'],
-        top_k=20,
-        alpha=0.85,
-        temperature=0.07,  # keep >0; deterministic with fixed seeds + eval()
-        seed=13,
-        cache_dir=os.path.join(base_path_evidenceData, "cache_step4b"),
-        device="cuda",
-        # device="cpu",
-        force_cpu_faiss=True,
-    )
-    builder.run()
+    # ''' step 4a: RadiopaediaSnapshot_v1 (chunking only, no embeddings) '''
+    # builder = RadiopaediaSnapshotBuilder(
+    #     in_dir=os.path.join(base_path_evidenceData, "articles_clean_txt"),  # folder with ~17k *.txt
+    #     out_dir=base_path_evidenceData,
+    #     snapshot_name=params['Preprocessing']['snapshot_name'],
+    #     tokenizer_name=params['Preprocessing']['tokenizer_name'],
+    #     target_tokens=200,
+    #     min_tokens=50,
+    #     write_csv=False,  # parquet is preferred
+    # )
+    # chunks_df = builder.run()
+    # print(chunks_df.head(10))
+    # print("n_chunks:", len(chunks_df))
+    # print("n_articles:", chunks_df["article_id"].nunique())
+    # print(chunks_df[["chunk_id", "article_id", "article_title", "chunk_token_count"]].head(10))
 
 
 
 
-    ''' step 4c '''
-    builder = RadiopaediaStep4CSupervisionBuilder(
-        qa_csv=os.path.join(base_path_mimicData, "mimic_qa_step3.csv"),
-        weak_alignment_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step4b.parquet"),
-        out_dir=os.path.join(base_path_evidenceData, "step4c_supervision"),
-        top_k=20,
-        min_weight=0.0,
-        qa_chunksize_rows=50_000,
-        parquet_batch_rows=50_000,
-        subject_id_col="subject_id",  # must exist in mimic_qa_step3.csv
-        split_seed=13,
-        frac_train=0.75,
-        frac_valid=0.10,
-        frac_test=0.15,
-    )
-    builder.run()
+
+    # ''' step 4b '''
+    # builder = RadiopaediaWeakEvidenceAligner(
+    #     qa_csv=os.path.join(base_path_mimicData, "mimic_qa_step3.csv"),
+    #     chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
+    #     out_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step4b.parquet"),
+    #     model_name=params["Preprocessing"]["tokenizer_name"],
+    #     max_query_tokens=128,
+    #     max_doc_tokens=256,
+    #     top_k=20,
+    #     alpha=0.85,
+    #     temperature=0.07,
+    #     seed=13,
+    #     cache_dir=os.path.join(base_path_evidenceData, "cache_step4b"),
+    #     device="cuda",
+    #     force_cpu_faiss=True,
+    # )
+    # builder.run()
+    #
+    #
+    #
+    #
+    # ''' step 4c '''
+    # builder = RadiopaediaStep4CSupervisionBuilder(
+    #     qa_csv=os.path.join(base_path_mimicData, "mimic_qa_step3.csv"),
+    #     weak_alignment_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step4b.parquet"),
+    #     out_dir=os.path.join(base_path_evidenceData, "step4c_supervision"),
+    #     subject_id_col="subject_id",
+    #     qa_row_id_col="qa_row_id",
+    #     top_k=20,
+    #     min_weight=0.0,
+    #     qa_chunksize_rows=50_000,
+    #     parquet_batch_rows=50_000,
+    #     split_seed=13,
+    #     frac_train=0.75,
+    #     frac_valid=0.10,
+    #     frac_test=0.15,
+    #     normalize_soft_support=True,
+    # )
+    # builder.run()
+
 
 
     ''' Creating the final mimic eval parquet from Step 4C '''
