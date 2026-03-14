@@ -25,6 +25,9 @@ import numpy as np
 import os
 import yaml
 from collections import Counter
+import math
+import pickle
+import heapq
 
 
 import warnings
@@ -933,10 +936,13 @@ class WeakAlignmentRow:
     claim_text: str
     supporting_span: str
     retrieval_query: str
+    alignment_status: str
     retrieved_chunk_ids_json: str
+    support_snippets_json: str
     support_weights_json: str
     embed_scores_json: str
     lexical_scores_json: str
+    local_match_scores_json: str
     combined_scores_json: str
 
 
@@ -950,6 +956,17 @@ class RadiopaediaWeakEvidenceAligner:
 
     Output:
       - out_parquet: per-QA row with top-k retrieved chunk_ids + soft weights
+
+    Foundational changes vs old version:
+      - retrieval is case-grounded, not claim-only
+      - case-specific anchors are extracted from supporting_span and case_context
+      - retrieval query uses claim + compressed anchor set, not raw supporting span
+      - reranking rewards evidence only when claim-state and case anchors align in the same snippet
+      - contradiction inside chunk is explicitly penalized
+      - generic concept-only chunks are penalized
+      - abstention is allowed when support is not case-specific enough
+      - best supporting snippet per chunk is stored for downstream supervision
+      - deterministic tie-breaking by combined score, local score, chunk_id
     """
 
     def __init__(
@@ -961,17 +978,33 @@ class RadiopaediaWeakEvidenceAligner:
         max_query_tokens: int = 256,
         max_doc_tokens: int = 256,
         top_k: int = 20,
+        dense_pool_k: int = 100,
+        lexical_pool_k: int = 100,
         qa_batch_size: int = 256,
         doc_batch_size: int = 128,
-        alpha: float = 0.85,
-        temperature: float = 0.07,
+        alpha: float = 0.60,
+        temperature: float = 0.20,
+        local_match_weight: float = 1.75,
+        anchor_match_weight: float = 2.50,
+        contradiction_weight: float = 2.25,
+        generic_penalty_weight: float = 0.75,
+        min_local_match_score: float = 0.75,
+        min_anchor_match_score: float = 0.20,
+        min_combined_score: float = 0.25,
+        max_anchor_terms: int = 8,
+        max_anchor_phrases: int = 6,
+        allow_empty_when_no_match: bool = True,
+        use_question_in_query: bool = False,
+        use_qa_type_prefix: bool = False,
         cache_dir: Optional[str | Path] = None,
         faiss_index_name: str = "radiopaedia_flatip.index",
         chunk_embeds_name: str = "radiopaedia_chunk_embeds.npy",
+        bm25_cache_name: str = "radiopaedia_bm25_cache.pkl",
         qa_row_id_col: str = "qa_row_id",
         question_col: str = "question",
         claim_col: str = "claim_text",
         supporting_span_col: str = "supporting_span",
+        case_context_col: str = "case_context",
         report_path_col: str = "report_rel_path",
         qa_type_col: str = "qa_type",
         chunk_id_col: str = "chunk_id",
@@ -992,22 +1025,40 @@ class RadiopaediaWeakEvidenceAligner:
         self.max_doc_tokens = int(max_doc_tokens)
 
         self.top_k = int(top_k)
+        self.dense_pool_k = int(max(dense_pool_k, top_k))
+        self.lexical_pool_k = int(max(lexical_pool_k, top_k))
         self.qa_batch_size = int(qa_batch_size)
         self.doc_batch_size = int(doc_batch_size)
 
         self.alpha = float(alpha)
         self.temperature = float(temperature)
+        self.local_match_weight = float(local_match_weight)
+        self.anchor_match_weight = float(anchor_match_weight)
+        self.contradiction_weight = float(contradiction_weight)
+        self.generic_penalty_weight = float(generic_penalty_weight)
+        self.min_local_match_score = float(min_local_match_score)
+        self.min_anchor_match_score = float(min_anchor_match_score)
+        self.min_combined_score = float(min_combined_score)
+
+        self.max_anchor_terms = int(max_anchor_terms)
+        self.max_anchor_phrases = int(max_anchor_phrases)
+
+        self.allow_empty_when_no_match = bool(allow_empty_when_no_match)
+        self.use_question_in_query = bool(use_question_in_query)
+        self.use_qa_type_prefix = bool(use_qa_type_prefix)
 
         self.cache_dir = Path(cache_dir) if cache_dir else self.out_parquet.parent
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.faiss_index_path = self.cache_dir / faiss_index_name
         self.chunk_embeds_path = self.cache_dir / chunk_embeds_name
+        self.bm25_cache_path = self.cache_dir / bm25_cache_name
 
         self.qa_row_id_col = str(qa_row_id_col)
         self.question_col = str(question_col)
         self.claim_col = str(claim_col)
         self.supporting_span_col = str(supporting_span_col)
+        self.case_context_col = str(case_context_col)
         self.report_path_col = str(report_path_col)
         self.qa_type_col = str(qa_type_col)
 
@@ -1022,9 +1073,103 @@ class RadiopaediaWeakEvidenceAligner:
         self.parquet_compression = str(parquet_compression)
 
         self._word_re = re.compile(r"[a-z0-9]+")
+        self._sent_split_re = re.compile(r"(?<=[\.\?\!])\s+")
         self._tokenizer: Optional[AutoTokenizer] = None
         self._model: Optional[AutoModel] = None
         self._pa_schema: Optional[pa.Schema] = None
+
+        self._bm25_state: Optional[Dict[str, object]] = None
+        self._chunk_text_map: Optional[Dict[int, str]] = None
+
+        self.negation_re = re.compile(
+            r"\b("
+            r"no|without|absent|negative for|free of|neither|"
+            r"no evidence of|no definite|no focal|no sign of|no signs of"
+            r")\b",
+            re.IGNORECASE,
+        )
+        self.uncertainty_re = re.compile(
+            r"\b("
+            r"may|might|possible|possibly|probable|probably|likely|unlikely|"
+            r"suggesting|suggestive of|cannot exclude|cannot be excluded|"
+            r"difficult to exclude|concerning for|suspicious for|question of|"
+            r"could represent|may represent|appears to|appearance of|"
+            r"rule out|r/o|rather than|versus|vs\b"
+            r")\b",
+            re.IGNORECASE,
+        )
+        self.resolution_re = re.compile(
+            r"\b("
+            r"resolved|has resolved|have resolved|essentially resolved|near complete resolution|"
+            r"cleared|has cleared|have cleared|improved|markedly improved|significantly improved|"
+            r"decreased|markedly decreased|significantly decreased|diminished"
+            r")\b",
+            re.IGNORECASE,
+        )
+        self.generic_penalty_re = re.compile(
+            r"\b("
+            r"summary|reference article|more references needed|peer review|"
+            r"these were assessed during peer review|paid speaker|shareholder|"
+            r"ongoing|micro - x ltd|philips australia|diagnostic criteria|"
+            r"epidemiology|pathology|treatment and prognosis|differential diagnosis|"
+            r"classification|staging|risk factors|etiology|aetiology"
+            r")\b",
+            re.IGNORECASE,
+        )
+        self.author_noise_re = re.compile(
+            r"\b("
+            r"jeremy jones|stefan tigges|henry knipe|craig hacking|"
+            r"behrang amini|andrew murphy|yuranga weerakkody|yahya baba|"
+            r"luke danaher|yi - jin kuok"
+            r")\b",
+            re.IGNORECASE,
+        )
+        self.normality_re = re.compile(
+            r"\b("
+            r"no acute cardiopulmonary (process|abnormality)|"
+            r"no acute intrathoracic process|"
+            r"no acute chest abnormality"
+            r")\b",
+            re.IGNORECASE,
+        )
+
+        self.finding_patterns: Dict[str, re.Pattern] = {
+            "pleural effusion": re.compile(r"\bpleural effusions?\b|\beffusions?\b", re.IGNORECASE),
+            "pneumothorax": re.compile(r"\bpneumothorax\b|\bpneumothoraces\b", re.IGNORECASE),
+            "cardiomegaly": re.compile(
+                r"\bcardiomegaly\b|\benlarged cardiac silhouette\b|\bcardiac silhouette is enlarged\b|\benlarged heart\b",
+                re.IGNORECASE,
+            ),
+            "atelectasis": re.compile(r"\batelecta(?:sis|tic)\b", re.IGNORECASE),
+            "consolidation": re.compile(r"\bconsolidation\b", re.IGNORECASE),
+            "acute cardiopulmonary abnormality": self.normality_re,
+        }
+
+        self._stop_terms = {
+            "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "without",
+            "is", "are", "was", "were", "be", "been", "this", "that", "these", "those",
+            "there", "here", "from", "into", "at", "by", "as", "it", "its", "than", "then",
+            "study", "exam", "examination", "report", "shows", "show", "seen", "present",
+            "absent", "uncertain", "question", "claim", "finding", "findings", "impression",
+            "acute", "cardiopulmonary", "abnormality", "process", "described", "showing",
+            "describes", "evidence", "suggest", "suggests", "suggested", "consistent",
+            "compatible", "could", "would", "should", "can", "cannot", "not", "likely",
+            "possible", "possibly", "probably", "versus", "vs", "mildly", "moderately",
+            "severely", "slightly", "somewhat",
+        }
+
+        self._anchor_keep_phrases = [
+            "left", "right", "bilateral", "bibasilar", "basilar", "apical", "retrocardiac",
+            "perihilar", "upper", "lower", "mid", "base", "bases", "lung bases",
+            "right base", "left base", "right upper", "left upper", "right lower", "left lower",
+            "small", "trace", "moderate", "large", "massive", "focal", "patchy", "multifocal",
+            "diffuse", "persistent", "unchanged", "new", "increased", "decreased", "improved",
+            "worsened", "worsening", "adjacent", "low lung volumes", "pulmonary edema",
+            "vascular congestion", "airspace opacity", "airspace opacities", "pneumonia",
+            "infection", "aspiration", "edema", "opacity", "opacities", "effusion", "effusions",
+            "atelectatic", "atelectatic change", "cardiac silhouette", "cardiomediastinal silhouette",
+            "hyperinflation", "hyperinflated", "pleural", "left pleural", "right pleural",
+        ]
 
         self._set_determinism()
 
@@ -1066,28 +1211,169 @@ class RadiopaediaWeakEvidenceAligner:
             return []
         return self._word_re.findall(s)
 
-    def _lexical_overlap(self, query: str, doc: str) -> float:
-        q = self._tokenize_words(query)
-        if not q:
-            return 0.0
-        qset = set(q)
-        dset = set(self._tokenize_words(doc))
-        if not dset:
-            return 0.0
-        return float(len(qset.intersection(dset))) / float(len(qset))
+    def _split_sentences(self, text: str) -> List[str]:
+        t = self._safe_str(text)
+        t = t.replace("\r\n", "\n").replace("\r", "\n")
+        t = re.sub(r"\s+", " ", t).strip()
+        if not t:
+            return []
+        sents = [x.strip() for x in self._sent_split_re.split(t) if x and x.strip()]
+        return [x for x in sents if len(x) >= 8]
 
-    def _build_retrieval_query(self, question: str, claim_text: str, supporting_span: str) -> str:
-        parts: List[str] = []
-        q = self._safe_str(question).strip()
+    def _infer_claim_state(self, claim_text: str) -> str:
+        c = self._normalize_text(claim_text)
+        if c.endswith(" is present"):
+            return "present"
+        if c.endswith(" is absent"):
+            return "absent"
+        if c.endswith(" is uncertain"):
+            return "uncertain"
+        return "unknown"
+
+    def _infer_claim_concept(self, claim_text: str) -> str:
         c = self._safe_str(claim_text).strip()
-        s = self._safe_str(supporting_span).strip()
+        for suffix in [" is present", " is absent", " is uncertain"]:
+            if c.endswith(suffix):
+                return c[: -len(suffix)].strip()
+        return c
 
-        if q:
-            parts.extend(["QUESTION:", q])
+    def _get_concept_pattern(self, concept: str) -> re.Pattern:
+        if concept in self.finding_patterns:
+            return self.finding_patterns[concept]
+        return re.compile(r"\b" + re.escape(concept) + r"\b", re.IGNORECASE)
+
+    def _concept_token_set(self, concept: str) -> Set[str]:
+        toks = set(self._tokenize_words(concept))
+        extra = set()
+        if concept == "pleural effusion":
+            extra.update({"effusion", "effusions", "pleural"})
+        elif concept == "pneumothorax":
+            extra.update({"pneumothorax", "pneumothoraces"})
+        elif concept == "cardiomegaly":
+            extra.update({"cardiomegaly", "cardiac", "silhouette", "enlarged", "heart"})
+        elif concept == "atelectasis":
+            extra.update({"atelectasis", "atelectatic"})
+        elif concept == "consolidation":
+            extra.update({"consolidation"})
+        elif concept == "acute cardiopulmonary abnormality":
+            extra.update({"acute", "cardiopulmonary", "abnormality", "process"})
+        return toks | extra
+
+    def _state_token_set(self) -> Set[str]:
+        return {
+            "present", "absent", "uncertain", "no", "without", "negative", "possible",
+            "possibly", "likely", "unlikely", "cannot", "exclude", "excluded",
+            "resolved", "improved", "decreased", "increased",
+        }
+
+    def _extract_anchor_terms(
+        self,
+        supporting_span: str,
+        case_context: str,
+        concept: str,
+        qa_type: str,
+    ) -> Tuple[List[str], List[str]]:
+        concept_toks = self._concept_token_set(concept)
+        banned = concept_toks | self._state_token_set() | self._stop_terms
+
+        primary = self._normalize_text(supporting_span)
+        secondary = self._normalize_text(case_context)
+
+        term_order: List[str] = []
+        seen_terms: Set[str] = set()
+
+        def add_term(tok: str) -> None:
+            if not tok:
+                return
+            if tok in banned:
+                return
+            if len(tok) <= 2:
+                return
+            if tok.isdigit():
+                return
+            if tok in seen_terms:
+                return
+            seen_terms.add(tok)
+            term_order.append(tok)
+
+        for tok in self._tokenize_words(primary):
+            add_term(tok)
+
+        if len(term_order) < self.max_anchor_terms:
+            pat = self._get_concept_pattern(concept)
+            for sent in self._split_sentences(secondary):
+                if not pat.search(sent):
+                    continue
+                for tok in self._tokenize_words(sent):
+                    add_term(tok)
+                    if len(term_order) >= self.max_anchor_terms:
+                        break
+                if len(term_order) >= self.max_anchor_terms:
+                    break
+
+        phrase_order: List[str] = []
+        seen_phrases: Set[str] = set()
+
+        raw_text = f"{primary} || {secondary}"
+        for phr in self._anchor_keep_phrases:
+            phr_norm = self._normalize_text(phr)
+            if not phr_norm:
+                continue
+            if phr_norm in raw_text and phr_norm not in seen_phrases:
+                seen_phrases.add(phr_norm)
+                phrase_order.append(phr_norm)
+                if len(phrase_order) >= self.max_anchor_phrases:
+                    break
+
+        tokens_primary = self._tokenize_words(primary)
+        candidate_phrases: List[str] = []
+        for n in [3, 2]:
+            for i in range(0, max(0, len(tokens_primary) - n + 1)):
+                gram = tokens_primary[i:i + n]
+                if any(t in banned for t in gram):
+                    continue
+                if sum(len(t) >= 3 for t in gram) < n:
+                    continue
+                phrase = " ".join(gram)
+                candidate_phrases.append(phrase)
+
+        for phr in candidate_phrases:
+            if phr in seen_phrases:
+                continue
+            seen_phrases.add(phr)
+            phrase_order.append(phr)
+            if len(phrase_order) >= self.max_anchor_phrases:
+                break
+
+        return term_order[: self.max_anchor_terms], phrase_order[: self.max_anchor_phrases]
+
+    def _build_retrieval_query(
+        self,
+        question: str,
+        claim_text: str,
+        qa_type: str,
+        anchor_terms: List[str],
+        anchor_phrases: List[str],
+    ) -> str:
+        parts: List[str] = []
+
+        c = self._safe_str(claim_text).strip()
+        q = self._safe_str(question).strip()
+        t = self._safe_str(qa_type).strip()
+
+        if self.use_qa_type_prefix and t:
+            parts.append(t)
+
         if c:
-            parts.extend(["CLAIM:", c])
-        if s:
-            parts.extend(["REPORT_EVIDENCE_HINT:", s])
+            parts.append(c)
+
+        if anchor_phrases:
+            parts.append("ANCHORS: " + " ; ".join(anchor_phrases[: self.max_anchor_phrases]))
+        elif anchor_terms:
+            parts.append("ANCHORS: " + " ".join(anchor_terms[: self.max_anchor_terms]))
+
+        if self.use_question_in_query and q:
+            parts.append(q)
 
         return "\n\n".join(parts).strip()
 
@@ -1199,6 +1485,108 @@ class RadiopaediaWeakEvidenceAligner:
         faiss.write_index(index, str(self.faiss_index_path))
         return index
 
+    def _build_or_load_bm25_state(self, chunks_df: pd.DataFrame) -> Dict[str, object]:
+        if self.bm25_cache_path.exists():
+            with open(self.bm25_cache_path, "rb") as f:
+                return pickle.load(f)
+
+        chunk_ids = chunks_df[self.chunk_id_col].to_numpy(dtype=np.int64)
+        chunk_texts = chunks_df[self.chunk_text_col].tolist()
+
+        postings: Dict[str, List[Tuple[int, int]]] = {}
+        dfreq: Dict[str, int] = {}
+        doc_len = np.zeros(len(chunk_texts), dtype=np.int32)
+
+        for doc_idx, txt in enumerate(tqdm(chunk_texts, desc="Building BM25 cache", unit="docs", miniters=1)):
+            toks = self._tokenize_words(txt)
+            doc_len[doc_idx] = len(toks)
+
+            if not toks:
+                continue
+
+            tf: Dict[str, int] = {}
+            for w in toks:
+                tf[w] = tf.get(w, 0) + 1
+
+            for w, c in tf.items():
+                postings.setdefault(w, []).append((doc_idx, c))
+                dfreq[w] = dfreq.get(w, 0) + 1
+
+        n_docs = len(chunk_texts)
+        avgdl = float(doc_len.mean()) if n_docs > 0 else 0.0
+
+        idf: Dict[str, float] = {}
+        for w, dfw in dfreq.items():
+            idf[w] = float(math.log(1.0 + (n_docs - dfw + 0.5) / (dfw + 0.5)))
+
+        state = {
+            "chunk_ids": chunk_ids,
+            "postings": postings,
+            "idf": idf,
+            "doc_len": doc_len,
+            "avgdl": avgdl,
+            "k1": 1.2,
+            "b": 0.75,
+        }
+
+        with open(self.bm25_cache_path, "wb") as f:
+            pickle.dump(state, f)
+
+        return state
+
+    def _bm25_topk(self, query: str, top_k: int) -> Tuple[List[int], List[float]]:
+        assert self._bm25_state is not None
+
+        toks = self._tokenize_words(query)
+        if not toks:
+            return [], []
+
+        chunk_ids = self._bm25_state["chunk_ids"]
+        postings = self._bm25_state["postings"]
+        idf = self._bm25_state["idf"]
+        doc_len = self._bm25_state["doc_len"]
+        avgdl = float(self._bm25_state["avgdl"])
+        k1 = float(self._bm25_state["k1"])
+        b = float(self._bm25_state["b"])
+
+        scores: Dict[int, float] = {}
+
+        for t in toks:
+            plist = postings.get(t, None)
+            if not plist:
+                continue
+
+            idft = float(idf.get(t, 0.0))
+            for doc_idx, tf in plist:
+                dl = float(doc_len[doc_idx])
+                denom = tf + k1 * (1.0 - b + b * (dl / (avgdl + 1e-12)))
+                s = idft * (tf * (k1 + 1.0)) / (denom + 1e-12)
+                scores[doc_idx] = scores.get(doc_idx, 0.0) + float(s)
+
+        if not scores:
+            return [], []
+
+        best = heapq.nlargest(top_k, scores.items(), key=lambda x: (x[1], -int(chunk_ids[x[0]])))
+        doc_idxs = [int(d) for d, _ in best]
+        vals = [float(s) for _, s in best]
+
+        ids = [int(chunk_ids[d]) for d in doc_idxs]
+        return ids, vals
+
+    def _standardize_scores(self, xs: List[float]) -> List[float]:
+        if not xs:
+            return []
+
+        arr = np.asarray(xs, dtype=np.float32)
+        mu = float(arr.mean())
+        sd = float(arr.std())
+
+        if sd <= 1e-8:
+            return [0.0 for _ in xs]
+
+        z = (arr - mu) / sd
+        return [float(x) for x in z.tolist()]
+
     def _softmax(self, x: np.ndarray) -> np.ndarray:
         x = x.astype(np.float32)
         x = x - np.max(x)
@@ -1216,6 +1604,296 @@ class RadiopaediaWeakEvidenceAligner:
             return w
         return self._softmax(combined / float(self.temperature)).astype(np.float32)
 
+    def _generic_chunk_penalty(self, text: str) -> float:
+        t = self._safe_str(text)
+        penalty = 0.0
+
+        if self.generic_penalty_re.search(t):
+            penalty += 1.0
+
+        if self.author_noise_re.search(t):
+            penalty += 1.0
+
+        toks = self._tokenize_words(t)
+        if len(toks) > 350:
+            penalty += 0.25
+
+        if t.count(":") >= 8:
+            penalty += 0.25
+
+        return float(penalty)
+
+    def _classify_sentence_state(
+        self,
+        sent: str,
+        concept: str,
+        qa_type: str,
+        pat: re.Pattern,
+    ) -> Optional[str]:
+        s = self._safe_str(sent)
+
+        if qa_type == "normality_statement":
+            if self.normality_re.search(s):
+                if self.uncertainty_re.search(s):
+                    return "uncertain"
+                return "absent"
+            return None
+
+        m = pat.search(s)
+        if not m:
+            return None
+
+        lo = max(0, m.start() - 100)
+        hi = min(len(s), m.end() + 100)
+        window = s[lo:hi]
+
+        has_neg = bool(self.negation_re.search(window))
+        has_unc = bool(self.uncertainty_re.search(window))
+        has_res = bool(self.resolution_re.search(window))
+
+        if has_neg:
+            return "absent"
+        if has_unc and has_res:
+            return "uncertain"
+        if has_unc:
+            return "uncertain"
+        if has_res:
+            return "absent"
+        return "present"
+
+    def _score_sentence_state_match(
+        self,
+        sent: str,
+        concept: str,
+        qa_type: str,
+        target_state: str,
+        pat: re.Pattern,
+    ) -> Tuple[float, Optional[str]]:
+        state = self._classify_sentence_state(sent, concept, qa_type, pat)
+        if state is None:
+            return -1e9, None
+
+        score = 0.0
+
+        if state == target_state:
+            score += 1.0
+        elif target_state == "uncertain" and state in {"present", "absent"}:
+            score -= 0.25
+        else:
+            score -= 1.0
+
+        s_norm = self._normalize_text(sent)
+        concept_norm = self._normalize_text(concept)
+        if concept_norm and concept_norm in s_norm:
+            score += 0.10
+
+        if self.generic_penalty_re.search(sent):
+            score -= 0.15
+
+        return float(score), state
+
+    def _score_sentence_anchor_match(
+        self,
+        sent: str,
+        anchor_terms: List[str],
+        anchor_phrases: List[str],
+    ) -> float:
+        if not anchor_terms and not anchor_phrases:
+            return 0.0
+
+        s_norm = self._normalize_text(sent)
+        sent_toks = set(self._tokenize_words(sent))
+
+        term_hits = 0
+        for tok in anchor_terms:
+            if tok in sent_toks:
+                term_hits += 1
+
+        phrase_hits = 0
+        for phr in anchor_phrases:
+            if phr in s_norm:
+                phrase_hits += 1
+
+        term_score = float(term_hits) / float(len(anchor_terms)) if anchor_terms else 0.0
+        phrase_score = float(phrase_hits) / float(len(anchor_phrases)) if anchor_phrases else 0.0
+
+        score = 0.60 * term_score + 1.00 * phrase_score
+        return float(score)
+
+    def _best_local_support(
+        self,
+        chunk_text: str,
+        concept: str,
+        qa_type: str,
+        target_state: str,
+        anchor_terms: List[str],
+        anchor_phrases: List[str],
+    ) -> Tuple[float, float, float, float, str]:
+        sents = self._split_sentences(chunk_text)
+        if not sents:
+            return -1e9, -1e9, -1e9, -1e9, ""
+
+        pat = self._get_concept_pattern(concept)
+
+        best_support_score = -1e9
+        best_support_claim = -1e9
+        best_support_anchor = -1e9
+        best_support_sent = ""
+
+        best_contradiction_score = -1e9
+
+        for sent in sents:
+            claim_score, _ = self._score_sentence_state_match(
+                sent=sent,
+                concept=concept,
+                qa_type=qa_type,
+                target_state=target_state,
+                pat=pat,
+            )
+            if claim_score <= -1e8:
+                continue
+
+            anchor_score = self._score_sentence_anchor_match(
+                sent=sent,
+                anchor_terms=anchor_terms,
+                anchor_phrases=anchor_phrases,
+            )
+
+            local_score = float(self.local_match_weight * claim_score + self.anchor_match_weight * anchor_score)
+
+            if claim_score > 0:
+                if local_score > best_support_score:
+                    best_support_score = float(local_score)
+                    best_support_claim = float(claim_score)
+                    best_support_anchor = float(anchor_score)
+                    best_support_sent = sent
+            else:
+                contradiction_mag = float((-claim_score) + 0.35 * anchor_score)
+                if contradiction_mag > best_contradiction_score:
+                    best_contradiction_score = contradiction_mag
+
+        if best_support_score <= -1e8:
+            return -1e9, -1e9, -1e9, max(best_contradiction_score, -1e9), ""
+
+        return (
+            float(best_support_score),
+            float(best_support_claim),
+            float(best_support_anchor),
+            float(max(best_contradiction_score, 0.0)),
+            self._safe_str(best_support_sent),
+        )
+
+    def _merge_and_rerank_candidates(
+        self,
+        dense_ids: List[int],
+        dense_scores: List[float],
+        lexical_ids: List[int],
+        lexical_scores: List[float],
+        concept: str,
+        qa_type: str,
+        target_state: str,
+        anchor_terms: List[str],
+        anchor_phrases: List[str],
+    ) -> Tuple[List[int], List[str], List[float], List[float], List[float], List[float], str]:
+        assert self._chunk_text_map is not None
+
+        dense_map = {int(i): float(s) for i, s in zip(dense_ids, dense_scores)}
+        lexical_map = {int(i): float(s) for i, s in zip(lexical_ids, lexical_scores)}
+
+        cand_ids = sorted(set(dense_map.keys()) | set(lexical_map.keys()))
+        if not cand_ids:
+            return [], [], [], [], [], [], "empty_candidate_pool"
+
+        dense_raw = [float(dense_map.get(cid, 0.0)) for cid in cand_ids]
+        lexical_raw = [float(lexical_map.get(cid, 0.0)) for cid in cand_ids]
+
+        dense_std = self._standardize_scores(dense_raw)
+        lexical_std = self._standardize_scores(lexical_raw)
+
+        rows: List[Tuple[int, str, float, float, float, float, float]] = []
+
+        for cid, ds, ls, dr, lr in zip(cand_ids, dense_std, lexical_std, dense_raw, lexical_raw):
+            txt = self._chunk_text_map.get(int(cid), "")
+
+            support_local, claim_score, anchor_score, contradiction_score, best_sent = self._best_local_support(
+                chunk_text=txt,
+                concept=concept,
+                qa_type=qa_type,
+                target_state=target_state,
+                anchor_terms=anchor_terms,
+                anchor_phrases=anchor_phrases,
+            )
+
+            penalty = self.generic_penalty_weight * self._generic_chunk_penalty(txt)
+
+            local_net = float(support_local - self.contradiction_weight * max(0.0, contradiction_score))
+            combined = float(self.alpha * ds + (1.0 - self.alpha) * ls + local_net - penalty)
+
+            rows.append(
+                (
+                    int(cid),
+                    self._safe_str(best_sent),
+                    float(dr),
+                    float(lr),
+                    float(claim_score + anchor_score),
+                    float(local_net),
+                    float(combined),
+                )
+            )
+
+        rows.sort(key=lambda x: (-x[6], -x[5], x[0]))
+
+        if self.allow_empty_when_no_match:
+            keep = []
+            for r in rows:
+                snippet = self._safe_str(r[1])
+                semantic_local = float(r[4])
+                local_net = float(r[5])
+                combined = float(r[6])
+
+                local_ok = semantic_local >= self.min_local_match_score
+                anchor_ok = True
+                if anchor_terms or anchor_phrases:
+                    anchor_ok = semantic_local >= (self.min_local_match_score + self.min_anchor_match_score)
+
+                combined_ok = combined >= self.min_combined_score
+                snippet_ok = bool(snippet.strip())
+
+                if local_ok and anchor_ok and combined_ok and snippet_ok:
+                    keep.append(r)
+
+            if not keep:
+                if anchor_terms or anchor_phrases:
+                    return [], [], [], [], [], [], "abstained_no_case_specific_support"
+                return [], [], [], [], [], [], "abstained_no_decision_relevant_support"
+
+            rows = keep
+
+        dedup_rows: List[Tuple[int, str, float, float, float, float, float]] = []
+        seen_snippets: Set[str] = set()
+
+        for r in rows:
+            snippet_key = self._normalize_text(r[1])
+            if snippet_key and snippet_key in seen_snippets:
+                continue
+            if snippet_key:
+                seen_snippets.add(snippet_key)
+            dedup_rows.append(r)
+            if len(dedup_rows) >= self.top_k:
+                break
+
+        if not dedup_rows:
+            return [], [], [], [], [], [], "abstained_after_dedup"
+
+        final_ids = [int(x[0]) for x in dedup_rows]
+        final_snippets = [self._safe_str(x[1]) for x in dedup_rows]
+        final_dense = [float(x[2]) for x in dedup_rows]
+        final_lex = [float(x[3]) for x in dedup_rows]
+        final_local = [float(x[5]) for x in dedup_rows]
+        final_combined = [float(x[6]) for x in dedup_rows]
+
+        return final_ids, final_snippets, final_dense, final_lex, final_local, final_combined, "ok"
+
     def _init_writer(self) -> pq.ParquetWriter:
         self.out_parquet.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1228,10 +1906,13 @@ class RadiopaediaWeakEvidenceAligner:
                 ("claim_text", pa.string()),
                 ("supporting_span", pa.string()),
                 ("retrieval_query", pa.string()),
+                ("alignment_status", pa.string()),
                 ("retrieved_chunk_ids_json", pa.string()),
+                ("support_snippets_json", pa.string()),
                 ("support_weights_json", pa.string()),
                 ("embed_scores_json", pa.string()),
                 ("lexical_scores_json", pa.string()),
+                ("local_match_scores_json", pa.string()),
                 ("combined_scores_json", pa.string()),
             ]
         )
@@ -1252,10 +1933,13 @@ class RadiopaediaWeakEvidenceAligner:
             "claim_text",
             "supporting_span",
             "retrieval_query",
+            "alignment_status",
             "retrieved_chunk_ids_json",
+            "support_snippets_json",
             "support_weights_json",
             "embed_scores_json",
             "lexical_scores_json",
+            "local_match_scores_json",
             "combined_scores_json",
         ]:
             batch_df[c] = batch_df[c].astype(str)
@@ -1270,10 +1954,18 @@ class RadiopaediaWeakEvidenceAligner:
 
         chunks_df = self._load_chunks_table()
         chunk_ids = chunks_df[self.chunk_id_col].to_numpy(dtype=np.int64)
-        chunk_texts = chunks_df[self.chunk_text_col].tolist()
+
+        self._chunk_text_map = {
+            int(cid): self._safe_str(txt)
+            for cid, txt in zip(
+                chunks_df[self.chunk_id_col].tolist(),
+                chunks_df[self.chunk_text_col].tolist(),
+            )
+        }
 
         chunk_embeds = self._build_or_load_chunk_embeddings(chunks_df)
         index = self._build_or_load_faiss_index(chunk_embeds)
+        self._bm25_state = self._build_or_load_bm25_state(chunks_df)
 
         writer = self._init_writer()
         assert self._pa_schema is not None
@@ -1290,6 +1982,9 @@ class RadiopaediaWeakEvidenceAligner:
                     if c not in df.columns:
                         raise ValueError(f"QA CSV missing required column: {c}")
 
+                if self.case_context_col not in df.columns:
+                    df[self.case_context_col] = ""
+
                 if self.qa_row_id_col not in df.columns:
                     df[self.qa_row_id_col] = np.arange(next_qa_row_id, next_qa_row_id + len(df), dtype=np.int64)
 
@@ -1303,17 +1998,46 @@ class RadiopaediaWeakEvidenceAligner:
                 df[self.qa_row_id_col] = df[self.qa_row_id_col].astype(np.int64)
                 next_qa_row_id = int(df[self.qa_row_id_col].max()) + 1
 
-                for c in [self.report_path_col, self.qa_type_col, self.question_col, self.claim_col, self.supporting_span_col]:
+                for c in [
+                    self.report_path_col,
+                    self.qa_type_col,
+                    self.question_col,
+                    self.claim_col,
+                    self.supporting_span_col,
+                    self.case_context_col,
+                ]:
                     df[c] = df[c].astype(str)
 
-                retrieval_queries = [
-                    self._build_retrieval_query(q, c, s)
-                    for q, c, s in zip(
-                        df[self.question_col].tolist(),
-                        df[self.claim_col].tolist(),
-                        df[self.supporting_span_col].tolist(),
+                anchor_terms_per_row: List[List[str]] = []
+                anchor_phrases_per_row: List[List[str]] = []
+                retrieval_queries: List[str] = []
+
+                for q, c, t, s, ctx in zip(
+                    df[self.question_col].tolist(),
+                    df[self.claim_col].tolist(),
+                    df[self.qa_type_col].tolist(),
+                    df[self.supporting_span_col].tolist(),
+                    df[self.case_context_col].tolist(),
+                ):
+                    concept = self._infer_claim_concept(c)
+                    anchor_terms, anchor_phrases = self._extract_anchor_terms(
+                        supporting_span=s,
+                        case_context=ctx,
+                        concept=concept,
+                        qa_type=t,
                     )
-                ]
+                    anchor_terms_per_row.append(anchor_terms)
+                    anchor_phrases_per_row.append(anchor_phrases)
+
+                    retrieval_queries.append(
+                        self._build_retrieval_query(
+                            question=q,
+                            claim_text=c,
+                            qa_type=t,
+                            anchor_terms=anchor_terms,
+                            anchor_phrases=anchor_phrases,
+                        )
+                    )
 
                 q_emb = self._encode_texts(
                     retrieval_queries,
@@ -1322,7 +2046,7 @@ class RadiopaediaWeakEvidenceAligner:
                     pbar=pbar,
                 )
 
-                D, I = index.search(q_emb, self.top_k)
+                D_dense, I_dense = index.search(q_emb, self.dense_pool_k)
 
                 out_rows: List[Dict[str, object]] = []
 
@@ -1347,36 +2071,57 @@ class RadiopaediaWeakEvidenceAligner:
                                     claim_text=claim_text,
                                     supporting_span=supporting_span,
                                     retrieval_query=retrieval_query,
+                                    alignment_status="empty_query",
                                     retrieved_chunk_ids_json="[]",
+                                    support_snippets_json="[]",
                                     support_weights_json="[]",
                                     embed_scores_json="[]",
                                     lexical_scores_json="[]",
+                                    local_match_scores_json="[]",
                                     combined_scores_json="[]",
                                 )
                             )
                         )
                         continue
 
-                    faiss_idxs = I[i].tolist()
-                    embed_scores = D[i].astype(np.float32).tolist()
+                    concept = self._infer_claim_concept(claim_text)
+                    target_state = self._infer_claim_state(claim_text)
+                    anchor_terms = anchor_terms_per_row[i]
+                    anchor_phrases = anchor_phrases_per_row[i]
 
-                    retrieved_ids: List[int] = []
-                    retrieved_texts: List[str] = []
-                    valid_embed_scores: List[float] = []
+                    dense_ids: List[int] = []
+                    dense_scores: List[float] = []
+                    seen_dense: Set[int] = set()
 
-                    for j, sc in zip(faiss_idxs, embed_scores):
+                    for j, sc in zip(I_dense[i].tolist(), D_dense[i].astype(np.float32).tolist()):
                         if j < 0:
                             continue
-                        retrieved_ids.append(int(chunk_ids[j]))
-                        retrieved_texts.append(chunk_texts[j])
-                        valid_embed_scores.append(float(sc))
+                        cid = int(chunk_ids[j])
+                        if cid in seen_dense:
+                            continue
+                        seen_dense.add(cid)
+                        dense_ids.append(cid)
+                        dense_scores.append(float(sc))
 
-                    lex_scores = [float(self._lexical_overlap(query_norm, t)) for t in retrieved_texts]
+                    lexical_ids, lexical_scores = self._bm25_topk(query_norm, self.lexical_pool_k)
 
-                    e = np.array(valid_embed_scores, dtype=np.float32)
-                    l = np.array(lex_scores, dtype=np.float32)
-                    combined = self.alpha * e + (1.0 - self.alpha) * l
-                    w = self._weights_from_scores(combined)
+                    final_ids, final_snippets, final_dense, final_lex, final_local, final_combined, alignment_status = self._merge_and_rerank_candidates(
+                        dense_ids=dense_ids,
+                        dense_scores=dense_scores,
+                        lexical_ids=lexical_ids,
+                        lexical_scores=lexical_scores,
+                        concept=concept,
+                        qa_type=qa_type,
+                        target_state=target_state,
+                        anchor_terms=anchor_terms,
+                        anchor_phrases=anchor_phrases,
+                    )
+
+                    if final_ids:
+                        combined_arr = np.asarray(final_combined, dtype=np.float32)
+                        weights = self._weights_from_scores(combined_arr)
+                    else:
+                        weights = np.asarray([], dtype=np.float32)
 
                     out_rows.append(
                         asdict(
@@ -1388,11 +2133,14 @@ class RadiopaediaWeakEvidenceAligner:
                                 claim_text=claim_text,
                                 supporting_span=supporting_span,
                                 retrieval_query=retrieval_query,
-                                retrieved_chunk_ids_json=json.dumps(retrieved_ids),
-                                support_weights_json=json.dumps([float(x) for x in w.tolist()]),
-                                embed_scores_json=json.dumps([float(x) for x in e.tolist()]),
-                                lexical_scores_json=json.dumps([float(x) for x in l.tolist()]),
-                                combined_scores_json=json.dumps([float(x) for x in combined.tolist()]),
+                                alignment_status=alignment_status,
+                                retrieved_chunk_ids_json=json.dumps([int(x) for x in final_ids]),
+                                support_snippets_json=json.dumps([self._safe_str(x) for x in final_snippets]),
+                                support_weights_json=json.dumps([float(x) for x in weights.tolist()]),
+                                embed_scores_json=json.dumps([float(x) for x in final_dense]),
+                                lexical_scores_json=json.dumps([float(x) for x in final_lex]),
+                                local_match_scores_json=json.dumps([float(x) for x in final_local]),
+                                combined_scores_json=json.dumps([float(x) for x in final_combined]),
                             )
                         )
                     )
@@ -1413,13 +2161,27 @@ class RadiopaediaWeakEvidenceAligner:
             "chunks_parquet": str(self.chunks_parquet.resolve()),
             "out_parquet": str(self.out_parquet.resolve()),
             "bootstrap_embedder": self.model_name,
-            "retrieval_query_format": "QUESTION + CLAIM + REPORT_EVIDENCE_HINT",
+            "retrieval_query_format": "CLAIM_PLUS_CASE_ANCHORS" if not self.use_question_in_query else "CLAIM_PLUS_CASE_ANCHORS_PLUS_QUESTION",
             "params": {
                 "max_query_tokens": self.max_query_tokens,
                 "max_doc_tokens": self.max_doc_tokens,
                 "top_k": self.top_k,
+                "dense_pool_k": self.dense_pool_k,
+                "lexical_pool_k": self.lexical_pool_k,
                 "alpha": self.alpha,
                 "temperature": self.temperature,
+                "local_match_weight": self.local_match_weight,
+                "anchor_match_weight": self.anchor_match_weight,
+                "contradiction_weight": self.contradiction_weight,
+                "generic_penalty_weight": self.generic_penalty_weight,
+                "min_local_match_score": self.min_local_match_score,
+                "min_anchor_match_score": self.min_anchor_match_score,
+                "min_combined_score": self.min_combined_score,
+                "max_anchor_terms": self.max_anchor_terms,
+                "max_anchor_phrases": self.max_anchor_phrases,
+                "allow_empty_when_no_match": self.allow_empty_when_no_match,
+                "use_question_in_query": self.use_question_in_query,
+                "use_qa_type_prefix": self.use_qa_type_prefix,
                 "seed": self.seed,
                 "force_cpu_faiss": self.force_cpu_faiss,
                 "qa_chunksize_rows": self.qa_chunksize_rows,
@@ -1430,6 +2192,17 @@ class RadiopaediaWeakEvidenceAligner:
             "cache": {
                 "chunk_embeds_npy": str(self.chunk_embeds_path),
                 "faiss_index": str(self.faiss_index_path),
+                "bm25_cache": str(self.bm25_cache_path),
+            },
+            "notes": {
+                "supporting_span_used_raw_in_query": False,
+                "supporting_span_used_for_anchor_extraction": True,
+                "case_context_used_for_anchor_backfill": True,
+                "lexical_signal": "corpus_bm25",
+                "candidate_generation": "dense_pool UNION lexical_pool",
+                "chunk_reranking": "dense_lexical_plus_claim_state_match_plus_case_anchor_match_minus_contradiction_minus_generic_penalty",
+                "stores_best_snippet_per_chunk": True,
+                "abstention_enabled": self.allow_empty_when_no_match,
             },
         }
         (self.out_parquet.parent / "manifest_step4b.json").write_text(
@@ -1439,8 +2212,7 @@ class RadiopaediaWeakEvidenceAligner:
 
         print(f"Wrote: {self.out_parquet}")
         print(f"Wrote: {self.out_parquet.parent / 'manifest_step4b.json'}")
-        print(f"Cache: {self.chunk_embeds_path}  |  {self.faiss_index_path}")
-
+        print(f"Cache: {self.chunk_embeds_path}  |  {self.faiss_index_path}  |  {self.bm25_cache_path}")
 
 
 
@@ -1474,6 +2246,8 @@ class VerifierSupervisionRow:
     claim_text: str
     supporting_span: str
     retrieval_query: str
+    alignment_status: str
+    support_snippets_json: str
     evidence_chunk_ids_json: str
     evidence_weights_json: str
     soft_support_score: float
@@ -1483,13 +2257,16 @@ class RadiopaediaStep4CSupervisionBuilder:
     """
     Step 4C: Convert Step 3 + Step 4B outputs into final supervision artifacts.
 
-    Fixes versus old version:
-      - merges by qa_row_id instead of relying on row order
-      - actually builds and writes patient-wise split map if missing
-      - keeps question / supporting_span / retrieval_query in supervision
-      - replaces invalid soft_support_score = max(combined_scores)
-      - uses weighted positive retrieval score as weak support target
-      - applies optional global min-max normalization to soft support
+    Foundational changes vs old version:
+      - explicitly respects Step 4B abstention status
+      - uses local sentence match and support snippet presence, not only combined score
+      - retriever positives are mined only from decision-relevant aligned chunks
+      - verifier target is sharp and piecewise, so abstained / weak rows stay low
+      - verifier evidence is smaller and filtered to what the verifier will actually consume
+      - does not apply dataset-level target normalization
+      - uses existing split column if it is already patient-consistent
+      - otherwise builds patient-wise split map
+      - writes parquet in batches
     """
 
     def __init__(
@@ -1507,15 +2284,35 @@ class RadiopaediaStep4CSupervisionBuilder:
         answer_col: str = "answer_target",
         supporting_span_col: str = "supporting_span",
         retrieval_query_col: str = "retrieval_query",
+        split_col: str = "split",
         qa_chunksize_rows: int = 50_000,
         parquet_batch_rows: int = 50_000,
-        top_k: Optional[int] = None,
+        top_k: Optional[int] = 20,
         min_weight: float = 0.0,
+        retriever_pos_top_k: int = 2,
+        retriever_pos_min_weight: float = 0.15,
+        retriever_pos_min_rel_to_top: float = 0.50,
+        retriever_pos_min_combined: float = 1.25,
+        retriever_pos_min_local: float = 1.25,
+        verifier_top_k: int = 3,
+        verifier_min_weight: float = 0.05,
+        verifier_min_combined: float = 0.75,
+        verifier_min_local: float = 0.75,
+        soft_top1_threshold: float = 2.50,
+        soft_margin_threshold: float = 0.75,
+        soft_local_threshold: float = 1.50,
+        abstained_score: float = 0.02,
+        weak_score_floor: float = 0.08,
+        weak_score_ceiling: float = 0.28,
+        medium_score_floor: float = 0.42,
+        medium_score_ceiling: float = 0.62,
+        strong_score_floor: float = 0.78,
+        strong_score_ceiling: float = 0.98,
         split_seed: int = 13,
         frac_train: float = 0.75,
         frac_valid: float = 0.10,
         frac_test: float = 0.15,
-        normalize_soft_support: bool = True,
+        normalize_soft_support: bool = False,
         tqdm_desc: str = "Step 4C: building supervision",
         parquet_compression: str = "zstd",
     ) -> None:
@@ -1534,12 +2331,36 @@ class RadiopaediaStep4CSupervisionBuilder:
         self.answer_col = str(answer_col)
         self.supporting_span_col = str(supporting_span_col)
         self.retrieval_query_col = str(retrieval_query_col)
+        self.split_col = str(split_col)
 
         self.qa_chunksize_rows = int(qa_chunksize_rows)
         self.parquet_batch_rows = int(parquet_batch_rows)
 
         self.top_k = int(top_k) if top_k is not None else None
         self.min_weight = float(min_weight)
+
+        self.retriever_pos_top_k = int(retriever_pos_top_k)
+        self.retriever_pos_min_weight = float(retriever_pos_min_weight)
+        self.retriever_pos_min_rel_to_top = float(retriever_pos_min_rel_to_top)
+        self.retriever_pos_min_combined = float(retriever_pos_min_combined)
+        self.retriever_pos_min_local = float(retriever_pos_min_local)
+
+        self.verifier_top_k = int(verifier_top_k)
+        self.verifier_min_weight = float(verifier_min_weight)
+        self.verifier_min_combined = float(verifier_min_combined)
+        self.verifier_min_local = float(verifier_min_local)
+
+        self.soft_top1_threshold = float(soft_top1_threshold)
+        self.soft_margin_threshold = float(soft_margin_threshold)
+        self.soft_local_threshold = float(soft_local_threshold)
+
+        self.abstained_score = float(abstained_score)
+        self.weak_score_floor = float(weak_score_floor)
+        self.weak_score_ceiling = float(weak_score_ceiling)
+        self.medium_score_floor = float(medium_score_floor)
+        self.medium_score_ceiling = float(medium_score_ceiling)
+        self.strong_score_floor = float(strong_score_floor)
+        self.strong_score_ceiling = float(strong_score_ceiling)
 
         self.split_seed = int(split_seed)
         self.frac_train = float(frac_train)
@@ -1560,6 +2381,7 @@ class RadiopaediaStep4CSupervisionBuilder:
         self._retr_schema: Optional[pa.Schema] = None
         self._ver_schema: Optional[pa.Schema] = None
         self._patient_split_map: Optional[Dict[int, str]] = None
+        self._split_method: str = "unknown"
 
     def _safe_str(self, x) -> str:
         if x is None:
@@ -1573,24 +2395,81 @@ class RadiopaediaStep4CSupervisionBuilder:
         except Exception:
             return []
 
-    def _filter_and_truncate(self, ids: List[int], w: List[float], combined: List[float]) -> Tuple[List[int], List[float], List[float]]:
-        m = min(len(ids), len(w), len(combined))
+    def _clip01(self, x: float) -> float:
+        return float(np.clip(float(x), 0.0, 1.0))
+
+    def _renormalize_weights(self, w: List[float]) -> List[float]:
+        if not w:
+            return []
+
+        arr = np.asarray(w, dtype=np.float32)
+        arr = np.maximum(arr, 0.0)
+
+        s = float(arr.sum())
+        if s <= 0.0:
+            arr = np.ones_like(arr, dtype=np.float32) / float(len(arr))
+        else:
+            arr = arr / s
+
+        return [float(x) for x in arr.tolist()]
+
+    def _piecewise_unit(self, x: float, lo: float, hi: float) -> float:
+        if hi <= lo:
+            return 1.0 if x >= hi else 0.0
+        return self._clip01((float(x) - float(lo)) / float(hi - lo))
+
+    def _entropy_concentration(self, w: List[float]) -> float:
+        if not w:
+            return 0.0
+
+        arr = np.asarray(self._renormalize_weights(w), dtype=np.float32)
+        if len(arr) == 1:
+            return 1.0
+
+        ent = float(-(arr * np.log(np.clip(arr, 1e-12, 1.0))).sum())
+        max_ent = float(np.log(len(arr)))
+        if max_ent <= 1e-12:
+            return 1.0
+
+        return self._clip01(1.0 - (ent / max_ent))
+
+    def _filter_and_truncate(
+        self,
+        ids: List[int],
+        w: List[float],
+        combined: List[float],
+        local_match: List[float],
+        snippets: List[str],
+    ) -> Tuple[List[int], List[float], List[float], List[float], List[str]]:
+        m = min(len(ids), len(w), len(combined), len(local_match), len(snippets))
         ids = ids[:m]
         w = w[:m]
         combined = combined[:m]
+        local_match = local_match[:m]
+        snippets = snippets[:m]
 
         if self.top_k is not None:
             ids = ids[: self.top_k]
             w = w[: self.top_k]
             combined = combined[: self.top_k]
+            local_match = local_match[: self.top_k]
+            snippets = snippets[: self.top_k]
 
         if self.min_weight > 0:
-            keep = [(i, ww, cc) for i, ww, cc in zip(ids, w, combined) if float(ww) >= self.min_weight]
-            ids = [int(i) for i, _, _ in keep]
-            w = [float(ww) for _, ww, _ in keep]
-            combined = [float(cc) for _, _, cc in keep]
+            keep = [
+                (cid, ww, cc, ll, ss)
+                for cid, ww, cc, ll, ss in zip(ids, w, combined, local_match, snippets)
+                if float(ww) >= self.min_weight
+            ]
+            ids = [int(x[0]) for x in keep]
+            w = [float(x[1]) for x in keep]
+            combined = [float(x[2]) for x in keep]
+            local_match = [float(x[3]) for x in keep]
+            snippets = [self._safe_str(x[4]) for x in keep]
 
-        return ids, w, combined
+        w = self._renormalize_weights(w)
+        m = min(len(ids), len(w), len(combined), len(local_match), len(snippets))
+        return ids[:m], w[:m], combined[:m], local_match[:m], snippets[:m]
 
     def _build_patient_split_map(self, qa_df: pd.DataFrame) -> Dict[int, str]:
         subjects = pd.to_numeric(qa_df[self.subject_id_col], errors="coerce")
@@ -1630,36 +2509,177 @@ class RadiopaediaStep4CSupervisionBuilder:
         )
         return split_map
 
-    def _weighted_support_from_scores(self, weights: List[float], combined_scores: List[float]) -> float:
-        if not weights or not combined_scores:
-            return 0.0
+    def _try_use_existing_split_map(self, qa_df: pd.DataFrame) -> Optional[Dict[int, str]]:
+        if self.split_col not in qa_df.columns:
+            return None
 
-        m = min(len(weights), len(combined_scores))
-        w = np.asarray(weights[:m], dtype=np.float32)
+        tmp = qa_df[[self.subject_id_col, self.split_col]].copy()
+        tmp[self.subject_id_col] = pd.to_numeric(tmp[self.subject_id_col], errors="coerce")
+        tmp = tmp[~tmp[self.subject_id_col].isna()].copy()
+        tmp[self.subject_id_col] = tmp[self.subject_id_col].astype(np.int64)
+        tmp[self.split_col] = tmp[self.split_col].astype(str).str.strip().str.lower()
+
+        allowed = {"train", "valid", "test"}
+        tmp = tmp[tmp[self.split_col].isin(allowed)].copy()
+        if len(tmp) == 0:
+            return None
+
+        nunique = tmp.groupby(self.subject_id_col)[self.split_col].nunique()
+        if int((nunique > 1).sum()) > 0:
+            return None
+
+        split_map = (
+            tmp.drop_duplicates(subset=[self.subject_id_col])
+            .set_index(self.subject_id_col)[self.split_col]
+            .to_dict()
+        )
+
+        self.split_map_out.write_text(
+            json.dumps({str(int(k)): str(v) for k, v in split_map.items()}, indent=2),
+            encoding="utf-8",
+        )
+        return {int(k): str(v) for k, v in split_map.items()}
+
+    def _select_retriever_positives(
+        self,
+        ids: List[int],
+        weights: List[float],
+        combined: List[float],
+        local_match: List[float],
+        snippets: List[str],
+        alignment_status: str,
+    ) -> Tuple[List[int], List[float]]:
+        status = self._safe_str(alignment_status)
+
+        if status != "ok":
+            return [], []
+
+        if not ids or not weights or not combined or not local_match or not snippets:
+            return [], []
+
+        m = min(len(ids), len(weights), len(combined), len(local_match), len(snippets))
+        ids = ids[:m]
+        weights = self._renormalize_weights(weights[:m])
+        combined = combined[:m]
+        local_match = local_match[:m]
+        snippets = snippets[:m]
+
+        top_w = float(weights[0]) if weights else 0.0
+        out_ids: List[int] = []
+        out_w: List[float] = []
+
+        for cid, ww, cc, ll, ss in zip(ids, weights, combined, local_match, snippets):
+            rel = float(ww / max(top_w, 1e-12)) if top_w > 0 else 0.0
+
+            if not self._safe_str(ss).strip():
+                continue
+            if ww < self.retriever_pos_min_weight:
+                continue
+            if rel < self.retriever_pos_min_rel_to_top:
+                continue
+            if cc < self.retriever_pos_min_combined:
+                continue
+            if ll < self.retriever_pos_min_local:
+                continue
+
+            out_ids.append(int(cid))
+            out_w.append(float(ww))
+
+            if self.retriever_pos_top_k > 0 and len(out_ids) >= self.retriever_pos_top_k:
+                break
+
+        if not out_ids:
+            return [], []
+
+        out_w = self._renormalize_weights(out_w)
+        return out_ids, out_w
+
+    def _select_verifier_evidence(
+        self,
+        ids: List[int],
+        weights: List[float],
+        combined: List[float],
+        local_match: List[float],
+        snippets: List[str],
+        alignment_status: str,
+    ) -> Tuple[List[int], List[float], List[float], List[float], List[str]]:
+        status = self._safe_str(alignment_status)
+
+        if status != "ok":
+            return [], [], [], [], []
+
+        if not ids or not weights or not combined or not local_match or not snippets:
+            return [], [], [], [], []
+
+        m = min(len(ids), len(weights), len(combined), len(local_match), len(snippets))
+        rows = [
+            (int(ids[i]), float(weights[i]), float(combined[i]), float(local_match[i]), self._safe_str(snippets[i]))
+            for i in range(m)
+        ]
+
+        rows = [x for x in rows if x[4].strip() != ""]
+        rows = [x for x in rows if x[1] >= self.verifier_min_weight]
+        rows = [x for x in rows if x[2] >= self.verifier_min_combined]
+        rows = [x for x in rows if x[3] >= self.verifier_min_local]
+
+        if self.verifier_top_k > 0:
+            rows = rows[: self.verifier_top_k]
+
+        if not rows:
+            return [], [], [], [], []
+
+        out_ids = [int(x[0]) for x in rows]
+        out_w = self._renormalize_weights([float(x[1]) for x in rows])
+        out_c = [float(x[2]) for x in rows]
+        out_l = [float(x[3]) for x in rows]
+        out_s = [self._safe_str(x[4]) for x in rows]
+
+        m2 = min(len(out_ids), len(out_w), len(out_c), len(out_l), len(out_s))
+        return out_ids[:m2], out_w[:m2], out_c[:m2], out_l[:m2], out_s[:m2]
+
+    def _soft_support_from_alignment(
+        self,
+        weights: List[float],
+        combined_scores: List[float],
+        local_match_scores: List[float],
+        alignment_status: str,
+    ) -> float:
+        status = self._safe_str(alignment_status)
+
+        if status != "ok":
+            return self._clip01(self.abstained_score)
+
+        if not weights or not combined_scores or not local_match_scores:
+            return self._clip01(self.abstained_score)
+
+        m = min(len(weights), len(combined_scores), len(local_match_scores))
+        w = np.asarray(self._renormalize_weights(weights[:m]), dtype=np.float32)
         c = np.asarray(combined_scores[:m], dtype=np.float32)
+        l = np.asarray(local_match_scores[:m], dtype=np.float32)
 
-        c = np.maximum(c, 0.0)
+        top1_c = float(c[0]) if len(c) > 0 else 0.0
+        top2_c = float(c[1]) if len(c) > 1 else float(top1_c)
+        margin = float(top1_c - top2_c) if len(c) > 1 else float(top1_c)
+        top1_l = float(l[0]) if len(l) > 0 else 0.0
+        top1_w = float(w[0]) if len(w) > 0 else 0.0
+        conc = self._entropy_concentration(w.tolist())
 
-        s = float(w.sum())
-        if s > 0:
-            w = w / s
-        elif len(w) > 0:
-            w = np.ones_like(w, dtype=np.float32) / float(len(w))
-        else:
-            return 0.0
+        s_top = self._piecewise_unit(top1_c, self.verifier_min_combined, self.soft_top1_threshold)
+        s_margin = self._piecewise_unit(margin, 0.0, self.soft_margin_threshold)
+        s_local = self._piecewise_unit(top1_l, self.verifier_min_local, self.soft_local_threshold)
+        s_mass = self._clip01(top1_w)
+        s_conc = self._clip01(conc)
 
-        return float(np.sum(w * c))
+        strength = 0.45 * s_top + 0.35 * s_local + 0.20 * s_margin
+        confidence = 0.55 * s_mass + 0.45 * s_conc
 
-    def _normalize_soft_support_scores(self, xs: List[float]) -> List[float]:
-        if not xs:
-            return xs
-        arr = np.asarray(xs, dtype=np.float32)
-        lo = float(arr.min())
-        hi = float(arr.max())
-        if hi <= lo + 1e-12:
-            return [0.5 for _ in xs]
-        arr = (arr - lo) / (hi - lo)
-        return [float(x) for x in arr.tolist()]
+        if s_top < 0.25 or s_local < 0.25:
+            return self._clip01(self.weak_score_floor + (self.weak_score_ceiling - self.weak_score_floor) * (0.70 * strength + 0.30 * confidence))
+
+        if s_top < 0.70 or s_local < 0.70:
+            return self._clip01(self.medium_score_floor + (self.medium_score_ceiling - self.medium_score_floor) * (0.65 * strength + 0.35 * confidence))
+
+        return self._clip01(self.strong_score_floor + (self.strong_score_ceiling - self.strong_score_floor) * (0.70 * strength + 0.30 * confidence))
 
     def _init_retriever_writer(self) -> pq.ParquetWriter:
         self._retr_schema = pa.schema(
@@ -1697,6 +2717,8 @@ class RadiopaediaStep4CSupervisionBuilder:
                 ("claim_text", pa.string()),
                 ("supporting_span", pa.string()),
                 ("retrieval_query", pa.string()),
+                ("alignment_status", pa.string()),
+                ("support_snippets_json", pa.string()),
                 ("evidence_chunk_ids_json", pa.string()),
                 ("evidence_weights_json", pa.string()),
                 ("soft_support_score", pa.float32()),
@@ -1724,6 +2746,8 @@ class RadiopaediaStep4CSupervisionBuilder:
             "question",
             "supporting_span",
             "retrieval_query",
+            "alignment_status",
+            "support_snippets_json",
             "pos_chunk_ids_json",
             "pos_weights_json",
             "case_context",
@@ -1741,6 +2765,18 @@ class RadiopaediaStep4CSupervisionBuilder:
             ).fillna(0.0).astype(np.float32)
 
         return pa.Table.from_pandas(df, schema=schema, preserve_index=False)
+
+    def _flush_buffer(
+        self,
+        writer: pq.ParquetWriter,
+        rows: List[Dict[str, object]],
+        schema: pa.Schema,
+    ) -> None:
+        if not rows:
+            return
+        df = pd.DataFrame(rows)
+        writer.write_table(self._to_table(df, schema))
+        rows.clear()
 
     def run(self) -> None:
         if not self.qa_csv.exists():
@@ -1769,8 +2805,11 @@ class RadiopaediaStep4CSupervisionBuilder:
 
         required_align = [
             self.qa_row_id_col,
+            "alignment_status",
             "retrieved_chunk_ids_json",
+            "support_snippets_json",
             "support_weights_json",
+            "local_match_scores_json",
             "combined_scores_json",
         ]
         for c in required_align:
@@ -1781,10 +2820,6 @@ class RadiopaediaStep4CSupervisionBuilder:
             qa_df[self.supporting_span_col] = ""
         if self.retrieval_query_col not in align_df.columns:
             align_df[self.retrieval_query_col] = ""
-        if self.question_col not in align_df.columns:
-            align_df[self.question_col] = ""
-        if self.supporting_span_col not in align_df.columns:
-            align_df[self.supporting_span_col] = ""
 
         qa_df[self.qa_row_id_col] = pd.to_numeric(qa_df[self.qa_row_id_col], errors="coerce")
         qa_df = qa_df[~qa_df[self.qa_row_id_col].isna()].copy()
@@ -1806,19 +2841,37 @@ class RadiopaediaStep4CSupervisionBuilder:
         qa_df[self.answer_col] = qa_df[self.answer_col].astype(str)
         qa_df[self.supporting_span_col] = qa_df[self.supporting_span_col].astype(str)
 
-        align_df["retrieved_chunk_ids_json"] = align_df["retrieved_chunk_ids_json"].astype(str)
-        align_df["support_weights_json"] = align_df["support_weights_json"].astype(str)
-        align_df["combined_scores_json"] = align_df["combined_scores_json"].astype(str)
-        align_df[self.retrieval_query_col] = align_df[self.retrieval_query_col].astype(str)
+        if self.split_col in qa_df.columns:
+            qa_df[self.split_col] = qa_df[self.split_col].astype(str)
 
-        self._patient_split_map = self._build_patient_split_map(qa_df)
+        for c in [
+            "alignment_status",
+            "retrieved_chunk_ids_json",
+            "support_snippets_json",
+            "support_weights_json",
+            "local_match_scores_json",
+            "combined_scores_json",
+            self.retrieval_query_col,
+        ]:
+            align_df[c] = align_df[c].astype(str)
+
+        existing_split_map = self._try_use_existing_split_map(qa_df)
+        if existing_split_map is not None:
+            self._patient_split_map = existing_split_map
+            self._split_method = "existing_patient_consistent_split"
+        else:
+            self._patient_split_map = self._build_patient_split_map(qa_df)
+            self._split_method = "patient_wise_random"
 
         merged = qa_df.merge(
             align_df[
                 [
                     self.qa_row_id_col,
+                    "alignment_status",
                     "retrieved_chunk_ids_json",
+                    "support_snippets_json",
                     "support_weights_json",
+                    "local_match_scores_json",
                     "combined_scores_json",
                     self.retrieval_query_col,
                 ]
@@ -1839,7 +2892,6 @@ class RadiopaediaStep4CSupervisionBuilder:
 
         retr_buffer: List[Dict[str, object]] = []
         ver_buffer: List[Dict[str, object]] = []
-        raw_soft_scores: List[float] = []
 
         try:
             for i in range(total_rows):
@@ -1857,29 +2909,52 @@ class RadiopaediaStep4CSupervisionBuilder:
                 answer_target = self._safe_str(row[self.answer_col])
                 supporting_span = self._safe_str(row[self.supporting_span_col])
                 retrieval_query = self._safe_str(row.get(self.retrieval_query_col, ""))
+                alignment_status = self._safe_str(row.get("alignment_status", ""))
 
                 ids = self._loads_json_list(self._safe_str(row.get("retrieved_chunk_ids_json", "[]")))
+                snippets = self._loads_json_list(self._safe_str(row.get("support_snippets_json", "[]")))
                 w = self._loads_json_list(self._safe_str(row.get("support_weights_json", "[]")))
+                local_match = self._loads_json_list(self._safe_str(row.get("local_match_scores_json", "[]")))
                 combined = self._loads_json_list(self._safe_str(row.get("combined_scores_json", "[]")))
 
                 ids = [int(x) for x in ids if str(x).strip() != ""]
+                snippets = [self._safe_str(x) for x in snippets]
                 w = [float(x) for x in w]
+                local_match = [float(x) for x in local_match]
                 combined = [float(x) for x in combined]
 
-                ids, w, combined = self._filter_and_truncate(ids, w, combined)
+                ids, w, combined, local_match, snippets = self._filter_and_truncate(
+                    ids=ids,
+                    w=w,
+                    combined=combined,
+                    local_match=local_match,
+                    snippets=snippets,
+                )
 
-                if len(ids) != len(w):
-                    m = min(len(ids), len(w))
-                    ids = ids[:m]
-                    w = w[:m]
-                if len(ids) != len(combined):
-                    m = min(len(ids), len(combined))
-                    ids = ids[:m]
-                    w = w[:m]
-                    combined = combined[:m]
+                retr_ids, retr_w = self._select_retriever_positives(
+                    ids=ids,
+                    weights=w,
+                    combined=combined,
+                    local_match=local_match,
+                    snippets=snippets,
+                    alignment_status=alignment_status,
+                )
 
-                soft_support_score = self._weighted_support_from_scores(w, combined)
-                raw_soft_scores.append(float(soft_support_score))
+                ver_ids, ver_w, ver_combined, ver_local, ver_snippets = self._select_verifier_evidence(
+                    ids=ids,
+                    weights=w,
+                    combined=combined,
+                    local_match=local_match,
+                    snippets=snippets,
+                    alignment_status=alignment_status,
+                )
+
+                soft_support_score = self._soft_support_from_alignment(
+                    weights=ver_w,
+                    combined_scores=ver_combined,
+                    local_match_scores=ver_local,
+                    alignment_status=alignment_status,
+                )
 
                 retr_buffer.append(
                     asdict(
@@ -1893,8 +2968,8 @@ class RadiopaediaStep4CSupervisionBuilder:
                             question=question,
                             supporting_span=supporting_span,
                             retrieval_query=retrieval_query,
-                            pos_chunk_ids_json=json.dumps(ids),
-                            pos_weights_json=json.dumps([float(x) for x in w]),
+                            pos_chunk_ids_json=json.dumps(retr_ids),
+                            pos_weights_json=json.dumps([float(x) for x in retr_w]),
                         )
                     )
                 )
@@ -1913,25 +2988,31 @@ class RadiopaediaStep4CSupervisionBuilder:
                             claim_text=claim_text,
                             supporting_span=supporting_span,
                             retrieval_query=retrieval_query,
-                            evidence_chunk_ids_json=json.dumps(ids),
-                            evidence_weights_json=json.dumps([float(x) for x in w]),
+                            alignment_status=alignment_status,
+                            support_snippets_json=json.dumps([self._safe_str(x) for x in ver_snippets]),
+                            evidence_chunk_ids_json=json.dumps(ver_ids),
+                            evidence_weights_json=json.dumps([float(x) for x in ver_w]),
                             soft_support_score=float(soft_support_score),
                         )
                     )
                 )
 
+                if len(retr_buffer) >= self.parquet_batch_rows:
+                    self._flush_buffer(retr_writer, retr_buffer, self._retr_schema)
+
+                if len(ver_buffer) >= self.parquet_batch_rows:
+                    self._flush_buffer(ver_writer, ver_buffer, self._ver_schema)
+
                 pbar.update(1)
 
-            if self.normalize_soft_support and ver_buffer:
-                norm_scores = self._normalize_soft_support_scores(raw_soft_scores)
-                for j, s in enumerate(norm_scores):
-                    ver_buffer[j]["soft_support_score"] = float(s)
+            if self.normalize_soft_support:
+                raise ValueError(
+                    "normalize_soft_support=True is disabled by design in the new Step 4C. "
+                    "Global dataset normalization was one of the foundational problems."
+                )
 
-            retr_df = pd.DataFrame(retr_buffer)
-            ver_df = pd.DataFrame(ver_buffer)
-
-            retr_writer.write_table(self._to_table(retr_df, self._retr_schema))
-            ver_writer.write_table(self._to_table(ver_df, self._ver_schema))
+            self._flush_buffer(retr_writer, retr_buffer, self._retr_schema)
+            self._flush_buffer(ver_writer, ver_buffer, self._ver_schema)
 
         finally:
             pbar.close()
@@ -1950,7 +3031,7 @@ class RadiopaediaStep4CSupervisionBuilder:
                 "patient_split_map": str(self.split_map_out.resolve()),
             },
             "split": {
-                "method": "patient-wise",
+                "method": self._split_method,
                 "seed": self.split_seed,
                 "fractions": {
                     "train": self.frac_train,
@@ -1962,9 +3043,37 @@ class RadiopaediaStep4CSupervisionBuilder:
             "params": {
                 "top_k": self.top_k,
                 "min_weight": self.min_weight,
-                "normalize_soft_support": self.normalize_soft_support,
-                "soft_support_scalar": "weighted_sum(max(combined_scores,0), normalized_by_support_weights); optional dataset min-max normalization",
+                "retriever_pos_top_k": self.retriever_pos_top_k,
+                "retriever_pos_min_weight": self.retriever_pos_min_weight,
+                "retriever_pos_min_rel_to_top": self.retriever_pos_min_rel_to_top,
+                "retriever_pos_min_combined": self.retriever_pos_min_combined,
+                "retriever_pos_min_local": self.retriever_pos_min_local,
+                "verifier_top_k": self.verifier_top_k,
+                "verifier_min_weight": self.verifier_min_weight,
+                "verifier_min_combined": self.verifier_min_combined,
+                "verifier_min_local": self.verifier_min_local,
+                "soft_top1_threshold": self.soft_top1_threshold,
+                "soft_margin_threshold": self.soft_margin_threshold,
+                "soft_local_threshold": self.soft_local_threshold,
+                "abstained_score": self.abstained_score,
+                "weak_score_floor": self.weak_score_floor,
+                "weak_score_ceiling": self.weak_score_ceiling,
+                "medium_score_floor": self.medium_score_floor,
+                "medium_score_ceiling": self.medium_score_ceiling,
+                "strong_score_floor": self.strong_score_floor,
+                "strong_score_ceiling": self.strong_score_ceiling,
+                "normalize_soft_support": False,
                 "join_key": "qa_row_id",
+            },
+            "notes": {
+                "uses_alignment_status_from_step4b": True,
+                "uses_support_snippets_for_positive_mining": True,
+                "uses_local_match_scores_for_positive_mining": True,
+                "global_target_minmax_normalization": False,
+                "retriever_positive_mining": "strict_decision_relevant_only",
+                "verifier_evidence_filtered_and_renormalized": True,
+                "abstained_rows_stay_low": True,
+                "soft_support_scalar": "three-regime piecewise target from top1 combined, top1 local, top1-top2 gap, top1 weight, and concentration",
             },
         }
         self.manifest_out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
@@ -2547,9 +3656,7 @@ if __name__ == "__main__":
 
 
 
-
-
-    # ''' step 4b '''
+    ''' step 4b '''
     # builder = RadiopaediaWeakEvidenceAligner(
     #     qa_csv=os.path.join(base_path_mimicData, "mimic_qa_step3.csv"),
     #     chunks_parquet=os.path.join(base_path_evidenceData, "chunks.parquet"),
@@ -2558,50 +3665,83 @@ if __name__ == "__main__":
     #     max_query_tokens=128,
     #     max_doc_tokens=256,
     #     top_k=20,
-    #     alpha=0.85,
-    #     temperature=0.07,
+    #     dense_pool_k=100,
+    #     lexical_pool_k=100,
+    #     qa_batch_size=256,
+    #     doc_batch_size=128,
+    #     alpha=0.60,
+    #     temperature=0.20,
+    #     local_match_weight=1.75,
+    #     anchor_match_weight=2.50,
+    #     contradiction_weight=2.25,
+    #     generic_penalty_weight=0.75,
+    #     min_local_match_score=0.75,
+    #     min_anchor_match_score=0.20,
+    #     min_combined_score=0.25,
+    #     max_anchor_terms=8,
+    #     max_anchor_phrases=6,
+    #     allow_empty_when_no_match=True,
+    #     use_question_in_query=False,
+    #     use_qa_type_prefix=False,
     #     seed=13,
     #     cache_dir=os.path.join(base_path_evidenceData, "cache_step4b"),
     #     device="cuda",
     #     force_cpu_faiss=True,
     # )
     # builder.run()
-    #
-    #
-    #
-    #
-    # ''' step 4c '''
-    # builder = RadiopaediaStep4CSupervisionBuilder(
-    #     qa_csv=os.path.join(base_path_mimicData, "mimic_qa_step3.csv"),
-    #     weak_alignment_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step4b.parquet"),
-    #     out_dir=os.path.join(base_path_evidenceData, "step4c_supervision"),
-    #     subject_id_col="subject_id",
-    #     qa_row_id_col="qa_row_id",
-    #     top_k=20,
-    #     min_weight=0.0,
-    #     qa_chunksize_rows=50_000,
-    #     parquet_batch_rows=50_000,
-    #     split_seed=13,
-    #     frac_train=0.75,
-    #     frac_valid=0.10,
-    #     frac_test=0.15,
-    #     normalize_soft_support=True,
-    # )
-    # builder.run()
 
 
 
-    ''' Creating the final mimic eval parquet from Step 4C '''
-    verifier_supervision_parquet = os.path.join(base_path_evidenceData, "step4c_supervision", "verifier_supervision.parquet")
-    radiopaedia_chunks_parquet = os.path.join(base_path_evidenceData, "chunks.parquet")
-    out_eval_parquet = os.path.join(base_path_evidenceData, "phase1_fixed_test_eval", "mimic_test_eval.parquet")
 
-    create_fixed_mimic_test_eval_parquet(verifier_supervision_parquet=verifier_supervision_parquet, out_parquet=out_eval_parquet,
-        evidence_parquet=radiopaedia_chunks_parquet, evidence_id_col="chunk_id", evidence_text_col="chunk_text",
-        evidence_id_base=0,  # change to 1 if ids start from 1
-        preload_evidence_texts=False,
-        split_value="test",
+    ''' step 4c '''
+    builder = RadiopaediaStep4CSupervisionBuilder(
+        qa_csv=os.path.join(base_path_mimicData, "mimic_qa_step3.csv"),
+        weak_alignment_parquet=os.path.join(base_path_evidenceData, "weak_alignment_step4b.parquet"),
+        out_dir=os.path.join(base_path_evidenceData, "step4c_supervision"),
+        subject_id_col="subject_id",
+        qa_row_id_col="qa_row_id",
+        top_k=20,
+        min_weight=0.0,
+        retriever_pos_top_k=2,
+        retriever_pos_min_weight=0.15,
+        retriever_pos_min_rel_to_top=0.50,
+        retriever_pos_min_combined=1.25,
+        retriever_pos_min_local=1.25,
+        verifier_top_k=3,
+        verifier_min_weight=0.05,
+        verifier_min_combined=0.75,
+        verifier_min_local=0.75,
+        soft_top1_threshold=2.50,
+        soft_margin_threshold=0.75,
+        soft_local_threshold=1.50,
+        abstained_score=0.02,
+        weak_score_floor=0.08,
+        weak_score_ceiling=0.28,
+        medium_score_floor=0.42,
+        medium_score_ceiling=0.62,
+        strong_score_floor=0.78,
+        strong_score_ceiling=0.98,
+        qa_chunksize_rows=50_000,
         parquet_batch_rows=50_000,
-        parquet_compression="zstd",
-        seed=13, write_manifest_json=True)
+        split_seed=13,
+        frac_train=0.75,
+        frac_valid=0.10,
+        frac_test=0.15,
+        normalize_soft_support=False,
+    )
+    builder.run()
+
+    # ''' Creating the final mimic eval parquet from Step 4C '''
+    # verifier_supervision_parquet = os.path.join(base_path_evidenceData, "step4c_supervision", "verifier_supervision.parquet")
+    # radiopaedia_chunks_parquet = os.path.join(base_path_evidenceData, "chunks.parquet")
+    # out_eval_parquet = os.path.join(base_path_evidenceData, "phase1_fixed_test_eval", "mimic_test_eval.parquet")
+    #
+    # create_fixed_mimic_test_eval_parquet(verifier_supervision_parquet=verifier_supervision_parquet, out_parquet=out_eval_parquet,
+    #     evidence_parquet=radiopaedia_chunks_parquet, evidence_id_col="chunk_id", evidence_text_col="chunk_text",
+    #     evidence_id_base=0,  # change to 1 if ids start from 1
+    #     preload_evidence_texts=False,
+    #     split_value="test",
+    #     parquet_batch_rows=50_000,
+    #     parquet_compression="zstd",
+    #     seed=13, write_manifest_json=True)
 
