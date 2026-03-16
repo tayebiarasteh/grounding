@@ -47,6 +47,7 @@ class TrainingVerifier:
         self.use_amp = bool(self.params["Verifier"]["use_amp"])
         self.amp_dtype = str(self.params["Verifier"]["amp_dtype"]).lower()  # "bf16" or "fp16"
         self.grad_scaler_mode = self.params["Verifier"]["grad_scaler_mode"]      # "auto"/bool
+        self.best_macro_f1 = -1.0
 
         # Speed knobs
         self.tf32 = bool(self.params["Verifier"]["tf32"])
@@ -68,6 +69,7 @@ class TrainingVerifier:
         # will be set in setup_cuda
         self.autocast_dtype = torch.bfloat16
         self.scaler = None
+
 
     def setup_cuda(self, cuda_device_id: int = 0):
         if torch.cuda.is_available():
@@ -123,14 +125,14 @@ class TrainingVerifier:
         )
         return {k: v.to(self.device, non_blocking=True) for k, v in enc.items()}
 
-    def setup_model(self, model, optimiser, loss_function):
+    def setup_model(self, model, optimiser, loss_function, class_weights):
         total_param_num = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"\nTotal # of trainable parameters: {total_param_num:,}")
         print("----------------------------------------------------\n")
 
         # IMPORTANT: keep weights in fp32 for stable training with AMP
         self.model = model.to(self.device).float()
-        self.loss_function = loss_function().to(self.device)
+        self.loss_function = loss_function(class_weights.to(self.device)).to(self.device)
         self.optimiser = optimiser
 
         self.model_info["total_param_num"] = total_param_num
@@ -157,6 +159,7 @@ class TrainingVerifier:
         self.optimiser.load_state_dict(checkpoint["optimizer_state_dict"])
         self.epoch = checkpoint["epoch"]
         self.best_loss = checkpoint["best_loss"]
+        self.best_macro_f1 = checkpoint.get("best_macro_f1", -1.0)
 
         # restore scaler state if present (optional)
         if self.scaler is not None and "scaler_state_dict" in checkpoint:
@@ -172,7 +175,6 @@ class TrainingVerifier:
 
 
 
-
     def train_epoch(self, train_loader, valid_loader=None, num_epochs=1000):
         self.params = read_config(self.cfg_path)
         total_start_time = time.time()
@@ -180,33 +182,34 @@ class TrainingVerifier:
         for _ in range(num_epochs - self.epoch):
             self.epoch += 1
 
+            self.model.train()
             batch_loss = 0.0
+            total_n = 0
+            correct = 0
+
             start_time = time.time()
 
             for idx, batch in enumerate(tqdm(train_loader)):
-                # remove this sanity-limit in real training
-                # if idx >= 20:
-                #     break
-
-                self.model.train()
-
                 tok = self._tokenize(batch.inputs, self.max_len)
-                targets = batch.targets.to(self.device, non_blocking=True).float()
+                targets = batch.targets.to(self.device, non_blocking=True).long()
 
                 self.optimiser.zero_grad(set_to_none=True)
 
-                # AMP forward
                 with torch.cuda.amp.autocast(
-                    enabled=(self.use_amp and self.device.type == "cuda"),
-                    dtype=self.autocast_dtype,
+                        enabled=(self.use_amp and self.device.type == "cuda"),
+                        dtype=self.autocast_dtype,
                 ):
                     out = self.model(**tok)
-                    preds = out.logits.squeeze(-1)
-                    loss = self.loss_function(preds, targets)
+                    logits = out.logits
+                    loss = self.loss_function(logits, targets)
 
-                batch_loss += float(loss.item())
+                B = int(targets.shape[0])
+                batch_loss += float(loss.item()) * B
+                total_n += B
 
-                # Backward + step
+                preds = logits.argmax(dim=-1)
+                correct += int((preds == targets).sum().item())
+
                 if self.scaler is not None and self.scaler.is_enabled():
                     self.scaler.scale(loss).backward()
                     if self.grad_clip > 0:
@@ -220,14 +223,15 @@ class TrainingVerifier:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                     self.optimiser.step()
 
-            train_loss = batch_loss / max(len(train_loader), 1)
-            self.writer.add_scalar("Train_loss_avg", train_loss, self.epoch)
+            train_loss = batch_loss / max(total_n, 1)
+            train_acc = correct / max(total_n, 1)
 
-            # Saves information about training to config file
+            self.writer.add_scalar("Train_loss_avg", train_loss, self.epoch)
+            self.writer.add_scalar("Train_accuracy", train_acc, self.epoch)
+
             self.params["Network"]["num_epoch"] = self.epoch
             write_config(self.params, self.cfg_path, sort_keys=True)
 
-            # checkpoint each epoch (your style)
             ckpt = {
                 "epoch": self.epoch,
                 "model_state_dict": self.model.state_dict(),
@@ -241,20 +245,25 @@ class TrainingVerifier:
 
             torch.save(
                 ckpt,
-                os.path.join(self.params["target_dir"], self.params["network_output_path"], self.params["checkpoint_name"]),
+                os.path.join(self.params["target_dir"], self.params["network_output_path"],
+                             self.params["checkpoint_name"]),
             )
 
-            # Validation
             if (self.epoch) % int(self.params["display_stats_freq"]) == 0:
+                end_time = time.time()
+                total_time = end_time - total_start_time
+                iteration_hours, iteration_mins, iteration_secs = self.time_duration(start_time, end_time)
+                total_hours, total_mins, total_secs = self.time_duration(total_start_time, end_time)
+
                 if valid_loader is not None:
-                    valid_loss, valid_mae, valid_pearson = self.valid_epoch(valid_loader)
+                    valid_loss, valid_acc, valid_macro_f1 = self.valid_epoch(valid_loader)
 
-                    end_time = time.time()
-                    total_time = end_time - total_start_time
-                    iteration_hours, iteration_mins, iteration_secs = self.time_duration(start_time, end_time)
-                    total_hours, total_mins, total_secs = self.time_duration(total_start_time, end_time)
+                    self.calculate_tb_stats(
+                        valid_loss=valid_loss,
+                        valid_acc=valid_acc,
+                        valid_macro_f1=valid_macro_f1,
+                    )
 
-                    self.calculate_tb_stats(valid_loss=valid_loss, valid_mae=valid_mae, valid_pearson=valid_pearson)
                     self.savings_prints(
                         iteration_hours,
                         iteration_mins,
@@ -264,15 +273,12 @@ class TrainingVerifier:
                         total_secs,
                         train_loss,
                         total_time,
+                        train_acc=train_acc,
                         valid_loss=valid_loss,
-                        valid_mae=valid_mae,
-                        valid_pearson=valid_pearson,
+                        valid_acc=valid_acc,
+                        valid_macro_f1=valid_macro_f1,
                     )
                 else:
-                    end_time = time.time()
-                    total_time = end_time - total_start_time
-                    iteration_hours, iteration_mins, iteration_secs = self.time_duration(start_time, end_time)
-                    total_hours, total_mins, total_secs = self.time_duration(total_start_time, end_time)
                     self.savings_prints(
                         iteration_hours,
                         iteration_mins,
@@ -282,8 +288,8 @@ class TrainingVerifier:
                         total_secs,
                         train_loss,
                         total_time,
+                        train_acc=train_acc,
                     )
-
 
 
 
@@ -298,82 +304,78 @@ class TrainingVerifier:
 
         with torch.no_grad():
             for idx, batch in enumerate(tqdm(valid_loader)):
-                # remove this sanity-limit in real validation
-                # if idx >= 50:
-                #     break
-
                 tok = self._tokenize(batch.inputs, self.max_len)
-                targets = batch.targets.to(self.device, non_blocking=True).float()
+                targets = batch.targets.to(self.device, non_blocking=True).long()
 
                 with torch.cuda.amp.autocast(
-                    enabled=(self.use_amp and self.device.type == "cuda"),
-                    dtype=self.autocast_dtype,
+                        enabled=(self.use_amp and self.device.type == "cuda"),
+                        dtype=self.autocast_dtype,
                 ):
                     out = self.model(**tok)
-                    preds = out.logits.squeeze(-1)
-                    loss = self.loss_function(preds, targets)
+                    logits = out.logits
+                    loss = self.loss_function(logits, targets)
 
                 B = int(targets.shape[0])
                 total_loss += float(loss.item()) * B
                 total_n += B
 
-                preds_all.extend(preds.detach().float().cpu().tolist())
-                targets_all.extend(targets.detach().float().cpu().tolist())
+                preds = logits.argmax(dim=-1)
+
+                preds_all.extend(preds.detach().cpu().tolist())
+                targets_all.extend(targets.detach().cpu().tolist())
 
         valid_loss = total_loss / max(total_n, 1)
 
         if total_n > 0:
-            arr_p = np.asarray(preds_all, dtype=np.float32)
-            arr_t = np.asarray(targets_all, dtype=np.float32)
-            valid_mae = float(np.mean(np.abs(arr_p - arr_t)))
-            if float(np.std(arr_p)) > 1e-8 and float(np.std(arr_t)) > 1e-8:
-                valid_pearson = float(np.corrcoef(arr_p, arr_t)[0, 1])
-            else:
-                valid_pearson = 0.0
+            valid_acc = float(metrics.accuracy_score(targets_all, preds_all))
+            valid_macro_f1 = float(metrics.f1_score(targets_all, preds_all, average="macro"))
         else:
-            valid_mae = 0.0
-            valid_pearson = 0.0
+            valid_acc = 0.0
+            valid_macro_f1 = 0.0
 
-        return valid_loss, valid_mae, valid_pearson
-
+        return valid_loss, valid_acc, valid_macro_f1
 
 
 
 
     def savings_prints(
-        self,
-        iteration_hours,
-        iteration_mins,
-        iteration_secs,
-        total_hours,
-        total_mins,
-        total_secs,
-        train_loss,
-        total_time,
-        valid_loss=None,
-        valid_mae=None,
-        valid_pearson=None,
+            self,
+            iteration_hours,
+            iteration_mins,
+            iteration_secs,
+            total_hours,
+            total_mins,
+            total_secs,
+            train_loss,
+            total_time,
+            train_acc=None,
+            valid_loss=None,
+            valid_acc=None,
+            valid_macro_f1=None,
     ):
         self.params["Network"]["num_epoch"] = self.epoch
         write_config(self.params, self.cfg_path, sort_keys=True)
 
-        # Save best model by validation loss if available, else train loss
-        if valid_loss is not None:
-            if valid_loss < self.best_loss:
-                self.best_loss = valid_loss
-                torch.save(
-                    self.model.state_dict(),
-                    os.path.join(self.params["target_dir"], self.params["network_output_path"], self.params["trained_model_name"]),
-                )
+        # save best by validation macro-F1 if available, else by train loss
+        save_best = False
+        if valid_macro_f1 is not None:
+            if not hasattr(self, "best_macro_f1"):
+                self.best_macro_f1 = -1.0
+            if valid_macro_f1 > self.best_macro_f1:
+                self.best_macro_f1 = valid_macro_f1
+                save_best = True
         else:
             if train_loss < self.best_loss:
                 self.best_loss = train_loss
-                torch.save(
-                    self.model.state_dict(),
-                    os.path.join(self.params["target_dir"], self.params["network_output_path"], self.params["trained_model_name"]),
-                )
+                save_best = True
 
-        # checkpoint every epoch (already done in train loop, keep your style)
+        if save_best:
+            torch.save(
+                self.model.state_dict(),
+                os.path.join(self.params["target_dir"], self.params["network_output_path"],
+                             self.params["trained_model_name"]),
+            )
+
         ckpt = {
             "epoch": self.epoch,
             "model_state_dict": self.model.state_dict(),
@@ -382,6 +384,8 @@ class TrainingVerifier:
             "model_info": self.model_info,
             "best_loss": self.best_loss,
         }
+        if hasattr(self, "best_macro_f1"):
+            ckpt["best_macro_f1"] = self.best_macro_f1
         if self.scaler is not None and self.scaler.is_enabled():
             ckpt["scaler_state_dict"] = self.scaler.state_dict()
 
@@ -400,28 +404,37 @@ class TrainingVerifier:
                 ),
             )
 
-        print("------------------------------------------------------" "----------------------------------")
+        print("--------------------------------------------------------------------------------")
         print(
             f"epoch: {self.epoch} | "
             f"epoch time: {iteration_hours}h {iteration_mins}m {iteration_secs:.2f}s | "
             f"total time: {total_hours}h {total_mins}m {total_secs:.2f}s"
         )
-        print(f"\n\tTrain loss: {train_loss:.4f}\n")
+
+        if train_acc is not None:
+            print(f"\n\tTrain loss: {train_loss:.4f} | Train acc: {float(train_acc):.4f}\n")
+        else:
+            print(f"\n\tTrain loss: {train_loss:.4f}\n")
 
         if valid_loss is not None:
-            print(f"\t Val. loss: {valid_loss:.4f} | MAE: {float(valid_mae):.4f} | Pearson-r: {float(valid_pearson):.4f}\n")
+            print(
+                f"\tVal. loss: {valid_loss:.4f} | "
+                f"Acc: {float(valid_acc):.4f} | "
+                f"Macro-F1: {float(valid_macro_f1):.4f}\n"
+            )
             msg = (
                 f"\n\n----------------------------------------------------------------------------------------\n"
                 f"epoch: {self.epoch} | epoch Time: {iteration_hours}h {iteration_mins}m {iteration_secs:.2f}s"
                 f" | total time: {total_hours}h {total_mins}m {total_secs:.2f}s | "
-                f"\n\n\tTrain loss: {train_loss:.4f} | "
-                f"Val. loss: {valid_loss:.4f} | MAE: {float(valid_mae):.4f} | Pearson-r: {float(valid_pearson):.4f}\n\n"
+                f"\n\n\tTrain loss: {train_loss:.4f} | Train acc: {float(train_acc):.4f} | "
+                f"Val. loss: {valid_loss:.4f} | Acc: {float(valid_acc):.4f} | Macro-F1: {float(valid_macro_f1):.4f}\n\n"
             )
         else:
             msg = (
                 f"----------------------------------------------------------------------------------------\n"
                 f"epoch: {self.epoch} | epoch time: {iteration_hours}h {iteration_mins}m {iteration_secs:.2f}s"
-                f" | total time: {total_hours}h {total_mins}m {total_secs:.2f}s\n\n\ttrain loss: {train_loss:.4f}\n\n"
+                f" | total time: {total_hours}h {total_mins}m {total_secs:.2f}s\n\n"
+                f"\ttrain loss: {train_loss:.4f} | train acc: {float(train_acc):.4f}\n\n"
             )
 
         with open(os.path.join(self.params["target_dir"], self.params["stat_log_path"]) + "/Stats", "a") as f:
@@ -430,11 +443,10 @@ class TrainingVerifier:
 
 
 
-
-    def calculate_tb_stats(self, valid_loss=None, valid_mae=None, valid_pearson=None):
+    def calculate_tb_stats(self, valid_loss=None, valid_acc=None, valid_macro_f1=None):
         if valid_loss is not None:
             self.writer.add_scalar("Val_loss", valid_loss, self.epoch)
-        if valid_mae is not None:
-            self.writer.add_scalar("Val_MAE", valid_mae, self.epoch)
-        if valid_pearson is not None:
-            self.writer.add_scalar("Val_PearsonR", valid_pearson, self.epoch)
+        if valid_acc is not None:
+            self.writer.add_scalar("Val_accuracy", valid_acc, self.epoch)
+        if valid_macro_f1 is not None:
+            self.writer.add_scalar("Val_macro_F1", valid_macro_f1, self.epoch)

@@ -1,18 +1,17 @@
 retriever:
-  model_name: sentence-transformers/all-mpnet-base-v2
-  tied_encoders: true            # true = shared weights
-  pooling: mean                  # mean pooling over last_hidden_state
+  model_name: BAAI/bge-base-en-v1.5
+  tied_encoders: true
+  pooling: mean
   max_query_tokens: 128
   max_doc_tokens: 256
-  temperature: 0.07              # tau in InfoNCE
-  top_k_positives: 20            # K per query (must match step4c top_k)
-  min_pos_weight: 0.0            # drop positives below this weight (usually 0.0)
-
+  temperature: 0.05
+  bm25_pool_size: 80
+  num_hard_negatives: 8
 
 
 Verifier:
   model_name: microsoft/deberta-v3-large
-  max_tokens: 512              # 384 or 512
+  max_tokens: 1024
   use_amp: true
   amp_dtype: bf16      # bf16 is fastest+stable on modern GPUs
   grad_scaler_mode: auto    # auto enables scaler only for fp16
@@ -21,21 +20,20 @@ Verifier:
 
 Network:
   seed: 13
-  num_epochs: 20
-  batch_size: 4
+  num_epochs: 40
 #  batch_size: 16
+  batch_size: 1
   lr: 1e-5
   weight_decay: 0.01
   grad_clip_norm: 1.0
 
 
 Preprocessing:
-  tokenizer_name: sentence-transformers/all-mpnet-base-v2
-  base_path_mimicData: /PATH/Radiopaedia/Text_only
-  snapshot_name: RadiopaediaSnapshot_29_01_2026
-  base_path_evidenceData: /PATH/Radiopaedia/Text_only/Articles_Processed_Jan_2026/RadiopaediaSnapshot_29_01_2026
-#  snapshot_name: RadiopaediaSnapshot_01_03_2026
-#  base_path_evidenceData: /PATHRadiopaedia/Text_only/Articles_Processed_March_2026/RadiopaediaSnapshot_01_03_2026
+  tokenizer_name: BAAI/bge-base-en-v1.5
+  base_path_mimicData: /PATH/Text_only
+  mimic_reports_base: /PATH/XRay/MIMIC
+  snapshot_name: RadiopaediaSnapshot_01_03_2026
+  base_path_evidenceData: /PATH/Articles_Processed_March_2026/RadiopaediaSnapshot_01_03_2026
 
 runtime:
   use_amp: true # useful for speed
@@ -50,5 +48,5 @@ hf_login: "xxxxxxxxxxx"
 
 
 # changeable items:
-target_dir: /PATH/Repositories_target_files/grounding/
+target_dir: /PATH/grounding/
 display_stats_freq: 1 # valid freq is equal to this
