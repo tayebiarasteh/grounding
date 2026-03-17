@@ -19,13 +19,14 @@ import matplotlib
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoImageProcessor, AutoModel
 matplotlib.use('Agg')
 import yaml
+import json
 
 from config.serde import open_experiment, create_experiment, delete_experiment, write_config
 from Train_Valid_retriever import Training
-from data.data_provider import RetrieverSupervisionDataset, RadiopaediaSentenceStore, retriever_collate_fn, VerifierSupervisionDataset, verifier_collate_fn
+from data.data_provider import RetrieverSupervisionDataset, RadiopaediaSentenceStore, retriever_collate_fn, VerifierBinaryDataset, verifier_binary_collate_fn
 from models.model import BiEncoder
 from Train_Valid_verifier import TrainingVerifier
-from data.mimic_data_preprocessing import RadiologyStep6SupervisionBuilder, MimicGroundingDatasetBuilder
+from data.mimic_data_preprocessing import RadiologyVerifierBinaryDatasetBuilder, MimicGroundingDatasetBuilder
 from data.chexpertplus_data_preprocessing import CheXpertRadiopaediaStep4ExternalTestBuilder, create_fixed_chexpert_test_eval_parquet
 from Tier1_2_3_prediction import S4Tier123End2EndEvaluatorTestOnly, S2Tier123End2EndEvaluatorTestOnly, S3Tier123End2EndEvaluatorTestOnly, S1Tier123CaseOnlyEvaluatorTestOnly, CrossSystemComparatorPredOnlyTestOnly, analyze_retrieval_error_coupling
 
@@ -36,19 +37,6 @@ warnings.filterwarnings('ignore')
 
 
 
-def _build_class_weights_from_dataset(dataset: VerifierSupervisionDataset) -> torch.Tensor:
-    counts = dataset.get_label_counts()
-
-    c0 = max(int(counts.get(0, 0)), 1)
-    c1 = max(int(counts.get(1, 0)), 1)
-    c2 = max(int(counts.get(2, 0)), 1)
-
-    inv = torch.tensor(
-        [1.0 / c0, 1.0 / c1, 1.0 / c2],
-        dtype=torch.float32,
-    )
-    weights = inv / inv.mean()
-    return weights
 
 
 
@@ -130,66 +118,72 @@ def main_train_retriever(global_config_path="/PATH/config/config.yaml", valid=Fa
 
 
 
+def _build_binary_class_weights_from_dataset(dataset: VerifierBinaryDataset) -> torch.Tensor:
+    counts = dataset.get_label_counts()
 
-def main_train_verifier(global_config_path="/PATH/config/config.yaml", valid=False, resume=False, experiment_name="name"):
-    """
-    Main function for verifier (Step 8) training + optional validation.
+    n_neg = max(int(counts.get(0, 0)), 1)
+    n_pos = max(int(counts.get(1, 0)), 1)
 
-    Mirrors your retriever main_train_retriever structure.
-    """
-    if resume is True:
+    # class 0 = not_supported, class 1 = supported
+    weights = torch.tensor([1.0, n_neg / n_pos], dtype=torch.float32)
+    return weights
+
+
+def main_train_verifier_binary(global_config_path="/PATH/config/config.yaml",
+    valid: bool = True,
+    resume: bool = False,
+    experiment_name: str = "verifier_binary"):
+
+    if resume:
         params = open_experiment(experiment_name, global_config_path)
     else:
         params = create_experiment(experiment_name, global_config_path)
 
     cfg_path = params["cfg_path"]
 
-    # datasets
-    train_dataset = VerifierSupervisionDataset(cfg_path=cfg_path, split_name="train", system_mode="s4")
-    valid_dataset = VerifierSupervisionDataset(cfg_path=cfg_path, split_name="val", system_mode="s4")
+    train_dataset = VerifierBinaryDataset(cfg_path=cfg_path,
+        split_name="train",
+        max_evidence_sentences=int(params["Verifier"]["max_evidence_sentences"]))
 
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
+    valid_dataset = VerifierBinaryDataset(cfg_path=cfg_path,
+        split_name="val",
+        max_evidence_sentences=int(params["Verifier"]["max_evidence_sentences"]))
+
+    train_loader = torch.utils.data.DataLoader(train_dataset,
         batch_size=int(params["Network"]["batch_size"]),
         shuffle=True,
         num_workers=2,
         pin_memory=True,
-        collate_fn=verifier_collate_fn,
+        collate_fn=verifier_binary_collate_fn,
         drop_last=True,
         persistent_workers=True)
 
     if valid:
-        valid_loader = torch.utils.data.DataLoader(
-            valid_dataset,
+        valid_loader = torch.utils.data.DataLoader(valid_dataset,
             batch_size=int(params["Network"]["batch_size"]),
             shuffle=False,
             num_workers=2,
             pin_memory=True,
-            persistent_workers=True,
-            prefetch_factor=2,
-            collate_fn=verifier_collate_fn,
-            drop_last=False)
+            collate_fn=verifier_binary_collate_fn,
+            drop_last=False,
+            persistent_workers=True)
     else:
         valid_loader = None
 
-    # model
     model = AutoModelForSequenceClassification.from_pretrained(
         params["Verifier"]["model_name"],
-        num_labels=3,
+        num_labels=2,
         problem_type="single_label_classification",
     )
 
-    class_weights = _build_class_weights_from_dataset(train_dataset)
+    class_weights = _build_binary_class_weights_from_dataset(train_dataset)
 
-    # loss
-    loss_function = torch.nn.CrossEntropyLoss
-
-    # optimizer
-    optimizer = torch.optim.AdamW(model.parameters(),
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
         lr=float(params["Network"]["lr"]),
-        weight_decay=float(params["Network"]["weight_decay"]))
+        weight_decay=float(params["Network"]["weight_decay"]),
+    )
 
-    # write some info into config (same style as retriever)
     model_info = params["Network"]
     model_info["lr"] = float(params["Network"]["lr"])
     model_info["batch_size"] = int(params["Network"]["batch_size"])
@@ -198,13 +192,23 @@ def main_train_verifier(global_config_path="/PATH/config/config.yaml", valid=Fal
 
     trainer = TrainingVerifier(cfg_path, resume=resume)
 
-    if resume is True:
-        trainer.load_checkpoint(model=model, optimiser=optimizer, loss_function=loss_function)
+    if resume:
+        trainer.load_checkpoint(
+            model=model,
+            optimiser=optimizer,
+            loss_function=torch.nn.CrossEntropyLoss,
+            class_weights=class_weights)
     else:
-        trainer.setup_model(model=model, optimiser=optimizer, loss_function=loss_function, class_weights=class_weights)
+        trainer.setup_model(
+            model=model,
+            optimiser=optimizer,
+            loss_function=torch.nn.CrossEntropyLoss,
+            class_weights=class_weights,
+        )
 
-    trainer.train_epoch(train_loader=train_loader, valid_loader=valid_loader, num_epochs=int(params["Network"]["num_epochs"]))
-
+    trainer.train_epoch(train_loader=train_loader,
+        valid_loader=valid_loader,
+        num_epochs=int(params["Network"]["num_epochs"]))
 
 
 

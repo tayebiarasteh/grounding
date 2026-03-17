@@ -839,30 +839,37 @@ class EvidenceSentence:
     concept_states_json: str
     num_matched_concepts: int
 
+    evidence_split: str   # "trainval" or "test"
+
 
 class RadiopaediaSentenceEvidenceBuilder:
     """
-    Build a frozen sentence-level evidence database from Radiopaedia .txt files.
+    Build sentence-level Radiopaedia evidence DB and create a held-out article split.
 
-    Output:
-      - evidence_sentences.csv
+    Outputs:
       - evidence_sentences.parquet
+      - evidence_sentences_trainval.parquet
+      - evidence_sentences_test.parquet
+      - evidence_articles_split.csv
       - manifest.json
 
-    Important:
-      - concept state is always concept-specific
-      - one sentence may match multiple concepts
-      - concept_states_json stores only matched concepts
+    Split policy:
+      - article-level split only
+      - stratified approximately by concept coverage
+      - trainval articles are used for verifier train/val supervision
+      - test articles are reserved for oracle-test and retrieval-test evaluation
     """
 
     def __init__(
         self,
         in_dir: str,
         out_dir: str,
-        snapshot_name: str = "RadiopaediaSentenceSnapshot_v5",
+        snapshot_name: str = "RadiopaediaSentenceSnapshot_v6",
         tokenizer_name: str = "BAAI/bge-base-en-v1.5",
         min_tokens: int = 7,
         max_tokens: int = 64,
+        heldout_article_ratio: float = 0.20,
+        seed: int = 13,
         write_csv: bool = True,
         write_parquet: bool = True,
         encoding: str = "utf-8",
@@ -876,10 +883,15 @@ class RadiopaediaSentenceEvidenceBuilder:
         self.tokenizer_name = tokenizer_name
         self.min_tokens = int(min_tokens)
         self.max_tokens = int(max_tokens)
+        self.heldout_article_ratio = float(heldout_article_ratio)
+        self.seed = int(seed)
+
         self.write_csv = bool(write_csv)
         self.write_parquet = bool(write_parquet)
         self.encoding = encoding
         self.tqdm_desc = tqdm_desc
+
+        self.rng = random.Random(self.seed)
 
         self._tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_name, use_fast=True)
         try:
@@ -978,7 +990,6 @@ class RadiopaediaSentenceEvidenceBuilder:
             re.I,
         )
 
-        # Broader concept map
         self.concepts: Dict[str, re.Pattern] = {
             "pleural effusion": re.compile(
                 r"\b("
@@ -1312,25 +1323,23 @@ class RadiopaediaSentenceEvidenceBuilder:
                 ) = self._sentence_flags(sent)
 
                 rows.append(
-                    asdict(
-                        EvidenceSentence(
-                            sentence_id=sentence_id,
-                            article_id=article_id,
-                            article_title=title,
-                            section_title=section_title,
-                            sentence_text=sent,
-                            sentence_token_count=int(self._token_count(sent)),
-                            article_relpath=relpath,
-                            sentence_hash=self._stable_hash(sent),
-                            is_chest_relevant=is_chest_relevant,
-                            is_definition_like=is_definition_like,
-                            is_metadata_like=is_metadata_like,
-                            is_fragment_like=is_fragment_like,
-                            matched_concepts_json=json.dumps(matched_concepts, ensure_ascii=False),
-                            concept_states_json=json.dumps(concept_states, ensure_ascii=False, sort_keys=True),
-                            num_matched_concepts=int(len(matched_concepts)),
-                        )
-                    )
+                    {
+                        "sentence_id": sentence_id,
+                        "article_id": article_id,
+                        "article_title": title,
+                        "section_title": section_title,
+                        "sentence_text": sent,
+                        "sentence_token_count": int(self._token_count(sent)),
+                        "article_relpath": relpath,
+                        "sentence_hash": self._stable_hash(sent),
+                        "is_chest_relevant": is_chest_relevant,
+                        "is_definition_like": is_definition_like,
+                        "is_metadata_like": is_metadata_like,
+                        "is_fragment_like": is_fragment_like,
+                        "matched_concepts_json": json.dumps(matched_concepts, ensure_ascii=False),
+                        "concept_states_json": json.dumps(concept_states, ensure_ascii=False, sort_keys=True),
+                        "num_matched_concepts": int(len(matched_concepts)),
+                    }
                 )
                 sentence_id += 1
 
@@ -1338,6 +1347,87 @@ class RadiopaediaSentenceEvidenceBuilder:
         pbar.close()
 
         return pd.DataFrame(rows)
+
+    # ----------------------------
+    # NEW: article-level split
+    # ----------------------------
+
+    def _article_concept_profile(self, df: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        article_ids = sorted(df["article_id"].astype(str).unique().tolist())
+
+        for aid in article_ids:
+            sub = df[df["article_id"].astype(str) == aid]
+            concepts_seen: Set[str] = set()
+
+            for s in sub["matched_concepts_json"].tolist():
+                try:
+                    xs = json.loads(s)
+                    if isinstance(xs, list):
+                        concepts_seen.update(str(x) for x in xs)
+                except Exception:
+                    pass
+
+            rows.append(
+                {
+                    "article_id": aid,
+                    "article_title": sub["article_title"].iloc[0] if len(sub) else "",
+                    "article_relpath": sub["article_relpath"].iloc[0] if len(sub) else "",
+                    "num_sentences": int(len(sub)),
+                    "num_chest_sentences": int((sub["is_chest_relevant"] == True).sum()),
+                    "num_matched_sentences": int((sub["num_matched_concepts"] > 0).sum()),
+                    "matched_concepts_json": json.dumps(sorted(concepts_seen), ensure_ascii=False),
+                }
+            )
+
+        return pd.DataFrame(rows)
+
+    def _make_article_split(self, df: pd.DataFrame) -> pd.DataFrame:
+        art = self._article_concept_profile(df)
+
+        # only stratify over articles that actually contain matched concepts
+        informative = art[art["num_matched_sentences"] > 0].copy()
+        noninformative = art[art["num_matched_sentences"] == 0].copy()
+
+        informative["concept_key"] = informative["matched_concepts_json"].astype(str)
+
+        test_article_ids: Set[str] = set()
+
+        # stratify approximately by concept-profile bucket
+        for key, g in informative.groupby("concept_key", sort=False):
+            article_ids = g["article_id"].astype(str).tolist()
+            self.rng.shuffle(article_ids)
+
+            n_test = max(1, int(round(len(article_ids) * self.heldout_article_ratio))) if len(article_ids) >= 3 else 0
+            test_article_ids.update(article_ids[:n_test])
+
+        # fill remaining from noninformative articles
+        all_article_ids = art["article_id"].astype(str).tolist()
+        target_test_n = int(round(len(all_article_ids) * self.heldout_article_ratio))
+
+        remaining_pool = [aid for aid in noninformative["article_id"].astype(str).tolist() if aid not in test_article_ids]
+        self.rng.shuffle(remaining_pool)
+
+        need = max(0, target_test_n - len(test_article_ids))
+        test_article_ids.update(remaining_pool[:need])
+
+        art["evidence_split"] = art["article_id"].astype(str).apply(
+            lambda x: "test" if x in test_article_ids else "trainval"
+        )
+        return art
+
+    def _attach_split_to_sentences(self, df: pd.DataFrame, article_split_df: pd.DataFrame) -> pd.DataFrame:
+        out = df.merge(
+            article_split_df[["article_id", "evidence_split"]],
+            on="article_id",
+            how="left",
+        )
+        out["evidence_split"] = out["evidence_split"].fillna("trainval")
+        return out
+
+    # ----------------------------
+    # write
+    # ----------------------------
 
     def _parquet_available(self) -> bool:
         try:
@@ -1352,16 +1442,35 @@ class RadiopaediaSentenceEvidenceBuilder:
             return False
 
     def write_outputs(self, df: pd.DataFrame) -> None:
-        csv_path = self.out_dir / "evidence_sentences.csv"
-        parquet_path = self.out_dir / "evidence_sentences.parquet"
+        full_csv_path = self.out_dir / "evidence_sentences.csv"
+        full_parquet_path = self.out_dir / "evidence_sentences.parquet"
+
+        trainval_csv_path = self.out_dir / "evidence_sentences_trainval.csv"
+        trainval_parquet_path = self.out_dir / "evidence_sentences_trainval.parquet"
+
+        test_csv_path = self.out_dir / "evidence_sentences_test.csv"
+        test_parquet_path = self.out_dir / "evidence_sentences_test.parquet"
+
+        article_split_csv_path = self.out_dir / "evidence_articles_split.csv"
+
+        article_split_df = self._make_article_split(df)
+        df = self._attach_split_to_sentences(df, article_split_df)
+
+        trainval_df = df[df["evidence_split"] == "trainval"].reset_index(drop=True)
+        test_df = df[df["evidence_split"] == "test"].reset_index(drop=True)
 
         if self.write_csv:
-            df.to_csv(csv_path, index=False)
+            df.to_csv(full_csv_path, index=False)
+            trainval_df.to_csv(trainval_csv_path, index=False)
+            test_df.to_csv(test_csv_path, index=False)
+            article_split_df.to_csv(article_split_csv_path, index=False)
 
         wrote_parquet = False
         if self.write_parquet:
             if self._parquet_available():
-                df.to_parquet(parquet_path, index=False)
+                df.to_parquet(full_parquet_path, index=False)
+                trainval_df.to_parquet(trainval_parquet_path, index=False)
+                test_df.to_parquet(test_parquet_path, index=False)
                 wrote_parquet = True
             else:
                 print("[WARN] Parquet requested but pyarrow/fastparquet not installed. Skipping parquet.")
@@ -1369,11 +1478,15 @@ class RadiopaediaSentenceEvidenceBuilder:
         manifest = {
             "snapshot_name": self.snapshot_name,
             "input_dir": str(self.in_dir.resolve()),
-            "num_articles": int(df["article_id"].nunique()) if not df.empty else 0,
-            "num_sentences": int(len(df)),
-            "num_sentences_with_any_concept_match": int((df["num_matched_concepts"] > 0).sum()) if not df.empty else 0,
             "tokenizer": self.tokenizer_name,
             "evidence_unit": "sentence",
+            "split_policy": {
+                "type": "article_level_stratified_holdout",
+                "heldout_article_ratio": self.heldout_article_ratio,
+                "seed": self.seed,
+                "trainval_usage": "verifier_train_and_val_oracle_supervision",
+                "test_usage": "oracle_test_and_retrieval_test_only",
+            },
             "content_policy": {
                 "content_rewritten": False,
                 "whitespace_normalized_only": True,
@@ -1383,9 +1496,25 @@ class RadiopaediaSentenceEvidenceBuilder:
                 "concept_specific_state_annotation": True,
             },
             "concepts_supported": sorted(list(self.concepts.keys())),
+            "counts": {
+                "num_articles_total": int(article_split_df["article_id"].nunique()) if not article_split_df.empty else 0,
+                "num_articles_trainval": int((article_split_df["evidence_split"] == "trainval").sum()) if not article_split_df.empty else 0,
+                "num_articles_test": int((article_split_df["evidence_split"] == "test").sum()) if not article_split_df.empty else 0,
+                "num_sentences_total": int(len(df)),
+                "num_sentences_trainval": int(len(trainval_df)),
+                "num_sentences_test": int(len(test_df)),
+                "num_sentences_with_any_concept_match_total": int((df["num_matched_concepts"] > 0).sum()) if not df.empty else 0,
+                "num_sentences_with_any_concept_match_trainval": int((trainval_df["num_matched_concepts"] > 0).sum()) if not trainval_df.empty else 0,
+                "num_sentences_with_any_concept_match_test": int((test_df["num_matched_concepts"] > 0).sum()) if not test_df.empty else 0,
+            },
             "files": {
-                "csv": "evidence_sentences.csv" if self.write_csv else None,
-                "parquet": "evidence_sentences.parquet" if wrote_parquet else None,
+                "full_csv": "evidence_sentences.csv" if self.write_csv else None,
+                "full_parquet": "evidence_sentences.parquet" if wrote_parquet else None,
+                "trainval_csv": "evidence_sentences_trainval.csv" if self.write_csv else None,
+                "trainval_parquet": "evidence_sentences_trainval.parquet" if wrote_parquet else None,
+                "test_csv": "evidence_sentences_test.csv" if self.write_csv else None,
+                "test_parquet": "evidence_sentences_test.parquet" if wrote_parquet else None,
+                "article_split_csv": "evidence_articles_split.csv" if self.write_csv else None,
             },
         }
 
@@ -1394,15 +1523,19 @@ class RadiopaediaSentenceEvidenceBuilder:
 
         print(f"Wrote: {manifest_path}")
         if self.write_csv:
-            print(f"Wrote: {csv_path}  (rows={len(df):,}, articles={manifest['num_articles']:,})")
+            print(f"Wrote: {full_csv_path}")
+            print(f"Wrote: {trainval_csv_path}")
+            print(f"Wrote: {test_csv_path}")
+            print(f"Wrote: {article_split_csv_path}")
         if wrote_parquet:
-            print(f"Wrote: {parquet_path}  (rows={len(df):,}, articles={manifest['num_articles']:,})")
+            print(f"Wrote: {full_parquet_path}")
+            print(f"Wrote: {trainval_parquet_path}")
+            print(f"Wrote: {test_parquet_path}")
 
     def run(self) -> pd.DataFrame:
         df = self.build_snapshot()
         self.write_outputs(df)
         return df
-
 
 
 
@@ -1880,6 +2013,13 @@ class RadiologyVerifierBinaryDatasetBuilder:
             out = pd.concat(kept_parts, axis=0).reset_index(drop=True)
             out["verifier_row_id"] = range(len(out))
 
+        # # subsampling for training
+        # pos = out[out["label_id"] == 1]
+        # neg = out[out["label_id"] == 0]
+        # neg_sampled = neg.sample(len(pos), random_state=13)
+        # out = pd.concat([pos, neg_sampled]).sample(frac=1, random_state=13).reset_index(drop=True)
+
+
         out.to_parquet(self.out_parquet, index=False)
 
         manifest = {
@@ -1932,6 +2072,509 @@ class RadiologyVerifierBinaryDatasetBuilder:
 
 
 
+
+
+@dataclass(frozen=True)
+class VerifierBinaryRow:
+    verifier_row_id: int
+    qa_row_id: int
+    split: str
+    subject_id: int
+    report_rel_path: str
+
+    concept: str
+    gold_state: str
+    claim_state: str
+    claim_text: str
+
+    case_context: str
+
+    evidence_sentence_ids_json: str
+    evidence_sentences_json: str
+    evidence_article_titles_json: str
+
+    row_type: str
+    evidence_source_type: str
+
+    label: str
+    label_id: int
+
+
+class RadiologyVerifierBinaryHeldoutRetrievedTestBuilder:
+    """
+    Build non-oracle held-out test data for the verifier.
+
+    Design:
+      - use only QA rows with split == "test"
+      - retrieve evidence only from held-out Radiopaedia test articles
+      - no oracle evidence selection
+      - create 2 rows per QA:
+            1) gold-state claim
+            2) opposite-state claim
+      - label = 1 only if:
+            claim_state == gold_state
+            AND at least one retrieved evidence sentence supports that claim
+      - otherwise label = 0
+
+    This is the realistic retrieval-based held-out test.
+    """
+
+    def __init__(
+        self,
+        qa_parquet: str,
+        evidence_sentences_test_parquet: str,
+        out_dir: str,
+        seed: int = 13,
+        retrieval_top_k_full: int = 8,
+        max_evidence_sentences: int = 5,
+        bm25_cache_name: str = "heldout_test_bm25.pkl",
+    ):
+        self.qa_parquet = Path(qa_parquet)
+        self.evidence_sentences_test_parquet = Path(evidence_sentences_test_parquet)
+        self.out_dir = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+        self.seed = int(seed)
+        self.rng = random.Random(self.seed)
+
+        self.retrieval_top_k_full = int(retrieval_top_k_full)
+        self.max_evidence_sentences = int(max_evidence_sentences)
+
+        self.out_parquet = self.out_dir / "verifier_binary_heldout_retrieval_test.parquet"
+        self.manifest_out = self.out_dir / "manifest_verifier_binary_heldout_retrieval_test.json"
+        self.bm25_cache_path = self.out_dir / bm25_cache_name
+
+        self.word_re = re.compile(r"[a-z0-9]+")
+        self.negation_re = re.compile(
+            r"\b(no|without|absent|negative for|free of|no evidence of|no focal|neither|none)\b",
+            re.I,
+        )
+        self.uncertainty_re = re.compile(
+            r"\b(possible|possibly|may|might|likely|unlikely|cannot exclude|could represent|"
+            r"suggestive of|question of|suspicious for|concerning for|may represent|appears to)\b",
+            re.I,
+        )
+        self.resolution_re = re.compile(
+            r"\b(resolved|improved|decreased|cleared|near complete resolution)\b",
+            re.I,
+        )
+
+        self.core_concepts = {
+            "pleural effusion",
+            "pneumothorax",
+            "pulmonary edema",
+            "consolidation",
+            "atelectasis",
+            "fracture",
+            "cardiomegaly",
+        }
+
+    # --------------------------------------------------
+    # helpers
+    # --------------------------------------------------
+
+    def _norm(self, s) -> str:
+        if s is None:
+            return ""
+        s = str(s).replace("\r\n", "\n").replace("\r", "\n")
+        s = re.sub(r"\s+", " ", s)
+        return s.strip()
+
+    def _tokens(self, s: str) -> List[str]:
+        return self.word_re.findall(self._norm(s).lower())
+
+    def _loads_json_list(self, s) -> List:
+        try:
+            out = json.loads(self._norm(s))
+            return out if isinstance(out, list) else []
+        except Exception:
+            return []
+
+    def _loads_json_dict(self, s) -> Dict:
+        try:
+            out = json.loads(self._norm(s))
+            return out if isinstance(out, dict) else {}
+        except Exception:
+            return {}
+
+    def _claim_text(self, concept: str, claim_state: str) -> str:
+        return f"{concept} is {claim_state}"
+
+    def _opposite_state(self, state: str) -> Optional[str]:
+        if state == "present":
+            return "absent"
+        if state == "absent":
+            return "present"
+        return None
+
+    def _build_query(self, claim_text: str, anchor_terms: List[str]) -> str:
+        if anchor_terms:
+            return f"{claim_text}\n\n" + " ".join(anchor_terms[:8])
+        return claim_text
+
+    def _is_imaging_like_support_sentence(self, s: str) -> bool:
+        s = self._norm(s).lower()
+        keywords = [
+            "on radiograph",
+            "on chest radiograph",
+            "on x-ray",
+            "on xray",
+            "on ct",
+            "on imaging",
+            "radiographic",
+            "imaging shows",
+            "appears as",
+            "seen as",
+            "findings include",
+            "demonstrates",
+            "demonstrated",
+            "visible on",
+            "characterized by",
+        ]
+        return any(k in s for k in keywords)
+
+    # --------------------------------------------------
+    # load
+    # --------------------------------------------------
+
+    def _load_qa(self) -> pd.DataFrame:
+        qa = pd.read_parquet(self.qa_parquet).copy()
+
+        required = {
+            "qa_row_id",
+            "subject_id",
+            "report_rel_path",
+            "split",
+            "concept",
+            "findings_text",
+            "claim_text",
+        }
+        missing = required - set(qa.columns)
+        if missing:
+            raise ValueError(f"QA parquet missing columns: {missing}")
+
+        if "gold_state" not in qa.columns:
+            qa["gold_state"] = qa["claim_text"].astype(str).str.extract(
+                r"\s+is\s+(present|absent|uncertain)\s*$", expand=False
+            )
+
+        qa["qa_row_id"] = pd.to_numeric(qa["qa_row_id"], errors="coerce")
+        qa["subject_id"] = pd.to_numeric(qa["subject_id"], errors="coerce")
+        qa = qa[~qa["qa_row_id"].isna() & ~qa["subject_id"].isna()].copy()
+        qa["qa_row_id"] = qa["qa_row_id"].astype(int)
+        qa["subject_id"] = qa["subject_id"].astype(int)
+
+        qa["concept"] = qa["concept"].astype(str).str.strip()
+        qa["gold_state"] = qa["gold_state"].astype(str).str.strip()
+        qa["case_context"] = qa["findings_text"].astype(str)
+        qa["anchor_terms_json"] = qa.get("anchor_terms_json", "[]")
+        qa["anchor_terms_json"] = qa["anchor_terms_json"].fillna("[]").astype(str)
+
+        qa = qa[qa["split"].astype(str) == "test"].copy()
+        qa = qa[qa["concept"].isin(self.core_concepts)].copy()
+        qa = qa[qa["gold_state"].isin(["present", "absent"])].copy()
+
+        return qa.reset_index(drop=True)
+
+    def _load_evidence(self) -> pd.DataFrame:
+        ev = pd.read_parquet(self.evidence_sentences_test_parquet).copy()
+
+        required = {
+            "sentence_id",
+            "sentence_text",
+            "article_title",
+            "matched_concepts_json",
+            "concept_states_json",
+            "is_chest_relevant",
+            "is_definition_like",
+            "is_metadata_like",
+            "is_fragment_like",
+        }
+        missing = required - set(ev.columns)
+        if missing:
+            raise ValueError(f"Evidence parquet missing columns: {missing}")
+
+        ev["sentence_id"] = pd.to_numeric(ev["sentence_id"], errors="coerce")
+        ev = ev[~ev["sentence_id"].isna()].copy()
+        ev["sentence_id"] = ev["sentence_id"].astype(int)
+        ev["sentence_text"] = ev["sentence_text"].astype(str)
+        ev["article_title"] = ev["article_title"].astype(str)
+
+        ev["matched_concepts"] = ev["matched_concepts_json"].apply(self._loads_json_list)
+        ev["concept_states"] = ev["concept_states_json"].apply(self._loads_json_dict)
+
+        ev = ev[ev["is_metadata_like"] == False].copy()
+        ev = ev[ev["is_definition_like"] == False].copy()
+        ev = ev[ev["is_fragment_like"] == False].copy()
+        ev = ev[ev["is_chest_relevant"] == True].copy()
+
+        return ev.reset_index(drop=True)
+
+    # --------------------------------------------------
+    # bm25
+    # --------------------------------------------------
+
+    def _build_bm25(self, ev: pd.DataFrame):
+        if self.bm25_cache_path.exists():
+            with open(self.bm25_cache_path, "rb") as f:
+                return pickle.load(f)
+
+        postings: Dict[str, List[Tuple[int, int]]] = {}
+        dfreq: Dict[str, int] = {}
+        sent_ids = ev["sentence_id"].tolist()
+        doc_len = np.zeros(len(ev), dtype=np.int32)
+
+        for i, text in enumerate(tqdm(ev["sentence_text"].tolist(), desc="Building heldout BM25", unit="sent")):
+            toks = self._tokens(text)
+            doc_len[i] = len(toks)
+
+            tf = {}
+            for t in toks:
+                tf[t] = tf.get(t, 0) + 1
+
+            for t, c in tf.items():
+                postings.setdefault(t, []).append((i, c))
+                dfreq[t] = dfreq.get(t, 0) + 1
+
+        n = len(ev)
+        avgdl = float(doc_len.mean()) if n else 0.0
+        idf = {t: math.log(1.0 + (n - df + 0.5) / (df + 0.5)) for t, df in dfreq.items()}
+
+        state = {
+            "sent_ids": sent_ids,
+            "postings": postings,
+            "idf": idf,
+            "doc_len": doc_len,
+            "avgdl": avgdl,
+            "k1": 1.2,
+            "b": 0.75,
+        }
+        with open(self.bm25_cache_path, "wb") as f:
+            pickle.dump(state, f)
+        return state
+
+    def _bm25_search(self, query: str, bm25_state, topk: int) -> List[int]:
+        toks = self._tokens(query)
+        if not toks:
+            return []
+
+        sent_ids = bm25_state["sent_ids"]
+        postings = bm25_state["postings"]
+        idf = bm25_state["idf"]
+        doc_len = bm25_state["doc_len"]
+        avgdl = bm25_state["avgdl"]
+        k1 = bm25_state["k1"]
+        b = bm25_state["b"]
+
+        scores = {}
+        for t in toks:
+            plist = postings.get(t, [])
+            idft = idf.get(t, 0.0)
+            for idx, tf in plist:
+                dl = float(doc_len[idx])
+                denom = tf + k1 * (1.0 - b + b * dl / (avgdl + 1e-12))
+                s = idft * (tf * (k1 + 1.0)) / (denom + 1e-12)
+                scores[idx] = scores.get(idx, 0.0) + float(s)
+
+        if not scores:
+            return []
+
+        best = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:topk]
+        return [int(sent_ids[i]) for i, _ in best]
+
+    # --------------------------------------------------
+    # support check on retrieved evidence
+    # --------------------------------------------------
+
+    def _retrieved_sentence_supports_claim(
+        self,
+        sent_meta: Dict[int, Dict[str, object]],
+        sentence_id: int,
+        concept: str,
+        claim_state: str,
+    ) -> bool:
+        meta = sent_meta.get(int(sentence_id))
+        if meta is None:
+            return False
+
+        concept_states = meta["concept_states"]
+        if concept not in concept_states:
+            return False
+
+        st = str(concept_states[concept]).strip()
+        sent_text = self._norm(meta["sentence_text"])
+
+        if st != claim_state:
+            return False
+
+        if concept not in sent_text.lower():
+            return False
+
+        if not self._is_imaging_like_support_sentence(sent_text):
+            return False
+
+        return True
+
+    def _make_one_row(
+        self,
+        verifier_row_id: int,
+        qa_row: pd.Series,
+        claim_state: str,
+        retrieved_ids: List[int],
+        retrieved_sents: List[str],
+        retrieved_titles: List[str],
+        label_id: int,
+    ) -> Dict:
+        label = "supported" if int(label_id) == 1 else "not_supported"
+
+        return asdict(
+            VerifierBinaryRow(
+                verifier_row_id=int(verifier_row_id),
+                qa_row_id=int(qa_row["qa_row_id"]),
+                split="test",
+                subject_id=int(qa_row["subject_id"]),
+                report_rel_path=str(qa_row["report_rel_path"]),
+                concept=str(qa_row["concept"]),
+                gold_state=str(qa_row["gold_state"]),
+                claim_state=str(claim_state),
+                claim_text=self._claim_text(str(qa_row["concept"]), str(claim_state)),
+                case_context=self._norm(qa_row["case_context"]),
+                evidence_sentence_ids_json=json.dumps([int(x) for x in retrieved_ids]),
+                evidence_sentences_json=json.dumps([self._norm(x) for x in retrieved_sents], ensure_ascii=False),
+                evidence_article_titles_json=json.dumps([self._norm(x) for x in retrieved_titles], ensure_ascii=False),
+                row_type="retrieved",
+                evidence_source_type=f"heldout_bm25_top{self.retrieval_top_k_full}",
+                label=label,
+                label_id=int(label_id),
+            )
+        )
+
+    # --------------------------------------------------
+    # main
+    # --------------------------------------------------
+
+    def run(self) -> pd.DataFrame:
+        qa = self._load_qa()
+        ev = self._load_evidence()
+        bm25_state = self._build_bm25(ev)
+
+        sent_meta = {
+            int(r["sentence_id"]): {
+                "sentence_text": str(r["sentence_text"]),
+                "article_title": str(r["article_title"]),
+                "concept_states": r["concept_states"],
+            }
+            for _, r in ev.iterrows()
+        }
+
+        rows: List[Dict] = []
+        verifier_row_id = 0
+
+        pbar = tqdm(total=len(qa), desc="Building heldout retrieval test", unit="qa")
+        for _, q in qa.iterrows():
+            concept = str(q["concept"])
+            gold_state = str(q["gold_state"])
+            opp_state = self._opposite_state(gold_state)
+            if opp_state is None:
+                pbar.update(1)
+                continue
+
+            anchor_terms = self._loads_json_list(q["anchor_terms_json"])
+            claim_states = [gold_state, opp_state]
+
+            for claim_state in claim_states:
+                claim_text = self._claim_text(concept, claim_state)
+                query = self._build_query(claim_text, anchor_terms)
+
+                retrieved_ids_full = self._bm25_search(query, bm25_state, self.retrieval_top_k_full)
+                retrieved_ids_full = [sid for sid in retrieved_ids_full if sid in sent_meta]
+
+                # label uses full retrieval set
+                any_support = any(
+                    self._retrieved_sentence_supports_claim(
+                        sent_meta=sent_meta,
+                        sentence_id=sid,
+                        concept=concept,
+                        claim_state=claim_state,
+                    )
+                    for sid in retrieved_ids_full
+                )
+
+                # model input uses truncated visible evidence only
+                retrieved_ids_shown = retrieved_ids_full[: self.max_evidence_sentences]
+                retrieved_sents = [self._norm(sent_meta[sid]["sentence_text"]) for sid in retrieved_ids_shown]
+                retrieved_titles = [self._norm(sent_meta[sid]["article_title"]) for sid in retrieved_ids_shown]
+
+                # label 1 only if claim matches case gold AND retrieved evidence supports that claim
+                label_id = int((claim_state == gold_state) and any_support)
+
+                rows.append(
+                    self._make_one_row(
+                        verifier_row_id=verifier_row_id,
+                        qa_row=q,
+                        claim_state=claim_state,
+                        retrieved_ids=retrieved_ids_shown,
+                        retrieved_sents=retrieved_sents,
+                        retrieved_titles=retrieved_titles,
+                        label_id=label_id,
+                    )
+                )
+                verifier_row_id += 1
+
+            pbar.update(1)
+        pbar.close()
+
+        out = pd.DataFrame(rows)
+        if out.empty:
+            raise ValueError("No heldout retrieval test rows were created.")
+
+        out.to_parquet(self.out_parquet, index=False)
+
+        manifest = {
+            "task": "binary_verifier_support",
+            "evaluation_mode": "heldout_retrieval_test",
+            "input_definition": "case_context + retrieved_heldout_evidence + claim -> supported / not_supported",
+            "labels": {"not_supported": 0, "supported": 1},
+            "retrieval": {
+                "method": "bm25",
+                "retrieval_top_k": self.retrieval_top_k_full,
+                "max_evidence_sentences": self.max_evidence_sentences,
+                "evidence_pool": str(self.evidence_sentences_test_parquet.resolve()),
+            },
+            "inputs": {
+                "qa_parquet": str(self.qa_parquet.resolve()),
+                "evidence_sentences_test_parquet": str(self.evidence_sentences_test_parquet.resolve()),
+            },
+            "outputs": {
+                "heldout_retrieval_test_parquet": str(self.out_parquet.resolve()),
+            },
+            "params": {
+                "seed": self.seed,
+                "core_concepts": sorted(self.core_concepts),
+            },
+            "counts": {
+                "num_rows": int(len(out)),
+                "num_supported": int((out["label_id"] == 1).sum()),
+                "num_not_supported": int((out["label_id"] == 0).sum()),
+                "num_unique_qa_rows": int(out["qa_row_id"].nunique()),
+            },
+            "counts_by_concept": {k: int(v) for k, v in out["concept"].value_counts().to_dict().items()},
+        }
+
+        self.manifest_out.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+        print(f"Wrote: {self.out_parquet}")
+        print(f"Wrote: {self.manifest_out}")
+        print("\nLabel counts:")
+        print(out["label"].value_counts(dropna=False).to_string())
+
+        return out
+
+
+
+
+
+
 if __name__ == "__main__":
 
     with open(global_config_path, 'r') as yaml_file:
@@ -1956,10 +2599,12 @@ if __name__ == "__main__":
     # evidence_builder = RadiopaediaSentenceEvidenceBuilder(
     #     in_dir=os.path.join(base_path_evidenceData, "articles_clean_txt"),
     #     out_dir=base_path_evidenceData,
-    #     snapshot_name=params['Preprocessing']['snapshot_name'],
+    #     snapshot_name=params["Preprocessing"]["snapshot_name"],
     #     tokenizer_name=params["Preprocessing"]["tokenizer_name"],
     #     min_tokens=7,
     #     max_tokens=50,
+    #     heldout_article_ratio=0.20,
+    #     seed=13,
     #     write_csv=True,
     #     write_parquet=True,
     #     encoding="utf-8",
@@ -1968,15 +2613,28 @@ if __name__ == "__main__":
 
 
 
-
     ''' step 6 '''
-    verifier_builder = RadiologyVerifierBinaryDatasetBuilder(
+    # verifier_builder = RadiologyVerifierBinaryDatasetBuilder(
+    #     qa_parquet=os.path.join(base_path_mimicData, "grounding_dataset", "qa_grounding_main_with_anchors.parquet"),
+    #     evidence_sentences_parquet=os.path.join(base_path_evidenceData, "evidence_sentences_trainval.parquet"),
+    #     out_dir=os.path.join(base_path_evidenceData, "verifier_binary_dataset"),
+    #     seed=13,
+    #     max_evidence_sentences=2,
+    #     max_rows_per_type_per_concept_split=None,
+    # )
+    # verifier_df = verifier_builder.run()
+
+
+
+    ''' mimic held-out test '''
+    heldout_test_builder = RadiologyVerifierBinaryHeldoutRetrievedTestBuilder(
         qa_parquet=os.path.join(base_path_mimicData, "grounding_dataset", "qa_grounding_main_with_anchors.parquet"),
-        evidence_sentences_parquet=os.path.join(base_path_evidenceData, "evidence_sentences.parquet"),
-        out_dir=os.path.join(base_path_evidenceData, "verifier_binary_dataset"),
+        evidence_sentences_test_parquet=os.path.join(base_path_evidenceData, "evidence_sentences_test.parquet"),
+        out_dir=os.path.join(base_path_evidenceData, "verifier_binary_dataset_heldout_test"),
         seed=13,
-        max_evidence_sentences=2,
-        max_rows_per_type_per_concept_split=None,
+        retrieval_top_k_full=30,
+        max_evidence_sentences=8,
     )
-    verifier_df = verifier_builder.run()
+    heldout_test_df = heldout_test_builder.run()
+
 

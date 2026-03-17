@@ -21,7 +21,8 @@ import math
 import torch
 from torch.utils.data import Sampler
 from typing import Iterator, Optional
-
+import random
+import re
 
 from config.serde import read_config
 
@@ -30,200 +31,444 @@ from config.serde import read_config
 
 
 
-
 @dataclass(frozen=True)
 class RetrieverBatch:
-    queries: List[str]                       # B
-    docs: List[str]                          # B*K
-    pos_mask: torch.Tensor                   # (B, B*K) bool, True where doc is positive for query
-    pos_weights: torch.Tensor                # (B, B*K) float, weights only on positives (0 elsewhere)
+    queries: List[str]
+    pos_docs: List[str]
+    neg_docs: List[List[str]]
+    qa_row_ids: Optional[List[int]]
 
 
-class RadiopaediaChunksStore:
+class RadiopaediaSentenceStore:
     """
-    Loads chunk_id -> chunk_text into memory.
-    If your chunks table is huge, replace this with an Arrow-backed lookup,
-    but for typical Radiopaedia chunk counts this is fine.
+    Sentence-level evidence store with lightweight BM25 support.
     """
-    def __init__(self, chunks_parquet: str, chunk_id_col: str = "chunk_id", chunk_text_col: str = "chunk_text"):
-        self.chunks_parquet = chunks_parquet
-        self.chunk_id_col = chunk_id_col
-        self.chunk_text_col = chunk_text_col
 
-        df = pd.read_parquet(chunks_parquet, columns=[chunk_id_col, chunk_text_col])
-        df[chunk_id_col] = pd.to_numeric(df[chunk_id_col], errors="coerce")
-        df = df.dropna(subset=[chunk_id_col]).copy()
-        df[chunk_id_col] = df[chunk_id_col].astype(int)
-        df[chunk_text_col] = df[chunk_text_col].astype(str)
+    def __init__(
+        self,
+        evidence_sentences_parquet: str,
+        sentence_id_col: str = "sentence_id",
+        sentence_text_col: str = "sentence_text",
+        chest_col: str = "is_chest_relevant",
+        definition_col: str = "is_definition_like",
+        metadata_col: str = "is_metadata_like",
+        article_title_col: str = "article_title",
+    ):
+        if not os.path.exists(evidence_sentences_parquet):
+            raise FileNotFoundError(f"Evidence sentences parquet not found: {evidence_sentences_parquet}")
 
-        self.id2text: Dict[int, str] = dict(zip(df[chunk_id_col].tolist(), df[chunk_text_col].tolist()))
+        cols = [sentence_id_col, sentence_text_col, chest_col, definition_col, metadata_col, article_title_col]
+        df = pd.read_parquet(evidence_sentences_parquet, columns=cols)
 
-    def get(self, chunk_id: int) -> str:
-        return self.id2text.get(int(chunk_id), "")
+        df[sentence_id_col] = pd.to_numeric(df[sentence_id_col], errors="coerce")
+        df = df.dropna(subset=[sentence_id_col]).copy()
+        df[sentence_id_col] = df[sentence_id_col].astype(int)
+        df[sentence_text_col] = df[sentence_text_col].astype(str)
 
+        for c in [chest_col, definition_col, metadata_col]:
+            if c in df.columns:
+                df[c] = df[c].fillna(False).astype(bool)
+            else:
+                df[c] = False
 
+        if article_title_col not in df.columns:
+            df[article_title_col] = ""
+
+        self.sentence_id_col = sentence_id_col
+        self.sentence_text_col = sentence_text_col
+        self.chest_col = chest_col
+        self.definition_col = definition_col
+        self.metadata_col = metadata_col
+        self.article_title_col = article_title_col
+
+        self.df = df.reset_index(drop=True)
+
+        self.id2text: Dict[int, str] = dict(zip(df[sentence_id_col].tolist(), df[sentence_text_col].tolist()))
+        self.id2meta: Dict[int, Dict[str, object]] = {
+            int(r[sentence_id_col]): {
+                "sentence_text": str(r[sentence_text_col]),
+                "is_chest_relevant": bool(r[chest_col]),
+                "is_definition_like": bool(r[definition_col]),
+                "is_metadata_like": bool(r[metadata_col]),
+                "article_title": str(r[article_title_col]),
+            }
+            for _, r in df.iterrows()
+        }
+        self.all_sentence_ids: List[int] = list(self.id2text.keys())
+
+        self.word_re = re.compile(r"[a-z0-9]+")
+        self._build_bm25()
+
+    def _tokens(self, s: str) -> List[str]:
+        return self.word_re.findall(str(s).lower())
+
+    def _build_bm25(self):
+        postings: Dict[str, List[Tuple[int, int]]] = {}
+        dfreq: Dict[str, int] = {}
+        doc_len = np.zeros(len(self.df), dtype=np.int32)
+        sent_ids = self.df[self.sentence_id_col].tolist()
+
+        for i, text in enumerate(self.df[self.sentence_text_col].tolist()):
+            toks = self._tokens(text)
+            doc_len[i] = len(toks)
+
+            tf = {}
+            for t in toks:
+                tf[t] = tf.get(t, 0) + 1
+
+            for t, c in tf.items():
+                postings.setdefault(t, []).append((i, c))
+                dfreq[t] = dfreq.get(t, 0) + 1
+
+        n = len(self.df)
+        avgdl = float(doc_len.mean()) if n > 0 else 0.0
+        idf = {t: math.log(1.0 + (n - df + 0.5) / (df + 0.5)) for t, df in dfreq.items()}
+
+        self._bm25_state = {
+            "sent_ids": sent_ids,
+            "postings": postings,
+            "idf": idf,
+            "doc_len": doc_len,
+            "avgdl": avgdl,
+            "k1": 1.2,
+            "b": 0.75,
+        }
+
+    def bm25_search(self, query: str, topk: int) -> List[int]:
+        toks = self._tokens(query)
+        if not toks:
+            return []
+
+        sent_ids = self._bm25_state["sent_ids"]
+        postings = self._bm25_state["postings"]
+        idf = self._bm25_state["idf"]
+        doc_len = self._bm25_state["doc_len"]
+        avgdl = self._bm25_state["avgdl"]
+        k1 = self._bm25_state["k1"]
+        b = self._bm25_state["b"]
+
+        scores = {}
+        for t in toks:
+            plist = postings.get(t, [])
+            idft = idf.get(t, 0.0)
+            for idx, tf in plist:
+                dl = float(doc_len[idx])
+                denom = tf + k1 * (1.0 - b + b * dl / (avgdl + 1e-12))
+                s = idft * (tf * (k1 + 1.0)) / (denom + 1e-12)
+                scores[idx] = scores.get(idx, 0.0) + float(s)
+
+        best = sorted(scores.items(), key=lambda x: x[1], reverse=True)[:topk]
+        return [int(sent_ids[i]) for i, _ in best]
+
+    def get(self, sentence_id: int) -> str:
+        return self.id2text.get(int(sentence_id), "")
+
+    def get_meta(self, sentence_id: int) -> Dict[str, object]:
+        return self.id2meta.get(int(sentence_id), {})
 
 
 class RetrieverSupervisionDataset(Dataset):
     """
-    Reads retriever_supervision.parquet and returns:
-      claim_text, pos_chunk_ids(list), pos_weights(list)
-
-    Requires columns:
-      - split
-      - claim_text
-      - pos_chunk_ids_json
-      - pos_weights_json
+    Reads Step 6 retriever supervision and returns one positive + hard negatives.
+    Config-driven version.
     """
+
     def __init__(
         self,
-        cfg_path,
-        chunks_store: RadiopaediaChunksStore,
+        cfg_path: str,
+        sentence_store: RadiopaediaSentenceStore,
         split_name: str,
-        top_k: int = 20,
-        min_pos_weight: float = 0.0,
-        claim_col: str = "claim_text",
+        supervision_relpath: Optional[str] = None,
         split_col: str = "split",
-        pos_ids_col: str = "pos_chunk_ids_json",
-        pos_w_col: str = "pos_weights_json",
+        qa_row_id_col: str = "qa_row_id",
+        query_col: str = "retrieval_query",
+        concept_col: str = "concept",
+        gold_state_col: str = "gold_state",
+        pos_ids_col: str = "positive_sentence_ids_json",
+        pos_texts_col: str = "positive_sentences_json",
+        bm25_pool_size: Optional[int] = None,
+        num_hard_negatives: Optional[int] = None,
+        seed: Optional[int] = None,
     ):
         self.cfg_path = cfg_path
         self.params = read_config(cfg_path)
-
-        self.chunks_store = chunks_store
-        self.top_k = int(top_k)
-        self.min_pos_weight = float(min_pos_weight)
         self.base_path = self.params["Preprocessing"]["base_path_evidenceData"]
 
-        retriever_supervision_path = os.path.join(self.base_path, "step4c_supervision/retriever_supervision.parquet")
+        self.sentence_store = sentence_store
+        self.split_name = str(split_name)
+
+        self.split_col = str(split_col)
+        self.qa_row_id_col = str(qa_row_id_col)
+        self.query_col = str(query_col)
+        self.concept_col = str(concept_col)
+        self.gold_state_col = str(gold_state_col)
+        self.pos_ids_col = str(pos_ids_col)
+        self.pos_texts_col = str(pos_texts_col)
+
+        if supervision_relpath is None:
+            supervision_relpath = self.params["retriever"].get(
+                "supervision_relpath",
+                "step6_final_supervision/retriever_supervision.parquet",
+            )
+        self.supervision_relpath = str(supervision_relpath)
+
+        if bm25_pool_size is None:
+            bm25_pool_size = int(self.params["retriever"]["bm25_pool_size"])
+        if num_hard_negatives is None:
+            num_hard_negatives = int(self.params["retriever"]["num_hard_negatives"])
+        if seed is None:
+            seed = int(self.params["Network"]["seed"])
+
+        self.bm25_pool_size = int(bm25_pool_size)
+        self.num_hard_negatives = int(num_hard_negatives)
+        self.base_seed = int(seed)
+
+        retriever_supervision_path = os.path.join(self.base_path, self.supervision_relpath)
+        if not os.path.exists(retriever_supervision_path):
+            raise FileNotFoundError(f"Retriever supervision parquet not found: {retriever_supervision_path}")
+
         df = pd.read_parquet(retriever_supervision_path)
 
-        for c in [split_col, claim_col, pos_ids_col, pos_w_col]:
+        required = [self.split_col, self.qa_row_id_col, self.query_col, self.pos_ids_col]
+        for c in required:
             if c not in df.columns:
                 raise ValueError(f"Missing required column in retriever supervision: {c}")
 
-        df[split_col] = df[split_col].astype(str)
-        df = df[df[split_col] == str(split_name)].reset_index(drop=True)
+        df[self.split_col] = df[self.split_col].astype(str)
+        df = df[df[self.split_col] == self.split_name].reset_index(drop=True)
+        df[self.query_col] = df[self.query_col].astype(str)
 
-        df[claim_col] = df[claim_col].astype(str)
+        self.has_pos_texts = self.pos_texts_col in df.columns
+        self.has_concept = self.concept_col in df.columns
+        self.has_gold_state = self.gold_state_col in df.columns
 
         self.df = df
-        self.claim_col = claim_col
-        self.pos_ids_col = pos_ids_col
-        self.pos_w_col = pos_w_col
 
+        self.negation_re = re.compile(r"\b(no|without|absent|negative for|free of|no evidence of|no focal|neither)\b", re.I)
+        self.uncertainty_re = re.compile(r"\b(possible|possibly|may|might|likely|unlikely|cannot exclude|could represent|suggestive of|question of)\b", re.I)
+        self.resolution_re = re.compile(r"\b(resolved|improved|decreased|cleared|near complete resolution)\b", re.I)
 
+        self.concepts = {
+            "pleural effusion": re.compile(r"\bpleural effusions?\b|\beffusions?\b", re.I),
+            "pneumothorax": re.compile(r"\bpneumothorax\b|\bpneumothoraces\b", re.I),
+            "cardiomegaly": re.compile(
+                r"\bcardiomegaly\b|"
+                r"\benlarged cardiac silhouette\b|"
+                r"\bcardiac silhouette is enlarged\b|"
+                r"\bcardiac silhouette enlarged\b|"
+                r"\benlarged heart\b|"
+                r"\bheart is enlarged\b|"
+                r"\bheart size is enlarged\b|"
+                r"\bheart size enlarged\b|"
+                r"\bheart is mildly enlarged\b|"
+                r"\bmild cardiomegaly\b", re.I
+            ),
+            "atelectasis": re.compile(
+                r"\batelectasis\b|"
+                r"\batelectatic\b|"
+                r"\bsubsegmental atelectatic\b|"
+                r"\bbibasilar atelectatic\b|"
+                r"\bbasal atelectatic\b", re.I
+            ),
+            "consolidation": re.compile(
+                r"\bconsolidation\b|"
+                r"\blobar consolidation\b|"
+                r"\bfocal consolidation\b|"
+                r"\bairspace consolidation\b", re.I
+            ),
+            "pulmonary edema": re.compile(r"\bpulmonary edema\b|\bedema\b", re.I),
+            "vascular congestion": re.compile(
+                r"\bvascular congestion\b|"
+                r"\bpulmonary vascular congestion\b|"
+                r"\bcentral pulmonary vascular congestion\b|"
+                r"\bvascular indistinctness\b|"
+                r"\bhilar vasculature\b", re.I
+            ),
+            "interstitial edema": re.compile(r"\binterstitial edema\b|\binterstitial pulmonary edema\b", re.I),
+        }
 
     def __len__(self) -> int:
         return len(self.df)
 
-
-
     def _loads(self, s: str) -> List:
         try:
-            return json.loads(s)
+            out = json.loads(str(s))
+            return out if isinstance(out, list) else []
         except Exception:
             return []
 
+    def _rng_for_row(self, qa_row_id: int) -> random.Random:
+        return random.Random(self.base_seed + int(qa_row_id))
 
+    def _concept_mentioned(self, sent: str, concept: str) -> bool:
+        pat = self.concepts.get(concept)
+        if pat is None:
+            return False
+        return bool(pat.search(sent))
+
+    def _classify_sentence_state(self, sent: str, concept: str) -> str:
+        if not self._concept_mentioned(sent, concept):
+            return ""
+        if self.negation_re.search(sent):
+            return "absent"
+        if self.uncertainty_re.search(sent):
+            return "uncertain"
+        if self.resolution_re.search(sent):
+            return "absent"
+        return "present"
+
+    def _is_sentence_usable_negative(self, sid: int) -> bool:
+        meta = self.sentence_store.get_meta(sid)
+        if not meta:
+            return False
+        if bool(meta.get("is_metadata_like", False)):
+            return False
+        if bool(meta.get("is_definition_like", False)):
+            return False
+
+        txt = str(meta.get("sentence_text", "")).strip()
+        if not txt:
+            return False
+
+        toks = re.findall(r"[a-z0-9]+", txt.lower())
+        return len(toks) >= 6
+
+    def _mine_hard_negative_ids(
+        self,
+        query: str,
+        concept: str,
+        gold_state: str,
+        positive_ids: List[int],
+        qa_row_id: int,
+    ) -> List[int]:
+        rng = self._rng_for_row(qa_row_id)
+        pos_set = set(int(x) for x in positive_ids)
+
+        bm25_ids = self.sentence_store.bm25_search(query, topk=self.bm25_pool_size)
+
+        wrong_state = []
+        near_topic_no_concept = []
+        fallback = []
+
+        for sid in bm25_ids:
+            sid = int(sid)
+            if sid in pos_set:
+                continue
+            if not self._is_sentence_usable_negative(sid):
+                continue
+
+            txt = self.sentence_store.get(sid)
+            if not txt.strip():
+                continue
+
+            has_concept = self._concept_mentioned(txt, concept)
+            if has_concept:
+                st = self._classify_sentence_state(txt, concept)
+                if st and st != gold_state:
+                    wrong_state.append(sid)
+            else:
+                near_topic_no_concept.append(sid)
+
+        if len(wrong_state) + len(near_topic_no_concept) < self.num_hard_negatives:
+            all_ids = self.sentence_store.all_sentence_ids[:]
+            rng.shuffle(all_ids)
+            for sid in all_ids:
+                sid = int(sid)
+                if sid in pos_set:
+                    continue
+                if sid in wrong_state or sid in near_topic_no_concept or sid in fallback:
+                    continue
+                if not self._is_sentence_usable_negative(sid):
+                    continue
+
+                meta = self.sentence_store.get_meta(sid)
+                if not bool(meta.get("is_chest_relevant", False)):
+                    continue
+
+                fallback.append(sid)
+                if len(wrong_state) + len(near_topic_no_concept) + len(fallback) >= self.num_hard_negatives:
+                    break
+
+        ordered = wrong_state + near_topic_no_concept + fallback
+
+        uniq = []
+        seen = set()
+        for sid in ordered:
+            if sid not in seen:
+                seen.add(sid)
+                uniq.append(sid)
+
+        return uniq[: self.num_hard_negatives]
 
     def __getitem__(self, idx: int):
         row = self.df.iloc[idx]
-        claim = str(row[self.claim_col]).strip()
 
-        ids = self._loads(str(row[self.pos_ids_col]))
-        w = self._loads(str(row[self.pos_w_col]))
+        qa_row_id = int(row[self.qa_row_id_col])
+        query = str(row[self.query_col]).strip()
 
-        ids = [int(x) for x in ids][: self.top_k]
-        w = [float(x) for x in w][: self.top_k]
+        pos_ids = [int(x) for x in self._loads(row[self.pos_ids_col])]
+        pos_docs = []
 
-        # length align
-        m = min(len(ids), len(w))
-        ids, w = ids[:m], w[:m]
+        for sid in pos_ids:
+            txt = self.sentence_store.get(sid)
+            if txt and txt.strip():
+                pos_docs.append((sid, txt.strip()))
 
-        # filter low-weight positives
-        if self.min_pos_weight > 0:
-            keep = [(i, ww) for i, ww in zip(ids, w) if ww >= self.min_pos_weight]
-            ids = [i for i, _ in keep]
-            w = [ww for _, ww in keep]
+        if len(pos_docs) == 0:
+            return {
+                "qa_row_id": qa_row_id,
+                "query": query,
+                "pos_doc": "",
+                "neg_docs": [],
+            }
 
-        # normalize weights per query (sum to 1)
-        if len(w) > 0:
-            s = float(np.sum(w))
-            if s > 0:
-                w = [float(x / s) for x in w]
-            else:
-                w = [1.0 / len(w) for _ in w]
+        rng = self._rng_for_row(qa_row_id)
+        _, pos_doc = rng.choice(pos_docs)
 
-        # materialize doc texts now (fast dict lookup)
-        docs = [self.chunks_store.get(i) for i in ids]
+        concept = str(row[self.concept_col]).strip() if self.has_concept else ""
+        gold_state = str(row[self.gold_state_col]).strip() if self.has_gold_state else ""
 
-        # drop empty docs
-        ids2, docs2, w2 = [], [], []
-        for i, d, ww in zip(ids, docs, w):
-            if d and d.strip():
-                ids2.append(i)
-                docs2.append(d)
-                w2.append(float(ww))
+        neg_ids = self._mine_hard_negative_ids(
+            query=query,
+            concept=concept,
+            gold_state=gold_state,
+            positive_ids=[sid for sid, _ in pos_docs],
+            qa_row_id=qa_row_id,
+        )
 
-        # if everything collapsed, return empty positives (trainer will skip)
+        neg_docs = []
+        for sid in neg_ids:
+            txt = self.sentence_store.get(sid)
+            if txt and txt.strip():
+                neg_docs.append(txt.strip())
+
         return {
-            "claim_text": claim,
-            "pos_docs": docs2,
-            "pos_weights": w2,
+            "qa_row_id": qa_row_id,
+            "query": query,
+            "pos_doc": pos_doc,
+            "neg_docs": neg_docs,
         }
 
 
+def retriever_collate_fn(batch: List[Dict]) -> RetrieverBatch:
+    queries = []
+    pos_docs = []
+    neg_docs = []
+    qa_row_ids = []
 
+    for item in batch:
+        queries.append(str(item.get("query", "")).strip())
+        pos_docs.append(str(item.get("pos_doc", "")).strip())
+        neg_docs.append([str(x).strip() for x in item.get("neg_docs", []) if str(x).strip()])
+        qa_row_ids.append(int(item.get("qa_row_id", -1)))
 
+    return RetrieverBatch(
+        queries=queries,
+        pos_docs=pos_docs,
+        neg_docs=neg_docs,
+        qa_row_ids=qa_row_ids,
+    )
 
-def retriever_collate_fn(batch: List[Dict], top_k: int) -> Optional[RetrieverBatch]:
-    """
-    Makes fixed K positives per query by:
-      - if fewer than K, pad with empty strings and 0 weight
-      - if more than K, truncate
-    Creates (B, B*K) mask and weights for weighted multi-positive InfoNCE.
-    """
-    B = len(batch)
-    K = int(top_k)
-
-    queries: List[str] = []
-    docs: List[str] = []
-
-    pos_mask = torch.zeros((B, B * K), dtype=torch.bool)
-    pos_weights = torch.zeros((B, B * K), dtype=torch.float32)
-
-    # if any item has no positives, we still keep it but it will produce zero numerator
-    for i, item in enumerate(batch):
-        q = str(item["claim_text"]).strip()
-        queries.append(q)
-
-        pos_docs = list(item.get("pos_docs", []))[:K]
-        w = list(item.get("pos_weights", []))[:K]
-
-        # pad
-        if len(pos_docs) < K:
-            pad_n = K - len(pos_docs)
-            pos_docs = pos_docs + [""] * pad_n
-            w = w + [0.0] * pad_n
-
-        # renormalize over nonzero weights (for stability)
-        nz = [x for x in w if x > 0]
-        if len(nz) > 0:
-            s = float(np.sum(nz))
-            if s > 0:
-                w = [float(x / s) if x > 0 else 0.0 for x in w]
-
-        # place docs in flat doc list
-        base = i * K
-        for j in range(K):
-            docs.append(pos_docs[j])
-
-            if pos_docs[j].strip() and w[j] > 0:
-                pos_mask[i, base + j] = True
-                pos_weights[i, base + j] = float(w[j])
-
-    return RetrieverBatch(queries=queries, docs=docs, pos_mask=pos_mask, pos_weights=pos_weights)
 
 
 
@@ -232,159 +477,42 @@ def retriever_collate_fn(batch: List[Dict], top_k: int) -> Optional[RetrieverBat
 class VerifierBatch:
     inputs: List[str]
     targets: torch.Tensor
-    qa_row_ids: Optional[List[int]]
+    qa_row_ids: List[int]
+    verifier_row_ids: List[int]
 
 
-class EvidenceTextStore:
+class VerifierBinaryDataset(Dataset):
     """
-    Deterministic chunk_id -> chunk_text lookup.
+    Reads binary verifier supervision parquet.
 
-    Assumption:
-      chunk_id is the row index in the evidence parquet (0-based).
-    If chunk ids are 1-based, set id_base=1.
-    """
+    Input format:
+        CASE + EVIDENCE + CLAIM
 
-    def __init__(
-        self,
-        evidence_parquet_path: str,
-        text_col: str = "chunk_text",
-        id_base: int = 0,
-        preload: bool = False,
-        cache_row_groups: int = 2,
-    ) -> None:
-        if not os.path.exists(evidence_parquet_path):
-            raise FileNotFoundError(f"Evidence parquet not found: {evidence_parquet_path}")
-
-        self.path = evidence_parquet_path
-        self.text_col = str(text_col)
-        self.id_base = int(id_base)
-        self.preload = bool(preload)
-        self.cache_row_groups = int(cache_row_groups)
-
-        self.pf = pq.ParquetFile(self.path)
-        if self.text_col not in set(self.pf.schema.names):
-            raise ValueError(f"Evidence parquet missing required text column: {self.text_col}")
-
-        self._rg_num_rows = [self.pf.metadata.row_group(i).num_rows for i in range(self.pf.num_row_groups)]
-        self._rg_prefix = np.cumsum([0] + self._rg_num_rows).tolist()
-        self._total_rows = self._rg_prefix[-1]
-
-        self._rg_cache: Dict[int, List[str]] = {}
-        self._rg_cache_order: List[int] = []
-
-        self._texts: Optional[List[str]] = None
-        if self.preload:
-            self._texts = self.pf.read(columns=[self.text_col]).column(0).to_pylist()
-
-    def _cache_put(self, rg: int, texts: List[str]) -> None:
-        self._rg_cache[rg] = texts
-        self._rg_cache_order.append(rg)
-        while len(self._rg_cache_order) > self.cache_row_groups:
-            old = self._rg_cache_order.pop(0)
-            self._rg_cache.pop(old, None)
-
-    def _row_to_rg(self, row_idx: int) -> Tuple[int, int]:
-        lo, hi = 0, len(self._rg_prefix) - 2
-        while lo <= hi:
-            mid = (lo + hi) // 2
-            if self._rg_prefix[mid] <= row_idx < self._rg_prefix[mid + 1]:
-                return mid, row_idx - self._rg_prefix[mid]
-            if row_idx < self._rg_prefix[mid]:
-                hi = mid - 1
-            else:
-                lo = mid + 1
-        raise IndexError(f"row_idx out of range: {row_idx}")
-
-    def get(self, chunk_id: int) -> str:
-        if chunk_id is None:
-            return ""
-        try:
-            row_idx = int(chunk_id) - self.id_base
-        except Exception:
-            return ""
-
-        if row_idx < 0 or row_idx >= self._total_rows:
-            return ""
-
-        if self._texts is not None:
-            x = self._texts[row_idx]
-            return "" if x is None or str(x).lower() == "nan" else str(x)
-
-        rg, off = self._row_to_rg(row_idx)
-        cached = self._rg_cache.get(rg)
-        if cached is None:
-            t = self.pf.read_row_group(rg, columns=[self.text_col])
-            cached = t.column(0).to_pylist()
-            self._cache_put(rg, cached)
-
-        x = cached[off]
-        return "" if x is None or str(x).lower() == "nan" else str(x)
-
-
-class VerifierSupervisionDataset(Dataset):
-    """
-    Reads Step 4C verifier_supervision.parquet and materializes evidence text on-the-fly
-    using a frozen evidence chunk store.
-
-    Updated for the new pipeline:
-      - supports supporting_span / retrieval_query columns
-      - sorts evidence by evidence_weights_json before truncating to top-k
-      - keeps verifier input as CASE + QUESTION + CLAIM + EVIDENCE
+    Expected parquet columns:
+        verifier_row_id
+        qa_row_id
+        split
+        case_context
+        claim_text
+        evidence_sentences_json
+        label_id
     """
 
     def __init__(
         self,
         cfg_path: str,
         split_name: str,
-        supervision_relpath: str = "step4c_supervision/verifier_supervision.parquet",
-        evidence_parquet_relpath: str = "chunks.parquet",
-        evidence_text_col: str = "chunk_text",
-        evidence_id_base: int = 0,
-        preload_evidence_texts: bool = False,
-        evidence_cache_row_groups: int = 2,
-        split_col: str = "split",
-        qa_row_id_col: str = "qa_row_id",
-        case_context_col: str = "case_context",
-        question_col: str = "question",
-        answer_col: str = "answer_target",
-        claim_col: str = "claim_text",
-        supporting_span_col: str = "supporting_span",
-        retrieval_query_col: str = "retrieval_query",
-        evidence_ids_col: str = "evidence_chunk_ids_json",
-        evidence_weights_col: str = "evidence_weights_json",
-        target_col: str = "soft_support_score",
-        evidence_separator: str = "\n\n---\n\n",
-        max_evidence_chars: int = 20_000,
-        verifier_top_k_evidence: int = 5,
-        join_with_newlines: bool = True,
-        cache_row_groups: int = 2,
-        assume_split_is_string: bool = True,
+        supervision_relpath: str = "verifier_binary_dataset/verifier_binary_trainvaltest.parquet",
+        max_evidence_sentences: int = 2,
+        max_evidence_chars: int = 12000,
     ) -> None:
         self.cfg_path = cfg_path
         self.params = read_config(cfg_path)
         self.base_path = self.params["Preprocessing"]["base_path_evidenceData"]
 
         self.split_name = str(split_name)
-
-        self.split_col = str(split_col)
-        self.qa_row_id_col = str(qa_row_id_col)
-        self.case_context_col = str(case_context_col)
-        self.question_col = str(question_col)
-        self.answer_col = str(answer_col)
-        self.claim_col = str(claim_col)
-        self.supporting_span_col = str(supporting_span_col)
-        self.retrieval_query_col = str(retrieval_query_col)
-        self.evidence_ids_col = str(evidence_ids_col)
-        self.evidence_weights_col = str(evidence_weights_col)
-        self.target_col = str(target_col)
-
-        self.evidence_separator = str(evidence_separator)
+        self.max_evidence_sentences = int(max_evidence_sentences)
         self.max_evidence_chars = int(max_evidence_chars)
-        self.verifier_top_k_evidence = int(verifier_top_k_evidence)
-        self.join_with_newlines = bool(join_with_newlines)
-
-        self.cache_row_groups = int(cache_row_groups)
-        self.assume_split_is_string = bool(assume_split_is_string)
 
         self.supervision_path = os.path.join(self.base_path, supervision_relpath)
         if not os.path.exists(self.supervision_path):
@@ -392,46 +520,30 @@ class VerifierSupervisionDataset(Dataset):
 
         self.pf = pq.ParquetFile(self.supervision_path)
 
-        schema_names = set(self.pf.schema.names)
         required = [
-            self.split_col,
-            self.case_context_col,
-            self.question_col,
-            self.claim_col,
-            self.evidence_ids_col,
-            self.evidence_weights_col,
-            self.target_col,
+            "verifier_row_id",
+            "qa_row_id",
+            "split",
+            "case_context",
+            "claim_text",
+            "evidence_sentences_json",
+            "label_id",
         ]
+        schema_names = set(self.pf.schema.names)
         for c in required:
             if c not in schema_names:
-                raise ValueError(f"Missing required column in verifier_supervision.parquet: {c}")
+                raise ValueError(f"Missing required column in verifier parquet: {c}")
 
-        self.has_qa_row_id = self.qa_row_id_col in schema_names
-        self.has_answer = self.answer_col in schema_names
-        self.has_supporting_span = self.supporting_span_col in schema_names
-        self.has_retrieval_query = self.retrieval_query_col in schema_names
-
-        evidence_path = os.path.join(self.base_path, evidence_parquet_relpath)
-        self.evidence_store = EvidenceTextStore(
-            evidence_parquet_path=evidence_path,
-            text_col=evidence_text_col,
-            id_base=evidence_id_base,
-            preload=preload_evidence_texts,
-            cache_row_groups=evidence_cache_row_groups,
-        )
-
-        self._rg_row_index: List[Tuple[int, int]] = []
+        self._rg_row_index: List[tuple[int, int]] = []
         self._build_split_index()
 
         self._rg_cache: Dict[int, Dict[str, List]] = {}
-        self._rg_cache_order: List[int] = []
+        self._label_counts_cache: Optional[Dict[int, int]] = None
 
     def _build_split_index(self) -> None:
         for rg in range(self.pf.num_row_groups):
-            t = self.pf.read_row_group(rg, columns=[self.split_col])
-            split_arr = t.column(0)
-            split_list = split_arr.to_pylist()
-
+            t = self.pf.read_row_group(rg, columns=["split"])
+            split_list = t.column(0).to_pylist()
             for i, s in enumerate(split_list):
                 if str(s) == self.split_name:
                     self._rg_row_index.append((rg, i))
@@ -450,81 +562,46 @@ class VerifierSupervisionDataset(Dataset):
 
     def _loads_json_list(self, s: str) -> List:
         try:
-            return json.loads(s)
+            out = json.loads(s)
+            return out if isinstance(out, list) else []
         except Exception:
             return []
 
-    def _truncate_evidence(self, s: str) -> str:
+    def _truncate_text(self, s: str) -> str:
         s = self._safe_str(s)
         if self.max_evidence_chars > 0 and len(s) > self.max_evidence_chars:
             return s[: self.max_evidence_chars]
         return s
 
-    def _materialize_evidence(self, evidence_ids_json: str, evidence_weights_json: str) -> str:
-        ids = self._loads_json_list(self._safe_str(evidence_ids_json))
-        weights = self._loads_json_list(self._safe_str(evidence_weights_json))
-
-        pairs: List[Tuple[int, float]] = []
-        m = min(len(ids), len(weights))
-        for i in range(m):
-            try:
-                cid = int(ids[i])
-                ww = float(weights[i])
-                pairs.append((cid, ww))
-            except Exception:
-                continue
-
-        if len(ids) > m:
-            for i in range(m, len(ids)):
-                try:
-                    pairs.append((int(ids[i]), 0.0))
-                except Exception:
-                    continue
-
-        pairs.sort(key=lambda x: x[1], reverse=True)
-
-        if self.verifier_top_k_evidence > 0:
-            pairs = pairs[: self.verifier_top_k_evidence]
-
-        out_chunks: List[str] = []
-        for cid, _ in pairs:
-            try:
-                txt = self.evidence_store.get(int(cid))
-                if txt:
-                    out_chunks.append(txt)
-            except Exception:
-                pass
-
-        joined = self.evidence_separator.join(out_chunks)
-        return self._truncate_evidence(joined)
+    def _materialize_evidence(self, evidence_sentences_json: str) -> str:
+        sents = self._loads_json_list(self._safe_str(evidence_sentences_json))
+        sents = [self._safe_str(x).strip() for x in sents if self._safe_str(x).strip()]
+        sents = sents[: self.max_evidence_sentences]
+        return self._truncate_text("\n\n".join(sents))
 
     def _build_input_text(
-        self,
-        case_context: str,
-        question: str,
-        claim_text: str,
-        evidence_text: str,
+            self,
+            case_context: str,
+            evidence_text: str,
+            claim_text: str,
     ) -> str:
-        sep = "\n\n" if self.join_with_newlines else " "
-        return sep.join(
-            [
-                "CASE:",
-                self._safe_str(case_context).strip(),
-                "QUESTION:",
-                self._safe_str(question).strip(),
-                "CLAIM:",
-                self._safe_str(claim_text).strip(),
-                "EVIDENCE:",
-                self._safe_str(evidence_text).strip(),
-            ]
+        case_text = self._safe_str(case_context).strip()
+        evidence_text = self._safe_str(evidence_text).strip()
+        claim_text = self._safe_str(claim_text).strip()
+
+        return (
+            "[TASK] support_verification\n\n"
+            "[CASE_BEGIN]\n"
+            f"{case_text}\n"
+            "[CASE_END]\n\n"
+            "[EVIDENCE_BEGIN]\n"
+            f"{evidence_text}\n"
+            "[EVIDENCE_END]\n\n"
+            "[CLAIM_BEGIN]\n"
+            f"{claim_text}\n"
+            "[CLAIM_END]"
         )
 
-    def _cache_put(self, rg: int, payload: Dict[str, List]) -> None:
-        self._rg_cache[rg] = payload
-        self._rg_cache_order.append(rg)
-        while len(self._rg_cache_order) > self.cache_row_groups:
-            old = self._rg_cache_order.pop(0)
-            self._rg_cache.pop(old, None)
 
     def _get_row_group_columns(self, rg: int) -> Dict[str, List]:
         cached = self._rg_cache.get(rg)
@@ -532,137 +609,70 @@ class VerifierSupervisionDataset(Dataset):
             return cached
 
         cols = [
-            self.case_context_col,
-            self.question_col,
-            self.claim_col,
-            self.evidence_ids_col,
-            self.evidence_weights_col,
-            self.target_col,
+            "verifier_row_id",
+            "qa_row_id",
+            "case_context",
+            "claim_text",
+            "evidence_sentences_json",
+            "label_id",
         ]
-        if self.has_qa_row_id:
-            cols.append(self.qa_row_id_col)
-        if self.has_answer:
-            cols.append(self.answer_col)
-        if self.has_supporting_span:
-            cols.append(self.supporting_span_col)
-        if self.has_retrieval_query:
-            cols.append(self.retrieval_query_col)
-
         t = self.pf.read_row_group(rg, columns=cols)
-        payload: Dict[str, List] = {c: t.column(c).to_pylist() for c in cols}
-
-        self._cache_put(rg, payload)
+        payload = {c: t.column(c).to_pylist() for c in cols}
+        self._rg_cache[rg] = payload
         return payload
+
+    def get_label_counts(self) -> Dict[int, int]:
+        if self._label_counts_cache is not None:
+            return dict(self._label_counts_cache)
+
+        counts = {0: 0, 1: 0}
+        for rg, row_in_group in self._rg_row_index:
+            payload = self._get_row_group_columns(rg)
+            try:
+                y = int(payload["label_id"][row_in_group])
+            except Exception:
+                y = 0
+            counts[y] = counts.get(y, 0) + 1
+
+        self._label_counts_cache = counts
+        return dict(counts)
 
     def __getitem__(self, idx: int) -> Dict:
         rg, row_in_group = self._rg_row_index[idx]
         payload = self._get_row_group_columns(rg)
 
-        if self.has_qa_row_id:
-            try:
-                qa_row_id = int(payload[self.qa_row_id_col][row_in_group])
-            except Exception:
-                qa_row_id = -1
-        else:
-            qa_row_id = int(idx)
+        verifier_row_id = int(payload["verifier_row_id"][row_in_group])
+        qa_row_id = int(payload["qa_row_id"][row_in_group])
 
-        case_context = payload[self.case_context_col][row_in_group]
-        question = payload[self.question_col][row_in_group]
-        claim_text = payload[self.claim_col][row_in_group]
-        evidence_ids_json = payload[self.evidence_ids_col][row_in_group]
-        evidence_weights_json = payload[self.evidence_weights_col][row_in_group]
+        case_context = payload["case_context"][row_in_group]
+        claim_text = payload["claim_text"][row_in_group]
+        evidence_sentences_json = payload["evidence_sentences_json"][row_in_group]
+        label_id = int(payload["label_id"][row_in_group])
 
-        evidence_text = self._materialize_evidence(
-            evidence_ids_json=evidence_ids_json,
-            evidence_weights_json=evidence_weights_json,
-        )
-
+        evidence_text = self._materialize_evidence(evidence_sentences_json)
         input_text = self._build_input_text(
             case_context=case_context,
-            question=question,
-            claim_text=claim_text,
             evidence_text=evidence_text,
+            claim_text=claim_text,
         )
 
-        try:
-            target = float(payload[self.target_col][row_in_group])
-        except Exception:
-            target = 0.0
-
         return {
+            "verifier_row_id": verifier_row_id,
             "qa_row_id": qa_row_id,
             "input_text": input_text,
-            "target": target,
+            "target": label_id,
         }
 
 
-class NonRepeatingChunkSampler(Sampler[int]):
-    def __init__(
-        self,
-        data_source,
-        chunk_size: int = 100_000,
-        seed: int = 13,
-        drop_last: bool = True,
-    ):
-        self.data_source = data_source
-        self.N = len(data_source)
-        self.chunk_size = int(chunk_size)
-        self.seed = int(seed)
-        self.drop_last = bool(drop_last)
+def verifier_binary_collate_fn(batch: List[Dict]) -> VerifierBatch:
+    inputs = [str(x["input_text"]).strip() for x in batch]
+    targets = torch.tensor([int(x["target"]) for x in batch], dtype=torch.long)
+    qa_row_ids = [int(x["qa_row_id"]) for x in batch]
+    verifier_row_ids = [int(x["verifier_row_id"]) for x in batch]
 
-        if self.chunk_size <= 0:
-            raise ValueError("chunk_size must be > 0")
-        if self.N <= 0:
-            raise ValueError("Dataset is empty")
-
-        g = torch.Generator()
-        g.manual_seed(self.seed)
-        self._perm = torch.randperm(self.N, generator=g).tolist()
-        self._cursor = 0
-        self._round = 0
-
-    def set_round(self, round_idx: int) -> None:
-        round_idx = int(round_idx)
-        if round_idx < 0:
-            round_idx = 0
-        self._round = round_idx
-        self._cursor = round_idx * self.chunk_size
-        while self._cursor >= self.N:
-            self._reshuffle()
-            self._cursor = max(0, self._cursor - self.N)
-
-    def _reshuffle(self) -> None:
-        self._round += 1
-        g = torch.Generator()
-        g.manual_seed(self.seed + self._round)
-        self._perm = torch.randperm(self.N, generator=g).tolist()
-        self._cursor = 0
-
-    def __iter__(self) -> Iterator[int]:
-        if self._cursor >= self.N:
-            self._reshuffle()
-
-        end = self._cursor + self.chunk_size
-        if end <= self.N:
-            out = self._perm[self._cursor:end]
-            self._cursor = end
-            return iter(out)
-
-        remainder = self._perm[self._cursor:self.N]
-        self._cursor = self.N
-
-        if self.drop_last:
-            self._reshuffle()
-            return iter(remainder)
-        else:
-            return iter(remainder)
-
-    def __len__(self) -> int:
-        return min(self.chunk_size, self.N)
-
-
-def verifier_collate_fn(batch: List[Dict]) -> VerifierBatch:
-    inputs: List[str] = [str(x.get("input_text", "")).strip() for x in batch]
-    targets = torch.tensor([float(x.get("target", 0.0)) for x in batch], dtype=torch.float32)
-    qa_row_ids = [int(x.get("qa_row_id", -1)) for x in batch]
-    return VerifierBatch(inputs=inputs, targets=targets, qa_row_ids=qa_row_ids)
+    return VerifierBatch(
+        inputs=inputs,
+        targets=targets,
+        qa_row_ids=qa_row_ids,
+        verifier_row_ids=verifier_row_ids,
+    )
