@@ -192,7 +192,7 @@ class TrainingVerifier:
 
             start_time = time.time()
 
-            for idx, batch in enumerate(tqdm(train_loader)):
+            for idx, batch in enumerate(train_loader):
                 tok = self._tokenize(batch.inputs, self.max_len)
                 targets = batch.targets.to(self.device, non_blocking=True).long()
 
@@ -254,7 +254,7 @@ class TrainingVerifier:
                 total_hours, total_mins, total_secs = self.time_duration(total_start_time, end_time)
 
                 if valid_loader is not None:
-                    valid_loss, valid_acc, valid_f1, valid_auroc = self.valid_epoch(valid_loader)
+                    valid_loss, valid_acc, valid_f1, valid_auroc, valid_specificity, valid_sensitivity, valid_precision, optimal_threshold = self.valid_epoch(valid_loader)
 
                     self.calculate_tb_stats(
                         valid_loss=valid_loss,
@@ -292,9 +292,7 @@ class TrainingVerifier:
                     )
 
 
-
-
-    def valid_epoch(self, valid_loader) -> Tuple[float, float, float, float]:
+    def valid_epoch(self, valid_loader):
         self.model.eval()
 
         total_loss = 0.0
@@ -322,28 +320,60 @@ class TrainingVerifier:
                 total_n += B
 
                 probs = torch.softmax(logits, dim=-1)[:, 1]
-                preds = logits.argmax(dim=-1)
 
-                preds_all.extend(preds.detach().cpu().tolist())
                 targets_all.extend(targets.detach().cpu().tolist())
                 probs_all.extend(probs.detach().cpu().tolist())
 
         valid_loss = total_loss / max(total_n, 1)
 
-        if total_n > 0:
-            valid_acc = float(metrics.accuracy_score(targets_all, preds_all))
-            valid_f1 = float(metrics.f1_score(targets_all, preds_all, average="binary"))
-            try:
-                valid_auroc = float(metrics.roc_auc_score(targets_all, probs_all))
-            except Exception:
-                valid_auroc = 0.0
-        else:
-            valid_acc = 0.0
-            valid_f1 = 0.0
+        if total_n == 0:
+            return {
+                "loss": 0.0,
+                "accuracy": 0.0,
+                "f1": 0.0,
+                "auroc": 0.0,
+                "specificity": 0.0,
+                "sensitivity": 0.0,
+                "precision": 0.0,
+                "threshold": 0.5,
+            }
+
+        targets_all = np.asarray(targets_all, dtype=np.int32)
+        probs_all = np.asarray(probs_all, dtype=np.float32)
+
+        try:
+            valid_auroc = float(metrics.roc_auc_score(targets_all, probs_all))
+        except Exception:
             valid_auroc = 0.0
 
-        return valid_loss, valid_acc, valid_f1, valid_auroc
+        # Youden threshold
+        try:
+            fpr, tpr, thresholds = metrics.roc_curve(targets_all, probs_all, pos_label=1)
+            youden = tpr - fpr
+            best_idx = int(np.argmax(youden))
+            optimal_threshold = float(thresholds[best_idx])
 
+            # sometimes sklearn may return inf threshold first
+            if not np.isfinite(optimal_threshold):
+                finite_thresholds = thresholds[np.isfinite(thresholds)]
+                if len(finite_thresholds) > 0:
+                    optimal_threshold = float(finite_thresholds.max())
+                else:
+                    optimal_threshold = 0.5
+        except Exception:
+            optimal_threshold = 0.5
+
+        preds_all = (probs_all >= optimal_threshold).astype(np.int32)
+
+        valid_acc = float(metrics.accuracy_score(targets_all, preds_all))
+        valid_f1 = float(metrics.f1_score(targets_all, preds_all, average="binary", zero_division=0))
+        valid_precision = float(metrics.precision_score(targets_all, preds_all, average="binary", zero_division=0))
+        valid_sensitivity = float(metrics.recall_score(targets_all, preds_all, average="binary", zero_division=0))
+
+        tn, fp, fn, tp = metrics.confusion_matrix(targets_all, preds_all, labels=[0, 1]).ravel()
+        valid_specificity = float(tn / (tn + fp + epsilon))
+
+        return valid_loss, valid_acc, valid_f1, valid_auroc, valid_specificity, valid_sensitivity, valid_precision, optimal_threshold
 
 
     def savings_prints(

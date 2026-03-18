@@ -23,12 +23,13 @@ import json
 
 from config.serde import open_experiment, create_experiment, delete_experiment, write_config
 from Train_Valid_retriever import Training
-from data.data_provider import RetrieverSupervisionDataset, RadiopaediaSentenceStore, retriever_collate_fn, VerifierBinaryDataset, verifier_binary_collate_fn
+from data.data_provider import RetrieverSupervisionDataset, RadiopaediaSentenceStore, retriever_collate_fn, VerifierBinaryDataset, verifier_binary_collate_fn, VerifierBinaryTestDataset
 from models.model import BiEncoder
 from Train_Valid_verifier import TrainingVerifier
 from data.mimic_data_preprocessing import RadiologyVerifierBinaryDatasetBuilder, MimicGroundingDatasetBuilder
 from data.chexpertplus_data_preprocessing import CheXpertRadiopaediaStep4ExternalTestBuilder, create_fixed_chexpert_test_eval_parquet
 from Tier1_2_3_prediction import S4Tier123End2EndEvaluatorTestOnly, S2Tier123End2EndEvaluatorTestOnly, S3Tier123End2EndEvaluatorTestOnly, S1Tier123CaseOnlyEvaluatorTestOnly, CrossSystemComparatorPredOnlyTestOnly, analyze_retrieval_error_coupling
+from Prediction import PredictionVerifier
 
 
 import warnings
@@ -129,6 +130,8 @@ def _build_binary_class_weights_from_dataset(dataset: VerifierBinaryDataset) -> 
     return weights
 
 
+
+
 def main_train_verifier_binary(global_config_path="/PATH/config/config.yaml",
     valid: bool = True,
     resume: bool = False,
@@ -214,142 +217,77 @@ def main_train_verifier_binary(global_config_path="/PATH/config/config.yaml",
 
 
 
-def main_evaluation(global_config_path, experiment_name, model_weights_path, verifier_weights_path,
-                    input_test_data="phase1_fixed_test_eval/mimic_test_eval.parquet", dataset='MIMIC'):
+def main_test_verifier_bootstrap(
+    global_config_path="/PATH/config/config.yaml",
+    experiment_name="verifier_exp",
+    experiment_epoch_num=3,
+    scenario_name="oracle_indomain",
+    test_parquet_path="/PATH/to/test_scenario.parquet",
+    split_name="test",
+    n_bootstrap=1000,
+):
+    params = open_experiment(experiment_name, global_config_path)
+    cfg_path = params["cfg_path"]
 
-    with open(global_config_path, "r") as f:
-        params = yaml.safe_load(f)
-    base_path_evidenceData = params["Preprocessing"]["base_path_evidenceData"]
-
-
-    ''' S1 '''
-    s1 = S1Tier123CaseOnlyEvaluatorTestOnly(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        verifier_weights_path=verifier_weights_path,
-        device="cuda",
-        verifier_top_p=5,
-        verifier_max_tokens=1024,
-        out_dir=os.path.join(base_path_evidenceData, dataset + "_Results/S1"),
-        batch_size_verify=4,
-        ece_bins=15,
-        seed=13,
-        input_test_data=input_test_data,
-    )
-    s1.run()
-
-
-    ''' S4 '''
-    runner = S4Tier123End2EndEvaluatorTestOnly(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        model_weights_path=model_weights_path,
-        verifier_weights_path=verifier_weights_path,
-        device="cuda",
-        top_k=20,
-        verifier_top_p=5,
-        verifier_max_tokens=1024,
-        out_dir=os.path.join(base_path_evidenceData, dataset + "_Results/S4"),
-        batch_size_retrieve=256,
-        batch_size_verify=4,
-        input_test_data=input_test_data,
-        batch_size_embed_docs=256,
-        ece_bins=15,
-    )
-    runner.run()
-
-    results, df_out = analyze_retrieval_error_coupling(
-        parquet_path=os.path.join(base_path_evidenceData, dataset + "_Results/S4", "s4_test_predictions.parquet"),
-        system_prefix="s4",
-        top_k=20,
-        make_plot=True,
+    test_dataset = VerifierBinaryTestDataset(
+        cfg_path=cfg_path,
+        test_parquet_path=test_parquet_path,
+        split_name=split_name,
+        max_evidence_sentences=2,
     )
 
+    test_loader = torch.utils.data.DataLoader(
+        dataset=test_dataset,
+        batch_size=int(params["Network"]["batch_size"]),
+        pin_memory=True,
+        drop_last=False,
+        shuffle=False,
+        num_workers=2,
+        collate_fn=verifier_binary_collate_fn,
+        persistent_workers=True,
+    )
 
+    model = AutoModelForSequenceClassification.from_pretrained(
+        params["Verifier"]["model_name"],
+        num_labels=2,
+        problem_type="single_label_classification",
+    )
 
-    ''' S2 '''
-    s2 = S2Tier123End2EndEvaluatorTestOnly(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        verifier_weights_path=verifier_weights_path,
-        device="cuda",
-        top_k=20,
-        verifier_top_p=5,
-        verifier_max_tokens=1024,
-        out_dir=os.path.join(base_path_evidenceData, dataset + "_Results/S2"),
-        batch_size_embed_chunks=128,
-        batch_size_retrieve=256,
-        batch_size_verify=4,
-        ece_bins=15,
-        input_test_data=input_test_data,
+    predictor = PredictionVerifier(cfg_path=cfg_path, split_name=split_name, scenario_name=scenario_name)
+    predictor.setup_model(model=model, epoch_num=experiment_epoch_num)
+
+    pred_dict = predictor.predict_only(test_loader)
+
+    metrics_dict = predictor._compute_metrics(
+        probs=pred_dict["probs"],
+        targets=pred_dict["targets"],
+    )
+
+    predictor.save_predictions_csv(
+        pred_dict=pred_dict,
+        metrics_dict=metrics_dict,
+        scenario_name=scenario_name,
+    )
+
+    boot_dict = predictor.bootstrap_metrics(
+        probs=pred_dict["probs"],
+        targets=pred_dict["targets"],
+        n_bootstrap=n_bootstrap,
         seed=13,
     )
-    s2.run()
 
-
-
-    ''' S3 '''
-    s3 = S3Tier123End2EndEvaluatorTestOnly(
-        cfg_path=global_config_path,
-        experiment_name=experiment_name,
-        base_path_evidenceData=base_path_evidenceData,
-        verifier_weights_path=verifier_weights_path,
-        device="cuda",
-        top_k=20,
-        verifier_top_p=5,
-        verifier_max_tokens=1024,
-        out_dir=os.path.join(base_path_evidenceData, dataset + "_Results/S3"),
-        batch_size_verify=4,
-        ece_bins=15,
-        seed=13,
-        input_test_data=input_test_data,
-        bm25_k1=1.2,
-        bm25_b=0.75,
-    )
-    s3.run()
-
-
-    ''' Cross comparison '''
-    base = params["Preprocessing"]["base_path_evidenceData"]
-
-    comparator = CrossSystemComparatorPredOnlyTestOnly(
-        system_test_predictions={
-            "S1": os.path.join(base, dataset + "_Results/S1", "s1_test_predictions.parquet"),
-            "S2": os.path.join(base, dataset + "_Results/S2", "s2_test_predictions.parquet"),
-            "S3": os.path.join(base, dataset + "_Results/S3", "s3_test_predictions.parquet"),
-            "S4": os.path.join(base, dataset + "_Results/S4", "s4_test_predictions.parquet"),
-        },
-        system_full_results_csvs={
-            "S1": os.path.join(base, dataset + "_Results/S1", "S1_full_results.csv"),
-            "S2": os.path.join(base, dataset + "_Results/S2", "S2_full_results.csv"),
-            "S3": os.path.join(base, dataset + "_Results/S3", "S3_full_results.csv"),
-            "S4": os.path.join(base, dataset + "_Results/S4", "S4_full_results.csv"),
-        },
-        system_faithfulness_predictions={
-            "S2": os.path.join(base, dataset + "_Results/S2", "s2_tier2_faithfulness_predictions.parquet"),
-            "S3": os.path.join(base, dataset + "_Results/S3", "s3_tier2_faithfulness_predictions.parquet"),
-            "S4": os.path.join(base, dataset + "_Results/S4", "s4_tier2_faithfulness_predictions.parquet"),
-        },
-        out_path=os.path.join(
-            base,
-            dataset + "_Results",
-            "cross_system_results",
-            "s1_s4_cross_system_comparison.json",
-        ),
-        ece_bins=15,
-        n_boot=1000,
-        seed=13,
-        verbose=True,
-        use_unordered_pairs_only=True,
+    predictor.save_bootstrap_csv(
+        boot_dict=boot_dict,
+        scenario_name=scenario_name,
     )
 
-    comparator.run()
+    predictor.print_and_save_stats(
+        metrics_dict=metrics_dict,
+        boot_dict=boot_dict,
+        scenario_name=scenario_name,
+    )
 
-
-
+    return metrics_dict, boot_dict
 
 
 

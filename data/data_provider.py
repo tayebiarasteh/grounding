@@ -676,3 +676,162 @@ def verifier_binary_collate_fn(batch: List[Dict]) -> VerifierBatch:
         qa_row_ids=qa_row_ids,
         verifier_row_ids=verifier_row_ids,
     )
+
+
+
+
+
+
+class VerifierBinaryTestDataset(Dataset):
+    """
+    Test dataset for verifier evaluation on a specific scenario parquet.
+    """
+
+    def __init__(
+            self,
+            cfg_path: str,
+            test_parquet_path: str,
+            split_name: str = "test",
+            max_evidence_sentences: int = 2,
+            max_evidence_chars: int = 12000,
+    ) -> None:
+        self.cfg_path = cfg_path
+        self.params = read_config(cfg_path)
+
+        self.test_parquet_path = str(test_parquet_path)
+        self.split_name = str(split_name)
+        self.max_evidence_sentences = int(max_evidence_sentences)
+        self.max_evidence_chars = int(max_evidence_chars)
+
+        if not os.path.exists(self.test_parquet_path):
+            raise FileNotFoundError(f"Test parquet not found: {self.test_parquet_path}")
+
+        self.pf = pq.ParquetFile(self.test_parquet_path)
+
+        required = [
+            "verifier_row_id",
+            "qa_row_id",
+            "split",
+            "case_context",
+            "claim_text",
+            "evidence_sentences_json",
+            "label_id",
+        ]
+        schema_names = set(self.pf.schema.names)
+        for c in required:
+            if c not in schema_names:
+                raise ValueError(f"Missing required column in verifier parquet: {c}")
+
+        self._rg_row_index = []
+        self._build_index()
+        self._rg_cache: Dict[int, Dict[str, List]] = {}
+
+
+    def _build_index(self) -> None:
+        for rg in range(self.pf.num_row_groups):
+            t = self.pf.read_row_group(rg, columns=["split"])
+            split_list = t.column(0).to_pylist()
+
+            for i, s in enumerate(split_list):
+                if str(s) == self.split_name:
+                    self._rg_row_index.append((rg, i))
+
+        if len(self._rg_row_index) == 0:
+            print(f"[WARN] No rows found for split='{self.split_name}' in {self.test_parquet_path}")
+
+
+    def __len__(self) -> int:
+        return len(self._rg_row_index)
+
+    def _safe_str(self, x) -> str:
+        if x is None:
+            return ""
+        s = str(x)
+        return "" if s.lower() == "nan" else s
+
+    def _loads_json_list(self, s: str) -> List:
+        try:
+            out = json.loads(s)
+            return out if isinstance(out, list) else []
+        except Exception:
+            return []
+
+    def _truncate_text(self, s: str) -> str:
+        s = self._safe_str(s)
+        if self.max_evidence_chars > 0 and len(s) > self.max_evidence_chars:
+            return s[: self.max_evidence_chars]
+        return s
+
+    def _materialize_evidence(self, evidence_sentences_json: str) -> str:
+        sents = self._loads_json_list(self._safe_str(evidence_sentences_json))
+        sents = [self._safe_str(x).strip() for x in sents if self._safe_str(x).strip()]
+        sents = sents[: self.max_evidence_sentences]
+        return self._truncate_text("\n\n".join(sents))
+
+    def _build_input_text(
+        self,
+        case_context: str,
+        evidence_text: str,
+        claim_text: str,
+    ) -> str:
+        case_text = self._safe_str(case_context).strip()
+        evidence_text = self._safe_str(evidence_text).strip()
+        claim_text = self._safe_str(claim_text).strip()
+
+        return (
+            "[TASK] support_verification\n\n"
+            "[CASE_BEGIN]\n"
+            f"{case_text}\n"
+            "[CASE_END]\n\n"
+            "[EVIDENCE_BEGIN]\n"
+            f"{evidence_text}\n"
+            "[EVIDENCE_END]\n\n"
+            "[CLAIM_BEGIN]\n"
+            f"{claim_text}\n"
+            "[CLAIM_END]"
+        )
+
+    def _get_row_group_columns(self, rg: int) -> Dict[str, List]:
+        cached = self._rg_cache.get(rg)
+        if cached is not None:
+            return cached
+
+        cols = [
+            "verifier_row_id",
+            "qa_row_id",
+            "case_context",
+            "claim_text",
+            "evidence_sentences_json",
+            "label_id",
+        ]
+        t = self.pf.read_row_group(rg, columns=cols)
+        payload = {c: t.column(c).to_pylist() for c in cols}
+        self._rg_cache[rg] = payload
+        return payload
+
+    def __getitem__(self, idx: int) -> Dict:
+        rg, row_in_group = self._rg_row_index[idx]
+        payload = self._get_row_group_columns(rg)
+
+        verifier_row_id = int(payload["verifier_row_id"][row_in_group])
+        qa_row_id = int(payload["qa_row_id"][row_in_group])
+
+        case_context = payload["case_context"][row_in_group]
+        claim_text = payload["claim_text"][row_in_group]
+        evidence_sentences_json = payload["evidence_sentences_json"][row_in_group]
+        label_id = int(payload["label_id"][row_in_group])
+
+        evidence_text = self._materialize_evidence(evidence_sentences_json)
+        input_text = self._build_input_text(
+            case_context=case_context,
+            evidence_text=evidence_text,
+            claim_text=claim_text,
+        )
+
+        return {
+            "verifier_row_id": verifier_row_id,
+            "qa_row_id": qa_row_id,
+            "input_text": input_text,
+            "target": label_id,
+        }
+
