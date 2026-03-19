@@ -10,7 +10,6 @@ import pdb
 import torch
 import os
 from torch.utils.data import Dataset
-from torch.nn import BCEWithLogitsLoss
 from torchvision import transforms, models
 import numpy as np
 from torch import nn
@@ -23,12 +22,11 @@ import json
 
 from config.serde import open_experiment, create_experiment, delete_experiment, write_config
 from Train_Valid_retriever import Training
-from data.data_provider import RetrieverSupervisionDataset, RadiopaediaSentenceStore, retriever_collate_fn, VerifierBinaryDataset, verifier_binary_collate_fn, VerifierBinaryTestDataset
+from data.data_provider import RetrieverSupervisionDataset, RadiopaediaSentenceStore, retriever_collate_fn, VerifierBinaryDataset, verifier_binary_collate_fn, VerifierBinaryTestDataset, verifier_binary_vignette_collate_fn, VerifierBinaryVignetteTestDataset
 from models.model import BiEncoder
 from Train_Valid_verifier import TrainingVerifier
 from data.mimic_data_preprocessing import RadiologyVerifierBinaryDatasetBuilder, MimicGroundingDatasetBuilder
-from data.chexpertplus_data_preprocessing import CheXpertRadiopaediaStep4ExternalTestBuilder, create_fixed_chexpert_test_eval_parquet
-from Tier1_2_3_prediction import S4Tier123End2EndEvaluatorTestOnly, S2Tier123End2EndEvaluatorTestOnly, S3Tier123End2EndEvaluatorTestOnly, S1Tier123CaseOnlyEvaluatorTestOnly, CrossSystemComparatorPredOnlyTestOnly, analyze_retrieval_error_coupling
+from data.chexpertplus_data_preprocessing import CheXpertPlusGroundingDatasetBuilder, CheXpertPlusVerifierBinaryDatasetBuilder
 from Prediction import PredictionVerifier
 
 
@@ -131,11 +129,7 @@ def _build_binary_class_weights_from_dataset(dataset: VerifierBinaryDataset) -> 
 
 
 
-
-def main_train_verifier_binary(global_config_path="/PATH/config/config.yaml",
-    valid: bool = True,
-    resume: bool = False,
-    experiment_name: str = "verifier_binary"):
+def main_train_verifier_binary(global_config_path="/PATH/config/config.yaml", valid=True, resume=False, experiment_name="verifier_binary"):
 
     if resume:
         params = open_experiment(experiment_name, global_config_path)
@@ -173,19 +167,13 @@ def main_train_verifier_binary(global_config_path="/PATH/config/config.yaml",
     else:
         valid_loader = None
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        params["Verifier"]["model_name"],
-        num_labels=2,
-        problem_type="single_label_classification",
-    )
+    model = AutoModelForSequenceClassification.from_pretrained(params["Verifier"]["model_name"], num_labels=2,
+                                                               problem_type="single_label_classification")
 
     class_weights = _build_binary_class_weights_from_dataset(train_dataset)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=float(params["Network"]["lr"]),
-        weight_decay=float(params["Network"]["weight_decay"]),
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(params["Network"]["lr"]),
+                                  weight_decay=float(params["Network"]["weight_decay"]))
 
     model_info = params["Network"]
     model_info["lr"] = float(params["Network"]["lr"])
@@ -217,75 +205,37 @@ def main_train_verifier_binary(global_config_path="/PATH/config/config.yaml",
 
 
 
-def main_test_verifier_bootstrap(
-    global_config_path="/PATH/config/config.yaml",
-    experiment_name="verifier_exp",
-    experiment_epoch_num=3,
-    scenario_name="oracle_indomain",
-    test_parquet_path="/PATH/to/test_scenario.parquet",
-    split_name="test",
-    n_bootstrap=1000,
-):
+def main_test_verifier_bootstrap(global_config_path="/PATH/config/config.yaml", experiment_name="verifier_exp",
+    experiment_epoch_num=3, scenario_name="oracle_indomain", test_parquet_path="/PATH/to/test_scenario.parquet", split_name="test", n_bootstrap=1000):
+
     params = open_experiment(experiment_name, global_config_path)
     cfg_path = params["cfg_path"]
 
-    test_dataset = VerifierBinaryTestDataset(
-        cfg_path=cfg_path,
-        test_parquet_path=test_parquet_path,
-        split_name=split_name,
-        max_evidence_sentences=2,
-    )
+    test_dataset = VerifierBinaryTestDataset(cfg_path=cfg_path, test_parquet_path=test_parquet_path,
+                                             split_name=split_name, max_evidence_sentences=2)
 
-    test_loader = torch.utils.data.DataLoader(
-        dataset=test_dataset,
-        batch_size=int(params["Network"]["batch_size"]),
-        pin_memory=True,
-        drop_last=False,
-        shuffle=False,
-        num_workers=2,
-        collate_fn=verifier_binary_collate_fn,
-        persistent_workers=True,
-    )
+    test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=int(params["Network"]["batch_size"]),
+                                              pin_memory=True, drop_last=False, shuffle=False, num_workers=2,
+                                              collate_fn=verifier_binary_collate_fn, persistent_workers=True)
 
-    model = AutoModelForSequenceClassification.from_pretrained(
-        params["Verifier"]["model_name"],
-        num_labels=2,
-        problem_type="single_label_classification",
-    )
+    model = AutoModelForSequenceClassification.from_pretrained(params["Verifier"]["model_name"], num_labels=2,
+                                                               problem_type="single_label_classification")
 
     predictor = PredictionVerifier(cfg_path=cfg_path, split_name=split_name, scenario_name=scenario_name)
     predictor.setup_model(model=model, epoch_num=experiment_epoch_num)
 
     pred_dict = predictor.predict_only(test_loader)
 
-    metrics_dict = predictor._compute_metrics(
-        probs=pred_dict["probs"],
-        targets=pred_dict["targets"],
-    )
+    metrics_dict = predictor._compute_metrics(probs=pred_dict["probs"], targets=pred_dict["targets"])
 
-    predictor.save_predictions_csv(
-        pred_dict=pred_dict,
-        metrics_dict=metrics_dict,
-        scenario_name=scenario_name,
-    )
+    predictor.save_predictions_csv(pred_dict=pred_dict, metrics_dict=metrics_dict, scenario_name=scenario_name)
 
-    boot_dict = predictor.bootstrap_metrics(
-        probs=pred_dict["probs"],
-        targets=pred_dict["targets"],
-        n_bootstrap=n_bootstrap,
-        seed=13,
-    )
+    boot_dict = predictor.bootstrap_metrics(probs=pred_dict["probs"], targets=pred_dict["targets"], n_bootstrap=n_bootstrap, seed=13)
 
-    predictor.save_bootstrap_csv(
-        boot_dict=boot_dict,
-        scenario_name=scenario_name,
-    )
+    predictor.save_bootstrap_csv(boot_dict=boot_dict, scenario_name=scenario_name)
 
-    predictor.print_and_save_stats(
-        metrics_dict=metrics_dict,
-        boot_dict=boot_dict,
-        scenario_name=scenario_name,
-    )
+    predictor.print_and_save_stats(metrics_dict=metrics_dict, boot_dict=boot_dict, scenario_name=scenario_name)
+
 
     return metrics_dict, boot_dict
 
@@ -293,4 +243,92 @@ def main_test_verifier_bootstrap(
 
 
 
+def main_test_vignette_mcq( global_config_path="/PATH/config/config.yaml", experiment_name="verifier_exp",
+                            experiment_epoch_num=3, scenario_name="vignette_mcq",
+                            test_parquet_path="/PATH/to/vignette_test.parquet", split_name="test", n_bootstrap=1000):
+    params = open_experiment(experiment_name, global_config_path)
+    cfg_path = params["cfg_path"]
+
+    test_dataset = VerifierBinaryVignetteTestDataset(cfg_path=cfg_path, test_parquet_path=test_parquet_path, split_name=split_name,
+                                          max_evidence_sentences=2)
+
+    test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=int(params["Network"]["batch_size"]),
+                                              pin_memory=True, drop_last=False, shuffle=False, num_workers=2,
+                                              collate_fn=verifier_binary_vignette_collate_fn, persistent_workers=True)
+
+    model = AutoModelForSequenceClassification.from_pretrained(params["Verifier"]["model_name"], num_labels=2,
+                                                               problem_type="single_label_classification")
+
+    predictor = PredictionVerifier(cfg_path=cfg_path, split_name=split_name, scenario_name=scenario_name)
+
+    predictor.setup_model(model=model, epoch_num=experiment_epoch_num)
+
+    pred_dict = predictor.predict_only_mcq(test_loader)
+
+    metrics_dict, boot_dict, question_df = predictor.save_and_report_mcq_stats(pred_dict=pred_dict, scenario_name=scenario_name,
+                                                                               n_bootstrap=n_bootstrap, seed=13)
+
+    return metrics_dict, boot_dict, question_df
+
+
+
+
+
+
+
+
+    # print(df.iloc[2])
+    # working_df = df.iloc[2000]
+    # print('\nchunk_text:', working_df['chunk_text'])
+    # df['soft_support_score'].mean()
+    # df['s1_pred_support_raw'].mean()
+    # df['s1_pred_prob_sigmoid'].mean()
+
+    # pos = df[df["label_id"] == 1]
+    # neg = df[df["label_id"] == 0]
+    #
+    # neg_sampled = neg.sample(len(pos), random_state=13)
+    #
+    # df = pd.concat([pos, neg_sampled]).sample(frac=1, random_state=13).reset_index(drop=True)
+
+
+    def has_concept(row):
+        concept = row["concept"].lower()
+        sents = json.loads(row["evidence_sentences_json"])
+        return any(concept in s.lower() for s in sents)
+
+
+    c = df[df["row_type"] == "C"]
+    print("C explicit concept ratio:", c.apply(has_concept, axis=1).mean())
+
+
+    def case_mentions_concept(row):
+        concept = row["concept"].lower()
+        return concept in row["case_context"].lower()
+
+
+    print("C shortcut leakage:", c.apply(case_mentions_concept, axis=1).mean())
+
+    print("evidence diversity:", df["evidence_sentences_json"].nunique() / len(df))
+
+    print(df["label"].value_counts())
+    print(df["row_type"].value_counts())
+
+
+    # working_df = df.iloc[2000]
+    # print('\nqa_row_id:', working_df['qa_row_id'])
+    # print('\nsubject_id:', working_df['subject_id'])
+    # print('\nquestion:', working_df['question'])
+    # print('\nclaim_text:', working_df['claim_text'])
+    # print('\ncase_context:', working_df['case_context'])
+    # print('\nanswer_target:', working_df['answer_target'])
+    # print('\nsoft_support_score:', working_df['soft_support_score'])
+    # print('\nevidence_weights_json:', working_df['evidence_weights_json'])
+    # print('\nevidence_chunk_ids_json:', working_df['evidence_chunk_ids_json'])
+    # print('\nqa_type:', working_df['qa_type'])
+
+
+    # pdb.set_trace()
+
+    asdfsdf = 2
 

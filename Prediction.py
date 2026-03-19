@@ -341,3 +341,253 @@ class PredictionVerifier:
         )
         with open(out_path, "a") as f:
             f.write(msg)
+
+
+
+
+    def predict_only_mcq(self, test_loader):
+        self.model.eval()
+
+        probs_cache = []
+        labels_cache = []
+        qa_ids_cache = []
+        verifier_ids_cache = []
+
+        question_uids_cache = []
+        option_ids_cache = []
+        correct_option_ids_cache = []
+        mcq_labels_cache = []
+
+        with torch.no_grad():
+            for batch in tqdm(test_loader):
+                tok = self._tokenize(batch.inputs)
+                targets = batch.targets.to(self.device, non_blocking=True).long()
+
+                out = self.model(**tok)
+                logits = out.logits
+                probs = torch.softmax(logits, dim=-1)[:, 1]
+
+                probs_cache.append(probs.detach().cpu())
+                labels_cache.append(targets.detach().cpu())
+                qa_ids_cache.extend(batch.qa_row_ids)
+                verifier_ids_cache.extend(batch.verifier_row_ids)
+
+                question_uids_cache.extend(batch.question_uids)
+                option_ids_cache.extend(batch.option_ids)
+                correct_option_ids_cache.extend(batch.correct_option_ids)
+                mcq_labels_cache.extend(batch.mcq_labels)
+
+        probs_all = torch.cat(probs_cache, dim=0).numpy()
+        labels_all = torch.cat(labels_cache, dim=0).numpy()
+
+        return {
+            "probs": probs_all,
+            "targets": labels_all,
+            "qa_row_ids": np.asarray(qa_ids_cache),
+            "verifier_row_ids": np.asarray(verifier_ids_cache),
+            "question_uids": np.asarray(question_uids_cache),
+            "option_ids": np.asarray(option_ids_cache),
+            "correct_option_ids": np.asarray(correct_option_ids_cache),
+            "mcq_labels": np.asarray(mcq_labels_cache),
+        }
+
+    def save_and_report_mcq_stats(self, pred_dict, scenario_name, n_bootstrap=1000, seed=13):
+        """
+        Aggregates row-level option scores into question-level MCQ metrics.
+
+        Expected pred_dict keys:
+            probs
+            targets
+            qa_row_ids
+            verifier_row_ids
+            question_uids
+            option_ids
+            correct_option_ids
+            mcq_labels
+        """
+
+        out_dir = os.path.join(
+            self.params["target_dir"],
+            self.params["stat_log_path"],
+            f"{scenario_name}_split_{self.split_name}",
+        )
+        os.makedirs(out_dir, exist_ok=True)
+
+        # --------------------------------------------------
+        # row-level predictions
+        # --------------------------------------------------
+        row_df = pd.DataFrame({
+            "verifier_row_id": pred_dict["verifier_row_ids"],
+            "qa_row_id": pred_dict["qa_row_ids"],
+            "question_uid": pred_dict["question_uids"],
+            "option_id": pred_dict["option_ids"],
+            "correct_option_id": pred_dict["correct_option_ids"],
+            "is_correct_option": pred_dict["targets"],
+            "mcq_label": pred_dict["mcq_labels"],
+            "prob_supported": pred_dict["probs"],
+        })
+
+        row_out_path = os.path.join(
+            out_dir,
+            f"predictions_mcq_rows_{scenario_name}_split_{self.split_name}.csv",
+        )
+        row_df.to_csv(row_out_path, index=False)
+
+        # --------------------------------------------------
+        # question-level aggregation
+        # --------------------------------------------------
+        question_rows = []
+
+        grouped = row_df.groupby("question_uid", sort=False)
+        for question_uid, g in grouped:
+            g = g.copy().reset_index(drop=True)
+
+            if g.empty:
+                continue
+
+            if g["correct_option_id"].nunique() != 1:
+                continue
+
+            correct_option_id = int(g["correct_option_id"].iloc[0])
+
+            # sort options by predicted support score descending
+            g_sorted = g.sort_values(
+                by=["prob_supported", "option_id"],
+                ascending=[False, True],
+            ).reset_index(drop=True)
+
+            pred_option_id = int(g_sorted["option_id"].iloc[0])
+
+            correct_match = g_sorted[g_sorted["option_id"].astype(int) == correct_option_id]
+            if len(correct_match) == 0:
+                continue
+
+            correct_rank = int(correct_match.index[0]) + 1
+
+            top1_correct = int(pred_option_id == correct_option_id)
+            top2_correct = int(correct_rank <= min(2, len(g_sorted)))
+            reciprocal_rank = 1.0 / float(correct_rank)
+
+            top1_prob = float(g_sorted["prob_supported"].iloc[0])
+            top2_prob = float(g_sorted["prob_supported"].iloc[1]) if len(g_sorted) >= 2 else np.nan
+            margin = float(top1_prob - top2_prob) if len(g_sorted) >= 2 else np.nan
+
+            pred_label = ""
+            correct_label = ""
+
+            pred_label_match = g_sorted[g_sorted["option_id"].astype(int) == pred_option_id]
+            if len(pred_label_match) > 0 and pd.notna(pred_label_match["mcq_label"].iloc[0]):
+                pred_label = str(pred_label_match["mcq_label"].iloc[0])
+
+            correct_label_match = g_sorted[g_sorted["option_id"].astype(int) == correct_option_id]
+            if len(correct_label_match) > 0 and pd.notna(correct_label_match["mcq_label"].iloc[0]):
+                correct_label = str(correct_label_match["mcq_label"].iloc[0])
+
+            question_rows.append({
+                "question_uid": str(question_uid),
+                "num_options": int(len(g_sorted)),
+                "correct_option_id": int(correct_option_id),
+                "pred_option_id": int(pred_option_id),
+                "correct_label": correct_label,
+                "pred_label": pred_label,
+                "correct_rank": int(correct_rank),
+                "mcq_accuracy": int(top1_correct),
+                "top2_accuracy": int(top2_correct),
+                "mrr": float(reciprocal_rank),
+                "margin_top1_top2": float(margin) if np.isfinite(margin) else np.nan,
+                "top1_prob": float(top1_prob),
+                "top2_prob": float(top2_prob) if np.isfinite(top2_prob) else np.nan,
+            })
+
+        question_df = pd.DataFrame(question_rows)
+        if question_df.empty:
+            raise ValueError("Question-level MCQ aggregation produced no valid rows.")
+
+        question_out_path = os.path.join(
+            out_dir,
+            f"predictions_mcq_questions_{scenario_name}_split_{self.split_name}.csv",
+        )
+        question_df.to_csv(question_out_path, index=False)
+
+        # --------------------------------------------------
+        # point estimates
+        # --------------------------------------------------
+        metrics_dict = {
+            "mcq_accuracy": float(question_df["mcq_accuracy"].mean()),
+            "top2_accuracy": float(question_df["top2_accuracy"].mean()),
+            "mrr": float(question_df["mrr"].mean()),
+            "margin_top1_top2": float(question_df["margin_top1_top2"].dropna().mean())
+            if question_df["margin_top1_top2"].notna().any() else 0.0,
+            "num_questions": int(len(question_df)),
+        }
+
+        # --------------------------------------------------
+        # bootstrap over questions
+        # --------------------------------------------------
+        rng = np.random.RandomState(seed)
+        n_questions = len(question_df)
+
+        acc_list = []
+        top2_list = []
+        mrr_list = []
+        margin_list = []
+
+        for _ in range(n_bootstrap):
+            idx = rng.choice(n_questions, n_questions, replace=True)
+            bs = question_df.iloc[idx]
+
+            acc_list.append(float(bs["mcq_accuracy"].mean()))
+            top2_list.append(float(bs["top2_accuracy"].mean()))
+            mrr_list.append(float(bs["mrr"].mean()))
+
+            margin_vals = bs["margin_top1_top2"].dropna().values
+            if len(margin_vals) > 0:
+                margin_list.append(float(np.mean(margin_vals)))
+            else:
+                margin_list.append(0.0)
+
+        boot_dict = {
+            "mcq_accuracy": np.asarray(acc_list, dtype=np.float32),
+            "top2_accuracy": np.asarray(top2_list, dtype=np.float32),
+            "mrr": np.asarray(mrr_list, dtype=np.float32),
+            "margin_top1_top2": np.asarray(margin_list, dtype=np.float32),
+        }
+
+        boot_df = pd.DataFrame({
+            "mcq_accuracy": boot_dict["mcq_accuracy"],
+            "top2_accuracy": boot_dict["top2_accuracy"],
+            "mrr": boot_dict["mrr"],
+            "margin_top1_top2": boot_dict["margin_top1_top2"],
+        })
+
+        boot_out_path = os.path.join(
+            out_dir,
+            f"bootstrap_mcq_{scenario_name}_split_{self.split_name}.csv",
+        )
+        boot_df.to_csv(boot_out_path, index=False)
+
+        # --------------------------------------------------
+        # reporting
+        # --------------------------------------------------
+        msg = (
+            f"\n\n----------------------------------------------------------------------------------------\n"
+            f"experiment: {self.params['experiment_name']}\n"
+            f"scenario: {scenario_name}\n"
+            f"split: {self.split_name}\n\n"
+            f"Num questions: {metrics_dict['num_questions']}\n"
+            f"MCQ Accuracy: {self._summary_str_pct(boot_dict['mcq_accuracy'])}\n"
+            f"Top-2 Accuracy: {self._summary_str_pct(boot_dict['top2_accuracy'])}\n"
+            f"MRR: {self._summary_str_raw_short(boot_dict['mrr'])}\n"
+            f"Margin (best-second): {self._summary_str_raw_short(boot_dict['margin_top1_top2'])}\n"
+        )
+
+        print(msg)
+
+        txt_out_path = os.path.join(
+            out_dir,
+            f"Test_on_{scenario_name}_split_{self.split_name}",
+        )
+        with open(txt_out_path, "a") as f:
+            f.write(msg)
+
+        return metrics_dict, boot_dict, question_df
