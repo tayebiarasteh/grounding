@@ -201,7 +201,7 @@ class PredictionVerifier:
 
 
     def _format_pct(self, x: float) -> str:
-        return f"{x * 100:.1f}"
+        return f"{x * 100:.2f}"
 
     def ci95(self, x):
         lo, hi = np.percentile(x, [2.5, 97.5])
@@ -298,7 +298,7 @@ class PredictionVerifier:
         lo, hi = self.ci95(arr)
         lo *= 100.0
         hi *= 100.0
-        return f"{mean:.1f} ± {std:.1f} [{lo:.1f}, {hi:.1f}]"
+        return f"{mean:.2f} ± {std:.2f} [{lo:.2f}, {hi:.2f}]"
 
     def _summary_str_raw(self, arr: np.ndarray) -> str:
         arr = np.asarray(arr, dtype=np.float32)

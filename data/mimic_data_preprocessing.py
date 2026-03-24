@@ -28,6 +28,8 @@ from collections import Counter
 import math
 import pickle
 import heapq
+import csv
+import matplotlib.pyplot as plt
 
 
 import warnings
@@ -2575,6 +2577,326 @@ class RadiologyVerifierBinaryHeldoutRetrievedTestBuilder:
 
 
 
+
+
+
+class AblationResultsParser:
+
+    TRAIN_DIR_RE = re.compile(
+        r"80_Binary_verifier_.*_top(?P<train_top_p>\d+)_lr8e6$"
+    )
+
+    EVAL_DIR_RE = re.compile(
+        r"top(?P<eval_top_p>\d+)_(?P<condition>oracle_indomain|oracle_heldout)_split_(?P<split>\w+)$"
+    )
+
+    METRICS = [
+        "AUROC",
+        "AUPRC",
+        "F1",
+        "Accuracy",
+        "Balanced Accuracy",
+        "Sensitivity",
+        "Specificity",
+        "Precision",
+        "Brier score",
+    ]
+
+    METRIC_RE_TEMPLATE = r"^{metric}:\s*([0-9.]+)\s*±\s*([0-9.]+)\s*\[([0-9.]+),\s*([0-9.]+)\]$"
+
+    CONDITION_MAP = {
+        "oracle_heldout": "MIMIC-CXR: Held-Out Evidence",
+        "oracle_indomain": "MIMIC-CXR: Source-Matched Evidence",
+    }
+
+    def __init__(self, root_dir: str | Path, output_csv: str | Path):
+        self.root_dir = Path(root_dir)
+        self.output_csv = Path(output_csv)
+
+    @staticmethod
+    def _sanitize_metric_name(metric_name: str) -> str:
+        name = metric_name.lower()
+        name = name.replace("(", "").replace(")", "")
+        name = name.replace(" ", "_")
+        return name
+
+    def _extract_metric(self, text: str, metric_name: str) -> Optional[Dict[str, float]]:
+        pattern = re.compile(
+            self.METRIC_RE_TEMPLATE.format(metric=re.escape(metric_name)),
+            re.MULTILINE,
+        )
+        match = pattern.search(text)
+        if not match:
+            return None
+
+        return {
+            "mean": float(match.group(1)),
+            "std": float(match.group(2)),
+        }
+
+    @staticmethod
+    def _read_text_file(path: Path) -> Optional[str]:
+        for encoding in ("utf-8", "utf-8-sig", "latin-1"):
+            try:
+                return path.read_text(encoding=encoding)
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
+    def _find_result_file(eval_dir: Path) -> Optional[Path]:
+        candidates = sorted(
+            p for p in eval_dir.iterdir()
+            if p.is_file() and p.name.startswith("Test_on_")
+        )
+        if not candidates:
+            return None
+        return candidates[0]
+
+    def _parse_one_eval_dir(self, train_dir: Path, eval_dir: Path) -> Optional[Dict]:
+        train_match = self.TRAIN_DIR_RE.match(train_dir.name)
+        eval_match = self.EVAL_DIR_RE.match(eval_dir.name)
+
+        if not train_match or not eval_match:
+            return None
+
+        result_file = self._find_result_file(eval_dir)
+        if result_file is None:
+            print(f"[WARN] No Test_on_ file found in: {eval_dir}")
+            return None
+
+        text = self._read_text_file(result_file)
+        if text is None:
+            print(f"[WARN] Could not read file: {result_file}")
+            return None
+
+        raw_condition = eval_match.group("condition")
+        mapped_condition = self.CONDITION_MAP.get(raw_condition, raw_condition)
+
+        row = {
+            "train_top_p": int(train_match.group("train_top_p")),
+            "eval_top_p": int(eval_match.group("eval_top_p")),
+            "condition": mapped_condition,
+        }
+
+        missing_metrics: List[str] = []
+        for metric_name in self.METRICS:
+            parsed = self._extract_metric(text, metric_name)
+            key = self._sanitize_metric_name(metric_name)
+
+            if parsed is None:
+                missing_metrics.append(metric_name)
+                row[f"{key}_mean"] = None
+                row[f"{key}_std"] = None
+            else:
+                row[f"{key}_mean"] = parsed["mean"]
+                row[f"{key}_std"] = parsed["std"]
+
+        if missing_metrics:
+            print(f"[WARN] Missing metrics in {result_file.name}: {missing_metrics}")
+
+        return row
+
+    def _build_fieldnames(self) -> List[str]:
+        fieldnames = [
+            "train_top_p",
+            "eval_top_p",
+            "condition",
+        ]
+
+        for metric_name in self.METRICS:
+            key = self._sanitize_metric_name(metric_name)
+            fieldnames.extend([
+                f"{key}_mean",
+                f"{key}_std",
+            ])
+
+        return fieldnames
+
+    def parse_all(self) -> List[Dict]:
+        if not self.root_dir.exists():
+            raise FileNotFoundError(f"Root folder not found: {self.root_dir.resolve()}")
+
+        rows: List[Dict] = []
+
+        for train_dir in sorted(self.root_dir.iterdir()):
+            if not train_dir.is_dir():
+                continue
+
+            if not self.TRAIN_DIR_RE.match(train_dir.name):
+                continue
+
+            stat_logs_dir = train_dir / "stat_logs"
+            if not stat_logs_dir.exists() or not stat_logs_dir.is_dir():
+                print(f"[WARN] Missing stat_logs in: {train_dir}")
+                continue
+
+            for eval_dir in sorted(stat_logs_dir.iterdir()):
+                if not eval_dir.is_dir():
+                    continue
+
+                parsed = self._parse_one_eval_dir(train_dir, eval_dir)
+                if parsed is not None:
+                    rows.append(parsed)
+
+        rows.sort(key=lambda r: (r["train_top_p"], r["eval_top_p"], r["condition"]))
+        return rows
+
+    def save_csv(self, rows: List[Dict]) -> None:
+        if not rows:
+            print("No matching results found. CSV not written.")
+            return
+
+        fieldnames = self._build_fieldnames()
+
+        with self.output_csv.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+        print(f"Parsed {len(rows)} result folders.")
+        print(f"Saved CSV to: {self.output_csv.resolve()}")
+
+    def run(self) -> List[Dict]:
+        rows = self.parse_all()
+        self.save_csv(rows)
+        return rows
+
+
+
+
+
+class TopPAblationPlotter:
+    """
+      - Row 1: Source-Matched
+      - Row 2: Held-Out
+      - Col 1: F1
+      - Col 2: AUPRC
+    """
+
+    def __init__(self, csv_path: str | Path, output_path: str | Path):
+        self.csv_path = Path(csv_path)
+        self.output_path = Path(output_path)
+
+        self.condition_order = [
+            "MIMIC-CXR: Source-Matched Evidence",
+            "MIMIC-CXR: Held-Out Evidence",
+        ]
+
+        self.linestyles = [
+            "-", "--", "-.", ":", (0, (3, 1, 1, 1)), (0, (5, 2))
+        ]
+        self.markers = ["o", "s", "^", "D", "v", "P"]
+
+    def load_data(self) -> pd.DataFrame:
+        df = pd.read_csv(self.csv_path)
+        df = df.sort_values(["condition", "train_top_p", "eval_top_p"]).copy()
+        return df
+
+    def run(self) -> Path:
+        df = self.load_data()
+
+        fig, axes = plt.subplots(2, 2, figsize=(12, 10), sharex=True)
+        train_values = sorted(df["train_top_p"].unique())
+
+        style_map = {}
+        for i, t in enumerate(train_values):
+            style_map[t] = self.linestyles[i % len(self.linestyles)]
+
+        if 1 in style_map and 2 in style_map:
+            style_map[1], style_map[2] = style_map[2], style_map[1]
+
+        panels = [
+            ("f1_mean", "F1 (%)"),
+            ("auprc_mean", "AUPRC (%)"),
+        ]
+
+        legend_handles = []
+        legend_labels = []
+        global_color_map = {}
+
+        for row_idx, condition in enumerate(self.condition_order):
+            sub = df[df["condition"] == condition].copy()
+            if sub.empty:
+                continue
+
+            for col_idx, (mean_col, y_label) in enumerate(panels):
+                ax = axes[row_idx, col_idx]
+
+                for i, train_top_p in enumerate(train_values):
+                    s = sub[sub["train_top_p"] == train_top_p].sort_values("eval_top_p")
+                    if s.empty:
+                        continue
+
+                    linestyle = style_map[train_top_p]
+                    marker = self.markers[i % len(self.markers)]
+
+                    if train_top_p not in global_color_map:
+                        line = ax.plot(
+                            s["eval_top_p"],
+                            s[mean_col],
+                            linestyle=linestyle,
+                            marker=marker,
+                            linewidth=2.2,
+                            markersize=6.5,
+                            label=f"Train top-{train_top_p}",
+                        )[0]
+                        global_color_map[train_top_p] = line.get_color()
+                        legend_handles.append(line)
+                        legend_labels.append(f"Train top-{train_top_p}")
+                    else:
+                        ax.plot(
+                            s["eval_top_p"],
+                            s[mean_col],
+                            linestyle=linestyle,
+                            marker=marker,
+                            linewidth=2.2,
+                            markersize=6.5,
+                            color=global_color_map[train_top_p],
+                            label=f"Train top-{train_top_p}",
+                        )
+
+                ax.set_title(condition, fontsize=16, pad=10)
+
+                ax.set_xlim(0, 10)
+                ax.set_xticks(range(0, 11))
+                ax.set_xticklabels(range(0, 11))
+                ax.tick_params(axis="x", labelbottom=True, labelsize=14)
+                ax.tick_params(axis="y", labelsize=14)
+                ax.set_ylim(0, 90)
+
+                ax.spines["top"].set_visible(False)
+                ax.spines["right"].set_visible(False)
+
+                ax.set_ylabel(y_label, fontsize=15)
+                ax.set_xlabel("Test with top-p", fontsize=15)
+
+        fig.legend(
+            legend_handles,
+            legend_labels,
+            loc="lower center",
+            ncol=6,
+            frameon=False,
+            bbox_to_anchor=(0.5, -0.01),
+            fontsize=13,
+        )
+
+        fig.tight_layout(rect=[0, 0.07, 1, 0.98])
+        fig.subplots_adjust(hspace=0.35)  # spacing between rows
+
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(self.output_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+        return self.output_path
+
+
+
+
+
+
+
+
 if __name__ == "__main__":
 
     with open(global_config_path, 'r') as yaml_file:
@@ -2592,10 +2914,10 @@ if __name__ == "__main__":
     #     seed=13,
     # )
     # builder.run_all()
-
-
-
-    ''' RadiopaediaSnapshot '''
+    #
+    #
+    #
+    # ''' RadiopaediaSnapshot '''
     # evidence_builder = RadiopaediaSentenceEvidenceBuilder(
     #     in_dir=os.path.join(base_path_evidenceData, "articles_clean_txt"),
     #     out_dir=base_path_evidenceData,
@@ -2617,9 +2939,10 @@ if __name__ == "__main__":
     # verifier_builder = RadiologyVerifierBinaryDatasetBuilder(
     #     qa_parquet=os.path.join(base_path_mimicData, "grounding_dataset", "qa_grounding_main_with_anchors.parquet"),
     #     evidence_sentences_parquet=os.path.join(base_path_evidenceData, "evidence_sentences_trainval.parquet"),
-    #     out_dir=os.path.join(base_path_evidenceData, "verifier_binary_dataset"),
+    #     # evidence_sentences_parquet=os.path.join(base_path_evidenceData, "evidence_sentences_test.parquet"),
+    #     out_dir=os.path.join(base_path_evidenceData, "verifier_binary_dataset_top10"),
     #     seed=13,
-    #     max_evidence_sentences=2,
+    #     max_evidence_sentences=10,
     #     max_rows_per_type_per_concept_split=None,
     # )
     # verifier_df = verifier_builder.run()
@@ -2627,14 +2950,22 @@ if __name__ == "__main__":
 
 
     ''' mimic held-out test '''
-    heldout_test_builder = RadiologyVerifierBinaryHeldoutRetrievedTestBuilder(
-        qa_parquet=os.path.join(base_path_mimicData, "grounding_dataset", "qa_grounding_main_with_anchors.parquet"),
-        evidence_sentences_test_parquet=os.path.join(base_path_evidenceData, "evidence_sentences_test.parquet"),
-        out_dir=os.path.join(base_path_evidenceData, "verifier_binary_dataset_heldout_test"),
-        seed=13,
-        retrieval_top_k_full=30,
-        max_evidence_sentences=8,
-    )
-    heldout_test_df = heldout_test_builder.run()
+    # heldout_test_builder = RadiologyVerifierBinaryHeldoutRetrievedTestBuilder(
+    #     qa_parquet=os.path.join(base_path_mimicData, "grounding_dataset", "qa_grounding_main_with_anchors.parquet"),
+    #     evidence_sentences_test_parquet=os.path.join(base_path_evidenceData, "evidence_sentences_test.parquet"),
+    #     # evidence_sentences_test_parquet=os.path.join(base_path_evidenceData, "evidence_sentences_trainval.parquet"),
+    #     out_dir=os.path.join(base_path_evidenceData, "verifier_binary_dataset_heldout_test"),
+    #     # out_dir=os.path.join(base_path_evidenceData, "verifier_binary_dataset_indomain_test"),
+    #     bm25_cache_name="heldout_test_bm25.pkl",
+    #     # bm25_cache_name="indomain_test_bm25.pkl",
+    #     seed=13,
+    #     retrieval_top_k_full=30,
+    #     max_evidence_sentences=30,
+    # )
+    # heldout_test_df = heldout_test_builder.run()
+
+
+
+
 
 

@@ -178,6 +178,132 @@ class TrainingVerifier:
 
 
 
+    def train_epoch_randomp(self, train_loader, valid_loader=None, num_epochs=1000):
+        self.params = read_config(self.cfg_path)
+        total_start_time = time.time()
+
+        for _ in range(num_epochs - self.epoch):
+            self.epoch += 1
+
+            self.model.train()
+            batch_loss = 0.0
+            total_n = 0
+            correct = 0
+
+            start_time = time.time()
+
+            for idx, batch in enumerate(train_loader):
+                tok = self._tokenize(batch.inputs, self.max_len)
+                targets = batch.targets.to(self.device, non_blocking=True).long()
+
+                self.optimiser.zero_grad(set_to_none=True)
+
+                with torch.cuda.amp.autocast(
+                    enabled=(self.use_amp and self.device.type == "cuda"),
+                    dtype=self.autocast_dtype,
+                ):
+                    out = self.model(**tok)
+                    logits = out.logits
+                    loss = self.loss_function(logits, targets)
+
+                B = int(targets.shape[0])
+                batch_loss += float(loss.item()) * B
+                total_n += B
+
+                preds = logits.argmax(dim=-1)
+                correct += int((preds == targets).sum().item())
+
+                if self.scaler is not None and self.scaler.is_enabled():
+                    self.scaler.scale(loss).backward()
+                    if self.grad_clip > 0:
+                        self.scaler.unscale_(self.optimiser)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    self.scaler.step(self.optimiser)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    if self.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    self.optimiser.step()
+
+                # optional logging of sampled batch top-p
+                if idx % 100 == 0:
+                    print(f"[train] epoch={self.epoch} batch={idx} sampled_top_p={batch.batch_top_p}")
+
+            train_loss = batch_loss / max(total_n, 1)
+            train_acc = correct / max(total_n, 1)
+
+            self.writer.add_scalar("Train_loss_avg", train_loss, self.epoch)
+            self.writer.add_scalar("Train_accuracy", train_acc, self.epoch)
+
+            self.params["Network"]["num_epoch"] = self.epoch
+            write_config(self.params, self.cfg_path, sort_keys=True)
+
+            ckpt = {
+                "epoch": self.epoch,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimiser.state_dict(),
+                "loss_state_dict": self.loss_function.state_dict(),
+                "model_info": self.model_info,
+                "best_loss": self.best_loss,
+            }
+            if self.scaler is not None and self.scaler.is_enabled():
+                ckpt["scaler_state_dict"] = self.scaler.state_dict()
+
+            torch.save(
+                ckpt,
+                os.path.join(
+                    self.params["target_dir"],
+                    self.params["network_output_path"],
+                    self.params["checkpoint_name"],
+                ),
+            )
+
+            if (self.epoch) % int(self.params["display_stats_freq"]) == 0:
+                end_time = time.time()
+                total_time = end_time - total_start_time
+                iteration_hours, iteration_mins, iteration_secs = self.time_duration(start_time, end_time)
+                total_hours, total_mins, total_secs = self.time_duration(total_start_time, end_time)
+
+                if valid_loader is not None:
+                    valid_loss, valid_acc, valid_f1, valid_auroc, valid_specificity, valid_sensitivity, valid_precision, optimal_threshold = self.valid_epoch(valid_loader)
+
+                    self.calculate_tb_stats(
+                        valid_loss=valid_loss,
+                        valid_acc=valid_acc,
+                        valid_f1=valid_f1,
+                        valid_auroc=valid_auroc,
+                    )
+
+                    self.savings_prints(
+                        iteration_hours,
+                        iteration_mins,
+                        iteration_secs,
+                        total_hours,
+                        total_mins,
+                        total_secs,
+                        train_loss,
+                        total_time,
+                        train_acc=train_acc,
+                        valid_loss=valid_loss,
+                        valid_acc=valid_acc,
+                        valid_f1=valid_f1,
+                        valid_auroc=valid_auroc,
+                    )
+                else:
+                    self.savings_prints(
+                        iteration_hours,
+                        iteration_mins,
+                        iteration_secs,
+                        total_hours,
+                        total_mins,
+                        total_secs,
+                        train_loss,
+                        total_time,
+                        train_acc=train_acc,
+                    )
+
+
     def train_epoch(self, train_loader, valid_loader=None, num_epochs=1000):
         self.params = read_config(self.cfg_path)
         total_start_time = time.time()
