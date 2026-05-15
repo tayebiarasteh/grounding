@@ -1,6 +1,6 @@
 # TODO
 
-This is the official repository of the paper [**TODO**](TODO).
+This is the official repository of the paper [**Case-Grounded Evidence Verification: A Framework for Constructing Evidence-Sensitive Supervision**](https://arxiv.org/abs/2604.09537).
 
 
 
@@ -50,6 +50,5 @@ $ conda install conda-forge::tiktoken
 $ conda install conda-forge::sentencepiece
 ```
 
-## Model initializations used
 
 
