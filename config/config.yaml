@@ -1,52 +1,225 @@
-retriever:
-  model_name: BAAI/bge-base-en-v1.5
-  tied_encoders: true
-  pooling: mean
-  max_query_tokens: 128
-  max_doc_tokens: 256
-  temperature: 0.05
-  bm25_pool_size: 80
-  num_hard_negatives: 8
+ocean_root: /PATH
+home_root:  /PATH
+user_home:  /PATH
+datasets_root: /PATH/datasets
+repo_root:     "${home_root}/Repositories/grounding"
 
+outputs_root:  "${ocean_root}/outputs/grounding"
 
-Verifier:
-  model_name: microsoft/deberta-v3-large
-  max_tokens: 1024
-  use_amp: true
-  amp_dtype: bf16      # bf16 is fastest+stable on modern GPUs
-  grad_scaler_mode: auto    # auto enables scaler only for fp16
-  tf32: true
+evidence_root:         "${datasets_root}/Radiopaedia/Text_only/Articles_Processed_March_2026/RadiopaediaSnapshot_01_03_2026"
+grounding_dataset_dir: "${datasets_root}/Radiopaedia/Text_only/grounding_dataset"
 
+Grounding:
+  hf_token: "REPLACE_WITH_HF_TOKEN"
 
-Network:
+  stats:
+    n_boot: 1000
+    boot_seed: 0
+    fdr_alpha: 0.05
+
+  results_dir: "${outputs_root}/study"
+  datasets_staging_dir: "${outputs_root}/datasets_staging"
+  hf_cache_dir: "${user_home}/.cache/huggingface/hub"
+  purge_hf_cache_after_use: true
+  findings: [atelectasis, cardiomegaly, consolidation, fracture, pleural effusion, pneumothorax, pulmonary edema]
   seed: 13
-  num_epochs: 40
-#  batch_size: 16
-  batch_size: 1
-  lr: 1e-5
-  weight_decay: 0.01
-  grad_clip_norm: 1.0
+  max_pool: 4
+  max_evidence_sentences: 2
+  max_evidence_chars: 12000
+  main_verifier: modernbert_large
+  sources:
+    snapshot: "${evidence_root}/evidence_sentences.parquet"
+    oracle_mimic: "${evidence_root}/verifier_binary_dataset/Test_parquets/oracle_indomain.parquet"
+    oracle_chexpert: "${evidence_root}/verifier_binary_dataset_chexpert_plus/Test_parquets/chexpert_plus_oracle_indomain.parquet"
+    mimic_sections: "${grounding_dataset_dir}/reports_sections.parquet"
+    chexpert_sections: "${datasets_root}/Radiopaedia/Text_only/grounding_dataset_chexpert_plus/reports_sections.parquet"
+    rexgradient_masterlist: "${datasets_root}/XRay/ReXGradient-160K/rexgradient_masterlist.csv"
+    rexgradient_sample: "${repo_root}/data/samples/sample_rexgradient_test_grounding.csv"
+    openi_reports_dir: "${datasets_root}/XRay/OpenI/NLMCXR_reports/ecgen-radiology"
+    openi_images_dir: "${datasets_root}/XRay/OpenI/preprocessed224"
+    openi_frontal: "${repo_root}/data/samples/openi_frontal_images.csv"
+    rexerr_dir: "${datasets_root}/XRay/ReXErr-v1/Sentence_level"
+    rexval_dir: "${datasets_root}/XRay/ReXVal"
+    radevalx_dir: "${datasets_root}/XRay/RadEvalX"
+    rexval_masterlist: "${datasets_root}/XRay/ReXVal/rexval_masterlist.csv"
+    radevalx_masterlist: "${datasets_root}/XRay/RadEvalX/radevalx_masterlist.csv"
+    mimic_master_list: "${datasets_root}/XRay/MIMIC/mimic_master_list.csv"
+    chexpert_master_list: "${datasets_root}/XRay/CheXpert-v1.0/chexpert_plus.csv"
+    mimic_patients: "${datasets_root}/XRay/MIMIC/mimiciv_demographics/hosp/patients.csv"
+    mimic_admissions: "${datasets_root}/XRay/MIMIC/mimiciv_demographics/hosp/admissions.csv"
+    chexpert_plus_reports: "${datasets_root}/XRay/CheXpert-v1.0/original labels/chexpert_plus_reports.csv"
+    padchest_gr_reports: "${datasets_root}/XRay/padchest/PadChest-GR/grounded_reports_20240819.json"
+    padchest_gr_table: "${datasets_root}/XRay/padchest/PadChest-GR/master_table.csv"
+    food_trainvaltest: "${outputs_root}/food/food_verifier_trainvaltest.parquet"
+  chexbert:
+    repo_id: StanfordAIMI/RRG_scorers
+    filename: chexbert.pth
+    sha256: 6550703c92d640e1e04d8105a7a185d76ece0f25fcbf033d292785bf22c0fde1
+    tokenizer: bert-base-uncased
+    batch_size: 64
+  judges:
+    models:
+      - {name: gpt-oss-120b, served: openai/gpt-oss-120b, chat_template_kwargs: null}
+      - {name: Qwen3.5-122B-A10B, served: Qwen/Qwen3.5-122B-A10B-GPTQ-Int4, chat_template_kwargs: {enable_thinking: false}}
+    temperature: 0.0
+    max_tokens: 4096
+    concurrency: 8
+    max_unparsed_share: 0.02
+  training:
+    lr: 8.0e-6
+    weight_decay: 0.01
+    batch_size: 4
+    num_epochs: 15
+    grad_clip_norm: 1.0
+    max_tokens: 1024
+    amp_dtype: bf16
+    eval_batch_size: 16
+    fit_report: true
+  lora:
+    rank: 16
+    alpha: 32
+    dropout: 0.05
+    target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+    lr: 1.0e-4
+    weight_decay: 0.0
+    micro_batch: 4
+    micro_batch_small_gpu: 2
+    grad_accum: 4
+    save_every_steps: 200
+    num_epochs: 3
+    grad_clip_norm: 1.0
+    max_tokens: 1024
+    eval_batch_size: 8
+  runs:
+    - {id: modernbert_large, kind: encoder, model_name: answerdotai/ModernBERT-large, train_set: main, seed: 0}
+    - {id: flan_t5_large, kind: encoder, model_name: google/flan-t5-large, train_set: main, seed: 0}
+    - {id: roberta_large, kind: encoder, model_name: FacebookAI/roberta-large, train_set: main, seed: 0}
+    - {id: electra_large, kind: encoder, model_name: google/electra-large-discriminator, train_set: main, seed: 0}
+    - {id: flan_t5_base, kind: encoder, model_name: google/flan-t5-base, train_set: main, seed: 0}
+    - {id: modernbert_base, kind: encoder, model_name: answerdotai/ModernBERT-base, train_set: main, seed: 0}
+    - {id: longformer_base, kind: encoder, model_name: allenai/longformer-base-4096, train_set: main, seed: 0}
+    - {id: biomedbert_base, kind: encoder, model_name: microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext, train_set: main, seed: 0}
+    - {id: modernbert_large_seed1, kind: encoder, model_name: answerdotai/ModernBERT-large, train_set: main, seed: 1}
+    - {id: modernbert_large_seed2, kind: encoder, model_name: answerdotai/ModernBERT-large, train_set: main, seed: 2}
+    - {id: modernbert_large_noD, kind: encoder, model_name: answerdotai/ModernBERT-large, train_set: noD, seed: 0}
+    - {id: modernbert_large_noD_easy, kind: encoder, model_name: answerdotai/ModernBERT-large, train_set: noD_easy, seed: 0}
+    - {id: modernbert_large_noD_random, kind: encoder, model_name: answerdotai/ModernBERT-large, train_set: noD_random, seed: 0}
+    - {id: modernbert_large_comparison, kind: encoder, model_name: answerdotai/ModernBERT-large, train_set: comparison, seed: 0}
+    - {id: modernbert_large_food, kind: encoder, model_name: answerdotai/ModernBERT-large, train_set: food, seed: 0}
+    - {id: qwen3_8b_lora, kind: lora, model_name: Qwen/Qwen3-8B, train_set: main, seed: 0}
+    - {id: qwen3_8b_lora_noD, kind: lora, model_name: Qwen/Qwen3-8B, train_set: noD, seed: 0}
+  runs_added:
+    - {id: modernbert_large_w, kind: encoder, model_name: answerdotai/ModernBERT-large, train_set: main_written, seed: 0}
+    - {id: flan_t5_large_w, kind: encoder, model_name: google/flan-t5-large, train_set: main_written, seed: 0}
+    - {id: roberta_large_w, kind: encoder, model_name: FacebookAI/roberta-large, train_set: main_written, seed: 0}
+    - {id: electra_large_w, kind: encoder, model_name: google/electra-large-discriminator, train_set: main_written, seed: 0, lr: 4.0e-6}
+    - {id: flan_t5_base_w, kind: encoder, model_name: google/flan-t5-base, train_set: main_written, seed: 0}
+    - {id: modernbert_base_w, kind: encoder, model_name: answerdotai/ModernBERT-base, train_set: main_written, seed: 0}
+    - {id: longformer_base_w, kind: encoder, model_name: allenai/longformer-base-4096, train_set: main_written, seed: 0}
+    - {id: biomedbert_base_w, kind: encoder, model_name: microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext, train_set: main_written, seed: 0}
+    - {id: modernbert_large_w_seed1, kind: encoder, model_name: answerdotai/ModernBERT-large, train_set: main_written, seed: 1}
+    - {id: modernbert_large_w_seed2, kind: encoder, model_name: answerdotai/ModernBERT-large, train_set: main_written, seed: 2}
+    - {id: modernbert_large_noD_w, kind: encoder, model_name: answerdotai/ModernBERT-large, train_set: noD_written, seed: 0}
+    - {id: modernbert_large_uncapped, kind: encoder, model_name: answerdotai/ModernBERT-large, train_set: main_uncapped, seed: 0}
+    - {id: qwen3_8b_lora_w, kind: lora, model_name: Qwen/Qwen3-8B, train_set: main_written, seed: 0}
+    - {id: qwen3_8b_lora_noD_w, kind: lora, model_name: Qwen/Qwen3-8B, train_set: noD_written, seed: 0}
+  main_verifier_added: modernbert_large_w
+  test_sets:
+    mimic: [unchanged, heldout, heldout_written, replaced, removed, masked_evidence, masked_evidence_statement, report_replaced]
+    chexpert: [unchanged, heldout, replaced, removed, report_replaced]
+    rexgradient: [unchanged, heldout, replaced, removed]
+    openi: [unchanged, heldout, replaced, removed]
+    openi_mesh: [unchanged]
+    padchest_gr: [unchanged, heldout, replaced, removed]
+    food: [unchanged, replaced, removed]
+  subgroups:
+    age_bins: [0, 40, 60, 80, 200]
+    age_labels: [under_40, 40_to_59, 60_to_79, 80_and_over]
+    race_patterns:
+      White: [white, caucasian]
+      Black: [black, african]
+      Asian: [asian]
+      Hispanic_or_Latino: [hispanic, latino, latina, latinx]
+    min_patients: 30
+  restricted_conditions:
+    masked_evidence: [modernbert_large, modernbert_large_w]
+    masked_evidence_statement: [modernbert_large, modernbert_large_w]
+  mask_token: "[FINDING]"
+  retrieval:
+    embedding_model: Qwen/Qwen3-Embedding-8B
+    reranker_model: Qwen/Qwen3-Reranker-8B
+    rerank_pool: 80
+    min_positives_for_auroc: 30
+  similarity:
+    ngram_orders: [1, 2, 3]
+    ranking_ngram_orders: [1, 2]
+    partition_fractions: [0.10, 0.25]
+  rexerr_error_types: ["False prediction", "False negation"]
+  generators:
+    max_new_tokens: 512
+    concurrency: 8
+    max_empty_share: 0.10
+    models:
+      - {name: MAIRA-2, kind: maira2, hf_id: microsoft/maira-2, hf_repos: [microsoft/maira-2]}
+      - {name: LLaVA-Rad, kind: llava_rad, hf_id: microsoft/llava-rad, repo_path: "${user_home}/LLaVA-Rad", model_base: lmsys/vicuna-7b-v1.5, model_name: llavarad, hf_repos: [microsoft/llava-rad, lmsys/vicuna-7b-v1.5]}
+      - {name: MedGemma-1.5-4B, kind: served, served: google/medgemma-1.5-4b-it}
+      - {name: LLaVA-Med, kind: served, served: /PATH/llava-med-v1.5-7b-hf}
+      - {name: Gemma-4-31B, kind: served, served: google/gemma-4-31B-it}
+      - {name: Qwen3-VL-32B, kind: served, served: Qwen/Qwen3-VL-32B-Instruct}
+  llm:
+    models:
+      - {name: DeepSeek-V4-Flash, served: MJPansa/DeepSeek-V4-Flash-0731-NVFP4, reasoning_effort: null}
+      - {name: Qwen3.8-Flash-Next, served: nvidia/Qwen3.8-Flash-Next-NVFP4, reasoning_effort: none}
+      - {name: Mistral-Small-4-119B, served: mistralai/Mistral-Small-4-119B-2603-NVFP4, reasoning_effort: null}
+      - {name: MedGemma-27B, served: google/medgemma-27b-it, reasoning_effort: null}
+    concurrency: 16
+    max_tokens: 4
+    top_logprobs: 20
+    timeout_s: 120
+    chunk_per_worker: 4
+    max_fallback_share: 0.10
+    local_name: Qwen3-8B
+    local_model: Qwen/Qwen3-8B
+    local_batch_size: 8
+  public:
+    models:
+      - {id: MiniCheck-Flan-T5-Large, kind: minicheck_t5, hf_repos: [lytang/MiniCheck-Flan-T5-Large], batch_size: 16, sweep: true}
+      - {id: AlignScore-large, kind: alignscore, hf_repos: [yzha/AlignScore, FacebookAI/roberta-large], ckpt: AlignScore-large.ckpt, batch_size: 32, sweep: true}
+      - {id: HHEM-2.1-Open, kind: hhem, hf_repos: [vectara/hallucination_evaluation_model, google/flan-t5-base], batch_size: 32, sweep: true}
+      - {id: LettuceDetect, kind: lettuce, hf_repos: [KRLabsOrg/lettucedect-large-modernbert-en-v1], batch_size: 32, sweep: true, probability: false}
+      - {id: GREEN, kind: green, hf_repos: [StanfordAIMI/GREEN-RadLlama2-7b], batch_size: 16, sweep: false, probability: false}
+      - {id: Bespoke-MiniCheck-7B, kind: bespoke_local, hf_id: bespokelabs/Bespoke-MiniCheck-7B, hf_repos: [bespokelabs/Bespoke-MiniCheck-7B], top_logprobs: 5, batch_size: 16, sweep: false}
+      - {id: Lynx-8B, kind: lynx_served, served: PatronusAI/Llama-3-Patronus-Lynx-8B-Instruct-v1.1, hf_repos: [], max_tokens: 600, top_logprobs: 20, concurrency: 16, sweep: false}
+  tfidf:
+    c_grid: [0.01, 0.1, 1.0, 10.0, 100.0]
+    min_df: 2
+  writer:
+    served: Qwen/Qwen3.5-35B-A3B-GPTQ-Int4
+    chat_template_kwargs: {enable_thinking: false}
+    temperature: 0.8
+    top_p: 0.95
+    max_tokens: 2000
+    sentences_per_call: 30
+    calls_per_request: 2
+    rewrites_per_sentence: 3
+    exemplars: 5
+    min_words: 6
+    concurrency: 4
+  written:
+    heldout_fraction: 0.2
+    min_heldout: 2
+    min_for_heldout: 5
+    mixed_share: 0.3
+    near_duplicate_jaccard: 0.8
+    leak_jaccard: 0.6
+  reader:
+    readers: [TTN, SZ]
 
-
-Preprocessing:
-  tokenizer_name: BAAI/bge-base-en-v1.5
-  base_path_mimicData: /PATH/Text_only
-  mimic_reports_base: /PATH/XRay/MIMIC
-  snapshot_name: RadiopaediaSnapshot_01_03_2026
-  base_path_evidenceData: /PATH/Articles_Processed_March_2026/RadiopaediaSnapshot_01_03_2026
-
-runtime:
-  use_amp: true # useful for speed
-
-network_output_path: network_data/
-output_data_path: output_data/
-tb_logs_path: tensor_board_logs/
-stat_log_path: stat_logs
-checkpoint_name: checkpoint.tar
-trained_model_name: trained_model.pth
-hf_login: "xxxxxxxxxxx"
-
-
-# changeable items:
-target_dir: /PATH/grounding/
-display_stats_freq: 1 # valid freq is equal to this
+  serving:
+    api_base_url:     "REPLACE_WITH_SERVER_URL"
+    api_base_url_env: GROUNDING_LLM_URL
+    api_key:          "REPLACE_WITH_API_KEY"
+    api_key_env:      GROUNDING_LLM_KEY
+    verify_ssl: true
+    max_retries: 5
+    connect_retry_max_s: 900
